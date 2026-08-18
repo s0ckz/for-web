@@ -5,7 +5,6 @@ import {
   TrackReferenceOrPlaceholder,
   useEnsureParticipant,
   useIsMuted,
-  useIsSpeaking,
   useTrackRefContext,
   useTracks,
   VideoTrack,
@@ -15,7 +14,12 @@ import { Track } from "livekit-client";
 import { styled } from "styled-system/jsx";
 
 import { useUser } from "@revolt/markdown/users";
-import { isSoundboardPublication, useIsMicMuted, useVoice } from "@revolt/rtc";
+import {
+  isSoundboardPublication,
+  useIsMicMuted,
+  useIsSpeakingFast,
+  useVoice,
+} from "@revolt/rtc";
 import { Avatar } from "@revolt/ui/components/design";
 import { Row } from "@revolt/ui/components/layout";
 import { Symbol } from "@revolt/ui/components/utils/Symbol";
@@ -92,7 +96,7 @@ function ConnectedUser() {
 
   const isMuted = useIsMicMuted(participant);
 
-  const isSpeaking = useIsSpeaking(participant);
+  const isSpeaking = useIsSpeakingFast(participant);
   const user = useUser(participant.identity);
 
   return (

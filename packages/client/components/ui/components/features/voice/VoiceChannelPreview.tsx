@@ -2,7 +2,6 @@ import { For, Show, splitProps } from "solid-js";
 import {
   TrackLoop,
   useEnsureParticipant,
-  useIsSpeaking,
   useTracks,
 } from "solid-livekit-components";
 
@@ -13,7 +12,7 @@ import { styled } from "styled-system/jsx";
 
 import { UserContextMenu } from "@revolt/app";
 import { useUser } from "@revolt/markdown/users";
-import { InRoom, useIsMicMuted } from "@revolt/rtc";
+import { InRoom, useIsMicMuted, useIsSpeakingFast } from "@revolt/rtc";
 
 import { Avatar, Ripple, typography } from "../../design";
 import { Row } from "../../layout";
@@ -75,7 +74,7 @@ function ParticipantLive() {
 
   const isMuted = useIsMicMuted(participant);
 
-  const isSpeaking = useIsSpeaking(participant);
+  const isSpeaking = useIsSpeakingFast(participant);
 
   return (
     <CommonUser

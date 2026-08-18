@@ -19,6 +19,7 @@ import {
   Room,
   ScreenSharePresets,
   Track,
+  TrackEvent,
   VideoResolution,
 } from "livekit-client";
 import { Channel } from "stoat.js";
@@ -44,6 +45,7 @@ import {
   SoundboardPlayer,
   SoundboardSound,
 } from "./soundboard";
+import { registerSpeakingMeter } from "./speaking";
 import { VoiceProcessor } from "./VoiceProcessor";
 
 type State =
@@ -103,6 +105,7 @@ class Voice {
   private limits;
   private screenShareTracks: Set<string>;
   private voiceProcessor?: VoiceProcessor;
+  #localSpeakingMeter?: () => void;
 
   constructor(
     voiceSettings: VoiceSettings,
@@ -304,6 +307,18 @@ class Voice {
             (this.voiceProcessor = new VoiceProcessor(this.#settings)),
           );
         }
+
+        this.#meterLocalMicrophone(room, pub);
+      }
+    });
+
+    room.addListener("localTrackUnpublished", (pub) => {
+      if (
+        pub.source === Track.Source.Microphone &&
+        !isSoundboardPublication(pub)
+      ) {
+        this.#localSpeakingMeter?.();
+        this.#localSpeakingMeter = undefined;
       }
     });
 
@@ -362,6 +377,9 @@ class Voice {
       if (!room) return;
 
       this.soundboard()?.dispose();
+
+      this.#localSpeakingMeter?.();
+      this.#localSpeakingMeter = undefined;
 
       room.removeAllListeners();
       room.disconnect();
@@ -785,6 +803,31 @@ class Voice {
     return participant.publishTrack(track, {
       source: Track.Source.Microphone,
     });
+  }
+
+  /**
+   * Meter our own microphone so our tile lights up as fast as everyone else's.
+   *
+   * Re-arms when the track restarts, which is how the voice settings effect
+   * applies new constraints -- the old MediaStreamTrack is dead by then and
+   * would read as permanent silence.
+   */
+  #meterLocalMicrophone(room: Room, pub: LocalTrackPublication) {
+    const track = pub.audioTrack;
+    if (!track) return;
+
+    const identity = room.localParticipant.identity;
+
+    const arm = () => {
+      this.#localSpeakingMeter?.();
+      this.#localSpeakingMeter = registerSpeakingMeter(
+        identity,
+        track.mediaStreamTrack,
+      );
+    };
+
+    arm();
+    track.on(TrackEvent.Restarted, arm);
   }
 
   /**

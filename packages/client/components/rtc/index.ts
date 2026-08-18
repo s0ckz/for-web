@@ -9,6 +9,7 @@ export {
 export type { SoundboardSound } from "./soundboard";
 export { useSoundboardLibrary } from "./soundboardLibrary";
 export type { SoundboardEntry, SoundboardLibrary } from "./soundboardLibrary";
+export { registerSpeakingMeter, useIsSpeakingFast } from "./speaking";
 export { useVoice, VoiceContext } from "./state";
 
 export { InRoom } from "./components/InRoom";
