@@ -450,6 +450,8 @@ const NotWatching = styled("div", {
     textAlign: "center",
     background: "#0003",
     cursor: "pointer",
+    zIndex: 3,
+    pointerEvents: "auto",
   },
 });
 
@@ -500,6 +502,7 @@ const Controls = styled("div", {
 
     display: "flex",
     gap: "var(--gap-sm)",
+    pointerEvents: "auto",
 
     opacity: 0,
     transition: "var(--transitions-fast) opacity",
@@ -526,6 +529,10 @@ const Overlay = styled("div", {
   base: {
     minWidth: 0,
     gridArea: "1/1",
+
+    // Informational only. Without this it covers the whole tile and steals
+    // clicks from the watch button and the controls beneath it.
+    pointerEvents: "none",
 
     padding: "var(--gap-md) var(--gap-lg)",
 
