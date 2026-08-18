@@ -86,7 +86,9 @@ export function TextChannel(props: ChannelPageProps) {
    * would blank out every other channel's chat.
    */
   const expanded = () =>
-    state.voice.hideChatInCall && voice.channel()?.id === props.channel.id;
+    state.voice.hideChatInCall &&
+    canConnect() &&
+    voice.channel()?.id === props.channel.id;
 
   // Last unread message id
   const [lastId, setLastId] = createSignal<string>();
