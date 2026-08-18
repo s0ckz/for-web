@@ -37,6 +37,13 @@ import { VoiceCallCardContext } from "@revolt/ui/components/features/voice/callC
 import { Device, useDevice } from "@revolt/common";
 import { InRoom } from "./components/InRoom";
 import { RoomAudioManager } from "./components/RoomAudioManager";
+import {
+  getMicPublication,
+  hasSoundboardPublication,
+  isSoundboardPublication,
+  SoundboardPlayer,
+  SoundboardSound,
+} from "./soundboard";
 import { VoiceProcessor } from "./VoiceProcessor";
 
 type State =
@@ -84,6 +91,9 @@ class Voice {
 
   showBar: Accessor<boolean>;
   #setShowBar: Setter<boolean>;
+
+  soundboard: Accessor<SoundboardPlayer | undefined>;
+  #setSoundboard: Setter<SoundboardPlayer | undefined>;
 
   private sound: SoundController;
   private device: Device;
@@ -140,6 +150,10 @@ class Voice {
     const [showBar, setShowBar] = createSignal(true);
     this.showBar = showBar;
     this.#setShowBar = setShowBar;
+
+    const [soundboard, setSoundboard] = createSignal<SoundboardPlayer>();
+    this.soundboard = soundboard;
+    this.#setSoundboard = setSoundboard;
 
     const inst = useInstance();
     this.config = inst.config;
@@ -199,6 +213,22 @@ class Voice {
       setNoiseSuppression(getSettings().noiseSupression ?? "browser");
       restartTrack();
     });
+
+    // Keep local monitoring of our own soundboard sounds in line with settings
+    createEffect(() => {
+      const soundboard = this.soundboard();
+      if (!soundboard) return;
+
+      const settings = getSettings();
+      const muted = settings.soundboardMuted || settings.deafen;
+      soundboard.setMonitorVolume(
+        muted ? 0 : settings.soundboardVolume * settings.outputVolume,
+      );
+    });
+
+    createEffect(() => {
+      this.soundboard()?.setSinkId(getSettings().preferredAudioOutputDevice);
+    });
   }
 
   async connect(channel: Channel, auth?: { url: string; token: string }) {
@@ -241,16 +271,15 @@ class Voice {
       this.#setState("CONNECTING");
       this.#setVideo(false);
       this.#setScreenshare(false);
+      this.#setSoundboard(new SoundboardPlayer(room));
     });
 
     room.addListener("connected", () => {
       this.#setState("CONNECTED");
       if (this.speakingPermission)
-        room.localParticipant
-          .setMicrophoneEnabled(this.#settings.micOn)
-          .then((track) => {
-            this.#settings.micOn = track != null;
-          });
+        this.#setMicEnabled(room, this.#settings.micOn).then((track) => {
+          this.#settings.micOn = track != null;
+        });
       for (const p of room.remoteParticipants.values()) {
         const screenShareTrack = p.getTrackPublication(
           Track.Source.ScreenShare,
@@ -265,7 +294,11 @@ class Voice {
     room.addListener("disconnected", () => this.#setState("DISCONNECTED"));
 
     room.addListener("localTrackPublished", (pub) => {
-      if (pub.audioTrack && pub.audioTrack.source === Track.Source.Microphone) {
+      if (
+        pub.audioTrack &&
+        pub.audioTrack.source === Track.Source.Microphone &&
+        !isSoundboardPublication(pub)
+      ) {
         if (!pub.audioTrack.getProcessor()) {
           pub.audioTrack?.setProcessor(
             (this.voiceProcessor = new VoiceProcessor(this.#settings)),
@@ -328,6 +361,8 @@ class Voice {
       const room = this.room();
       if (!room) return;
 
+      this.soundboard()?.dispose();
+
       room.removeAllListeners();
       room.disconnect();
 
@@ -336,6 +371,7 @@ class Voice {
         this.#setRoom();
         this.#setChannel();
         this.#setFullscreen(false);
+        this.#setSoundboard();
         this.vidTracks = () => [];
       });
 
@@ -351,14 +387,14 @@ class Voice {
     try {
       const room = this.room();
       if (!room) throw "invalid state";
-      await room.localParticipant.setMicrophoneEnabled(
-        (this.#settings.micOn || !!fromMute) &&
-          !room.localParticipant.isMicrophoneEnabled,
+      await this.#setMicEnabled(
+        room,
+        (this.#settings.micOn || !!fromMute) && !this.#isMicEnabled(room),
       );
 
       this.#settings.deafen = !this.#settings.deafen;
       if (fromMute) {
-        this.#settings.micOn = room.localParticipant.isMicrophoneEnabled;
+        this.#settings.micOn = this.#isMicEnabled(room);
       }
       if (this.#settings.deafen) {
         this.sound.playSound("deafen");
@@ -378,11 +414,9 @@ class Voice {
     try {
       const room = this.room();
       if (!room) throw "invalid state";
-      await room.localParticipant.setMicrophoneEnabled(
-        !room.localParticipant.isMicrophoneEnabled,
-      );
+      await this.#setMicEnabled(room, !this.#isMicEnabled(room));
 
-      this.#settings.micOn = room.localParticipant.isMicrophoneEnabled;
+      this.#settings.micOn = this.#isMicEnabled(room);
 
       if (this.#settings.micOn) {
         this.sound.playSound("unmute");
@@ -510,9 +544,8 @@ class Voice {
           true,
           {
             resolution:
-              this.getEnabledScreenShareQualities()[
-                this.#screenShareQuality()
-              ]?.resolution,
+              this.getEnabledScreenShareQualities()[this.#screenShareQuality()]
+                ?.resolution,
             audio: {
               autoGainControl: false,
               echoCancellation: false,
@@ -687,10 +720,86 @@ class Voice {
   }
 
   getMicrophoneTrack(): LocalTrackPublication | undefined {
-    const track = this.room()?.localParticipant.getTrackPublication(
-      Track.Source.Microphone,
-    );
-    return track;
+    const room = this.room();
+    if (!room) return undefined;
+    return getMicPublication(room.localParticipant) as
+      | LocalTrackPublication
+      | undefined;
+  }
+
+  /**
+   * Whether our real microphone is published and unmuted.
+   *
+   * localParticipant.isMicrophoneEnabled cannot be used: it looks at the
+   * first microphone-source publication, which may be the soundboard track.
+   */
+  #isMicEnabled(room: Room): boolean {
+    const pub = getMicPublication(room.localParticipant);
+    return !!pub && !pub.isMuted;
+  }
+
+  /**
+   * Soundboard-aware setMicrophoneEnabled.
+   */
+  async #setMicEnabled(
+    room: Room,
+    enabled: boolean,
+  ): Promise<LocalTrackPublication | undefined> {
+    const participant = room.localParticipant;
+    const pub = getMicPublication(participant) as
+      | LocalTrackPublication
+      | undefined;
+
+    if (pub) {
+      if (enabled) await pub.unmute();
+      else await pub.mute();
+      return pub;
+    }
+
+    if (!enabled) return undefined;
+
+    // Without a soundboard track LiveKit's own logic is exactly what we want.
+    if (!hasSoundboardPublication(participant)) {
+      return participant.setMicrophoneEnabled(true);
+    }
+
+    // With one, setMicrophoneEnabled would find the soundboard track first and
+    // "unmute" that instead of capturing a microphone, so do it by hand.
+    const [track] = await participant.createTracks({ audio: true });
+    if (!track) return undefined;
+    return participant.publishTrack(track, {
+      source: Track.Source.Microphone,
+    });
+  }
+
+  /**
+   * Play a soundboard sound for everyone in the call
+   */
+  async playSoundboard(sound: SoundboardSound) {
+    try {
+      const soundboard = this.soundboard();
+      if (!soundboard) throw "invalid state";
+      await soundboard.play(sound);
+    } catch (e) {
+      this.onErr(e);
+    }
+  }
+
+  /**
+   * Stop every soundboard sound we are playing
+   */
+  stopSoundboard() {
+    this.soundboard()?.stopAll();
+  }
+
+  /**
+   * Publish the soundboard track ahead of time so the first sound is instant
+   */
+  prepareSoundboard() {
+    if (!this.speakingPermission) return;
+    this.soundboard()
+      ?.ensurePublished()
+      .catch((e) => this.onErr(e));
   }
 
   get listenPermission() {

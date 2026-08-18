@@ -331,6 +331,36 @@ export function UserContextMenu(props: {
         >
           <Trans>Mute</Trans>
         </ContextMenuButton>
+        <ContextMenuButton
+          symbol={
+            <IconSlot>
+              <Symbol
+                size={16}
+                fill={state.voice.getSoundboardUserMuted(props.user.id)}
+              >
+                music_off
+              </Symbol>
+            </IconSlot>
+          }
+          onClick={() =>
+            state.voice.setSoundboardUserMuted(
+              props.user.id,
+              !state.voice.getSoundboardUserMuted(props.user.id),
+            )
+          }
+          actionSymbol={
+            <IconSlot>
+              <Show
+                when={state.voice.getSoundboardUserMuted(props.user.id)}
+                fallback={<Symbol size={16}>check_box_outline_blank</Symbol>}
+              >
+                <Symbol size={16}>check_box</Symbol>
+              </Show>
+            </IconSlot>
+          }
+        >
+          <Trans>Mute Soundboard</Trans>
+        </ContextMenuButton>
         <ContextMenuDivider />
       </Show>
       <Show when={props.isScreenshare && !props.user.self}>

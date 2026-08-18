@@ -4,6 +4,7 @@ import { useInstance } from "@revolt/instance";
 import { Column } from "@revolt/ui";
 
 import { ScreenShareOptions } from "./ScreenShareOptions";
+import { SoundboardOptions } from "./SoundboardOptions";
 import { VoiceInputOptions } from "./VoiceInputOptions";
 import { VoiceProcessingOptions } from "./VoiceProcessingOptions";
 
@@ -20,6 +21,7 @@ export function VoiceSettings() {
       <Show when={limits().video}>
         <ScreenShareOptions />
       </Show>
+      <SoundboardOptions />
     </Column>
   );
 }

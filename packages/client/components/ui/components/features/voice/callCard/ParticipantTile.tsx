@@ -8,14 +8,14 @@ import {
   VideoTrack,
 } from "solid-livekit-components";
 
-import { Track } from "livekit-client";
 import type { RemoteTrackPublication } from "livekit-client";
+import { Track } from "livekit-client";
 import { cva } from "styled-system/css";
 import { styled } from "styled-system/jsx";
 
 import { UserContextMenu } from "@revolt/app";
 import { useUser } from "@revolt/markdown/users";
-import { useVoice } from "@revolt/rtc";
+import { useIsMicMuted, useVoice } from "@revolt/rtc";
 import { useState } from "@revolt/state";
 import { Avatar } from "@revolt/ui/components/design";
 import { Row } from "@revolt/ui/components/layout";
@@ -55,10 +55,7 @@ export function ParticipantTile(props: TileProps) {
   const [isFullscreen, setFullscreen] = createSignal(false);
   const [pointerIdle, setPointerIdle] = createSignal(false);
 
-  const isMuted = useIsMuted({
-    participant,
-    source: Track.Source.Microphone,
-  });
+  const isMuted = useIsMicMuted(participant);
 
   const isScreenShareAudioMuted = useIsMuted({
     participant,

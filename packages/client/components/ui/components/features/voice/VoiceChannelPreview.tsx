@@ -2,7 +2,6 @@ import { For, Show, splitProps } from "solid-js";
 import {
   TrackLoop,
   useEnsureParticipant,
-  useIsMuted,
   useIsSpeaking,
   useTracks,
 } from "solid-livekit-components";
@@ -14,7 +13,7 @@ import { styled } from "styled-system/jsx";
 
 import { UserContextMenu } from "@revolt/app";
 import { useUser } from "@revolt/markdown/users";
-import { InRoom } from "@revolt/rtc";
+import { InRoom, useIsMicMuted } from "@revolt/rtc";
 
 import { Avatar, Ripple, typography } from "../../design";
 import { Row } from "../../layout";
@@ -74,10 +73,7 @@ function VariantPreview(props: { channel: Channel }) {
 function ParticipantLive() {
   const participant = useEnsureParticipant();
 
-  const isMuted = useIsMuted({
-    participant,
-    source: Track.Source.Microphone,
-  });
+  const isMuted = useIsMicMuted(participant);
 
   const isSpeaking = useIsSpeaking(participant);
 

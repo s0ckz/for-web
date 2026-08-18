@@ -1,5 +1,14 @@
 import { getVirtmic } from "./virtualMic";
 
+export {
+  getMicPublication,
+  isSoundboardPublication,
+  SOUNDBOARD_TRACK_NAME,
+  useIsMicMuted,
+} from "./soundboard";
+export type { SoundboardSound } from "./soundboard";
+export { useSoundboardLibrary } from "./soundboardLibrary";
+export type { SoundboardEntry, SoundboardLibrary } from "./soundboardLibrary";
 export { useVoice, VoiceContext } from "./state";
 
 export { InRoom } from "./components/InRoom";

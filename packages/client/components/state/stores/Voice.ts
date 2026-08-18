@@ -58,6 +58,13 @@ export interface TypeVoice {
   screenShareWatching: Record<string, boolean>;
   /** Show the playback statistics overlay on screen shares */
   screenShareStats: boolean;
+
+  /** Volume applied to every soundboard sound (yours included) */
+  soundboardVolume: number;
+  /** Mute all soundboard sounds */
+  soundboardMuted: boolean;
+  /** Users whose soundboard sounds are muted, keyed by user id */
+  soundboardUserMutes: Record<string, boolean>;
 }
 
 /**
@@ -100,6 +107,9 @@ export class Voice extends AbstractStore<"voice", TypeVoice> {
       screenShareMutes: {},
       screenShareWatching: {},
       screenShareStats: false,
+      soundboardVolume: 1.0,
+      soundboardMuted: false,
+      soundboardUserMutes: {},
     };
   }
 
@@ -192,6 +202,22 @@ export class Voice extends AbstractStore<"voice", TypeVoice> {
 
     if (typeof input.screenShareStats === "boolean") {
       data.screenShareStats = input.screenShareStats;
+    }
+
+    if (typeof input.soundboardVolume === "number") {
+      data.soundboardVolume = input.soundboardVolume;
+    }
+
+    if (typeof input.soundboardMuted === "boolean") {
+      data.soundboardMuted = input.soundboardMuted;
+    }
+
+    if (typeof input.soundboardUserMutes === "object") {
+      Object.entries(input.soundboardUserMutes)
+        .filter(
+          ([userId, muted]) => typeof userId === "string" && muted === true,
+        )
+        .forEach(([k, v]) => (data.soundboardUserMutes[k] = v));
     }
 
     if (typeof input.userMutes === "object") {
@@ -327,6 +353,52 @@ export class Voice extends AbstractStore<"voice", TypeVoice> {
    */
   set screenShareStats(value: boolean) {
     this.set("screenShareStats", value);
+  }
+
+  /**
+   * Volume applied to every soundboard sound
+   */
+  get soundboardVolume(): number {
+    return this.get().soundboardVolume ?? 1.0;
+  }
+
+  /**
+   * Set the soundboard volume
+   */
+  set soundboardVolume(value: number) {
+    this.set("soundboardVolume", value);
+  }
+
+  /**
+   * Whether every soundboard sound is muted
+   */
+  get soundboardMuted(): boolean {
+    return this.get().soundboardMuted ?? false;
+  }
+
+  /**
+   * Mute or unmute every soundboard sound
+   */
+  set soundboardMuted(value: boolean) {
+    this.set("soundboardMuted", value);
+  }
+
+  /**
+   * Set whether a user's soundboard sounds are muted
+   * @param userId User ID
+   * @param muted Whether they should be muted
+   */
+  setSoundboardUserMuted(userId: string, muted: boolean) {
+    this.set("soundboardUserMutes", userId, muted);
+  }
+
+  /**
+   * Get whether a user's soundboard sounds are muted
+   * @param userId User ID
+   * @returns Whether muted
+   */
+  getSoundboardUserMuted(userId: string): boolean {
+    return this.get().soundboardUserMutes?.[userId] || false;
   }
 
   /**

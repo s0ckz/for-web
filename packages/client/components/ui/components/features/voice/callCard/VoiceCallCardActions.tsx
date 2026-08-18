@@ -10,6 +10,8 @@ import { useState } from "@revolt/state";
 import { Button, IconButton } from "@revolt/ui/components/design";
 import { Symbol } from "@revolt/ui/components/utils/Symbol";
 
+import { SoundboardButton } from "../soundboard/SoundboardPicker";
+
 export function VoiceCallCardActions(props: { size: "xs" | "sm" }) {
   const voice = useVoice();
   const state = useState();
@@ -125,6 +127,7 @@ export function VoiceCallCardActions(props: { size: "xs" | "sm" }) {
           <Symbol>screen_share</Symbol>
         </Show>
       </IconButton>
+      <SoundboardButton size={props.size} />
       <Button
         size={props.size}
         variant="_error"
