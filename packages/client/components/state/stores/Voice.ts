@@ -65,6 +65,11 @@ export interface TypeVoice {
    * participants" toggle).
    */
   showNonVideoParticipants: boolean;
+  /**
+   * Hide the text chat while in a call so the call card fills the channel
+   * area (an expanded view that is not fullscreen).
+   */
+  hideChatInCall: boolean;
 
   /** Volume applied to every soundboard sound (yours included) */
   soundboardVolume: number;
@@ -115,6 +120,7 @@ export class Voice extends AbstractStore<"voice", TypeVoice> {
       screenShareWatching: {},
       screenShareStats: false,
       showNonVideoParticipants: true,
+      hideChatInCall: false,
       soundboardVolume: 1.0,
       soundboardMuted: false,
       soundboardUserMutes: {},
@@ -214,6 +220,10 @@ export class Voice extends AbstractStore<"voice", TypeVoice> {
 
     if (typeof input.showNonVideoParticipants === "boolean") {
       data.showNonVideoParticipants = input.showNonVideoParticipants;
+    }
+
+    if (typeof input.hideChatInCall === "boolean") {
+      data.hideChatInCall = input.hideChatInCall;
     }
 
     if (typeof input.soundboardVolume === "number") {
@@ -379,6 +389,20 @@ export class Voice extends AbstractStore<"voice", TypeVoice> {
    */
   set showNonVideoParticipants(value: boolean) {
     this.set("showNonVideoParticipants", value);
+  }
+
+  /**
+   * Whether the text chat is hidden while in a call
+   */
+  get hideChatInCall(): boolean {
+    return this.get().hideChatInCall ?? false;
+  }
+
+  /**
+   * Hide or show the text chat while in a call
+   */
+  set hideChatInCall(value: boolean) {
+    this.set("hideChatInCall", value);
   }
 
   /**

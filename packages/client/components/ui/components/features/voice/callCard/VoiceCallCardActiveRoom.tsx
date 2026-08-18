@@ -23,6 +23,7 @@ export function VoiceCallCardActiveRoom() {
       <Participants />
       <VoiceCallControls>
         <VoiceCallControlHolder right>
+          <VoiceHideChat />
           <VoiceShowNonVideoParticipants />
           <VoiceCallFullscreen />
         </VoiceCallControlHolder>
@@ -45,6 +46,37 @@ function VoiceCallFullscreen() {
     >
       <Show when={voice.fullscreen()} fallback={<Symbol>fullscreen</Symbol>}>
         <Symbol>fullscreen_exit</Symbol>
+      </Show>
+    </IconButton>
+  );
+}
+
+/**
+ * Hide the text chat so the call card fills the whole channel area.
+ *
+ * Not the same as fullscreen: the rest of the app stays put, this only gives
+ * the call the space the message list was using.
+ */
+function VoiceHideChat() {
+  const state = useState();
+  const { t } = useLingui();
+
+  const hidden = () => state.voice.hideChatInCall;
+
+  return (
+    <IconButton
+      size="sm"
+      variant={"standard"}
+      onPress={() => (state.voice.hideChatInCall = !hidden())}
+      use:floating={{
+        tooltip: {
+          placement: "top",
+          content: hidden() ? t`Show chat` : t`Hide chat`,
+        },
+      }}
+    >
+      <Show when={hidden()} fallback={<Symbol>speaker_notes_off</Symbol>}>
+        <Symbol>chat</Symbol>
       </Show>
     </IconButton>
   );
