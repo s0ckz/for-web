@@ -17,9 +17,11 @@ import {
 import {
   LocalTrackPublication,
   Room,
+  ScreenShareCaptureOptions,
   ScreenSharePresets,
   Track,
   TrackEvent,
+  TrackPublishOptions,
   VideoResolution,
 } from "livekit-client";
 import { Channel } from "stoat.js";
@@ -62,6 +64,40 @@ type ScreenShareQuality = {
   fullName: string;
   contentHint: string;
 };
+
+/** Capture constraints for the screen share's audio half */
+const SCREEN_SHARE_AUDIO: ScreenShareCaptureOptions["audio"] = {
+  autoGainControl: false,
+  echoCancellation: false,
+  noiseSuppression: false,
+  voiceIsolation: false,
+  restrictOwnAudio: true,
+};
+
+const SCREEN_SHARE_PUBLISH: TrackPublishOptions = {
+  // LiveKit's h1080fps30 preset caps the stream at roughly 2.5 Mbps.
+  // 1080p screen content cannot hold 30fps within that, so the encoder trades
+  // frames away and settles around 10-12fps even on a connection with plenty
+  // of headroom. Give it room, and tell it to protect the framerate rather
+  // than the resolution.
+  screenShareEncoding: {
+    maxBitrate: 6_000_000,
+    maxFramerate: 30,
+    priority: "high",
+  },
+  // VP9 is dramatically more efficient than VP8 on screen content (large flat
+  // areas, sharp text). backupCodec keeps clients that cannot decode it
+  // working via a VP8 stream.
+  videoCodec: "vp9",
+  backupCodec: true,
+  degradationPreference: "maintain-framerate",
+};
+
+/** At most this many automatic share recoveries ... */
+const MAX_RECOVERIES = 3;
+
+/** ... within this window, so a permanently broken capture cannot loop */
+const RECOVERY_WINDOW_MS = 60_000;
 
 class Voice {
   #settings: VoiceSettings;
@@ -107,6 +143,11 @@ class Voice {
   private screenShareTracks: Set<string>;
   private voiceProcessor?: VoiceProcessor;
   #localSpeakingMeter?: () => void;
+
+  /** What the last successful share was started with, for recovery */
+  #lastShareChoice?: { qualityName: ScreenShareQualityName; audio: boolean };
+  #recoveryAttempts: number[] = [];
+  #recovering = false;
 
   constructor(
     voiceSettings: VoiceSettings,
@@ -385,6 +426,9 @@ class Voice {
       this.#localSpeakingMeter?.();
       this.#localSpeakingMeter = undefined;
 
+      this.#lastShareChoice = undefined;
+      this.#recoveryAttempts = [];
+
       room.removeAllListeners();
       room.disconnect();
 
@@ -525,6 +569,10 @@ class Voice {
     if (!room) throw "invalid state";
 
     if (this.screenshare()) {
+      // Deliberately stopping means there is nothing left to recover.
+      this.#lastShareChoice = undefined;
+      this.#recoveryAttempts = [];
+
       await room.localParticipant.setScreenShareEnabled(false);
 
       this.#setScreenshare(room.localParticipant.isScreenShareEnabled);
@@ -574,32 +622,9 @@ class Voice {
             resolution:
               this.getEnabledScreenShareQualities()[this.#screenShareQuality()]
                 ?.resolution,
-            audio: {
-              autoGainControl: false,
-              echoCancellation: false,
-              noiseSuppression: false,
-              voiceIsolation: false,
-              restrictOwnAudio: true,
-            },
+            audio: SCREEN_SHARE_AUDIO,
           },
-          {
-            // LiveKit's h1080fps30 preset caps the stream at roughly 2.5 Mbps.
-            // 1080p screen content cannot hold 30fps within that, so the
-            // encoder trades frames away and settles around 10-12fps even on a
-            // connection with plenty of headroom. Give it room, and tell it to
-            // protect the framerate rather than the resolution.
-            screenShareEncoding: {
-              maxBitrate: 6_000_000,
-              maxFramerate: 30,
-              priority: "high",
-            },
-            // VP9 is dramatically more efficient than VP8 on screen content
-            // (large flat areas, sharp text). backupCodec keeps clients that
-            // cannot decode it working via a VP8 stream.
-            videoCodec: "vp9",
-            backupCodec: true,
-            degradationPreference: "maintain-framerate",
-          },
+          SCREEN_SHARE_PUBLISH,
         );
 
         const screenAudioTrack = room.localParticipant.getTrackPublication(
@@ -609,51 +634,12 @@ class Voice {
         this.#setScreenshare(room.localParticipant.isScreenShareEnabled);
 
         if (localTrack) {
-          // This event is only fired if the screen share is ended by closing the window being streamed.
-          // This catches the ending and disables screen sharing on our side. If this weren't here,
-          // livekit would still share stream audio after closing the window being streamed.
-          localTrack.on("ended", () => {
-            this.toggleScreenshare();
-            const oldAudioTrack = room.localParticipant.getTrackPublication(
-              Track.Source.ScreenShareAudio,
-            );
-            if (oldAudioTrack && oldAudioTrack.track) {
-              room.localParticipant.unpublishTrack(oldAudioTrack.track);
-            }
-          });
+          this.#armScreenShareEnded(room, localTrack);
 
-          const callback = async (
+          const callback = (
             qualityName: ScreenShareQualityName,
             audio: boolean,
-          ) => {
-            const quality = qualities[qualityName] || qualities.low!;
-
-            if (localTrack.videoTrack) {
-              await localTrack.videoTrack.mediaStreamTrack.applyConstraints({
-                frameRate: { max: quality.resolution.frameRate },
-                width:
-                  quality.resolution.width === 0
-                    ? undefined
-                    : {
-                        ideal: quality.resolution.width,
-                        max: quality.resolution.width,
-                      },
-                height:
-                  quality.resolution.height === 0
-                    ? undefined
-                    : {
-                        ideal: quality.resolution.height,
-                        max: quality.resolution.height,
-                      },
-              });
-              localTrack.videoTrack.mediaStreamTrack.contentHint =
-                quality.contentHint;
-              if (!audio && screenAudioTrack?.track) {
-                room.localParticipant.unpublishTrack(screenAudioTrack.track);
-              }
-              this.sound.playSound("streamStart");
-            }
-          };
+          ) => this.#applyShareChoice(room, localTrack, qualityName, audio);
 
           if (screenPickerQualityName) {
             callback(
@@ -710,6 +696,161 @@ class Voice {
         if (cancelled) return;
         this.onErr(e);
       }
+    }
+  }
+
+  /**
+   * Apply a quality/audio choice to a live screen share and remember it.
+   * @param room Room
+   * @param localTrack Screen share publication
+   * @param qualityName Chosen quality
+   * @param audio Whether the share's audio should be kept
+   * @param announce Whether to play the "stream started" sound
+   */
+  async #applyShareChoice(
+    room: Room,
+    localTrack: LocalTrackPublication,
+    qualityName: ScreenShareQualityName,
+    audio: boolean,
+    announce = true,
+  ) {
+    const qualities = this.getEnabledScreenShareQualities();
+    const quality = qualities[qualityName] || qualities.low!;
+
+    this.#lastShareChoice = { qualityName, audio };
+
+    if (!localTrack.videoTrack) return;
+
+    await localTrack.videoTrack.mediaStreamTrack.applyConstraints({
+      frameRate: { max: quality.resolution.frameRate },
+      width:
+        quality.resolution.width === 0
+          ? undefined
+          : {
+              ideal: quality.resolution.width,
+              max: quality.resolution.width,
+            },
+      height:
+        quality.resolution.height === 0
+          ? undefined
+          : {
+              ideal: quality.resolution.height,
+              max: quality.resolution.height,
+            },
+    });
+
+    localTrack.videoTrack.mediaStreamTrack.contentHint = quality.contentHint;
+
+    if (!audio) {
+      const screenAudioTrack = room.localParticipant.getTrackPublication(
+        Track.Source.ScreenShareAudio,
+      );
+      if (screenAudioTrack?.track) {
+        room.localParticipant.unpublishTrack(screenAudioTrack.track);
+      }
+    }
+
+    if (announce) this.sound.playSound("streamStart");
+  }
+
+  /**
+   * Watch a screen share publication for its capture ending.
+   *
+   * Windows' WGC capturer reports a permanent error when the captured window
+   * is destroyed and recreated -- which is what a game does when it switches
+   * to fullscreen -- and LiveKit then unpublishes the track. The share is
+   * fine, the capture handle is not, so try to pick the window back up.
+   */
+  #armScreenShareEnded(room: Room, localTrack: LocalTrackPublication) {
+    localTrack.on("ended", () => {
+      this.#onScreenShareEnded(room);
+    });
+  }
+
+  async #onScreenShareEnded(room: Room) {
+    // LiveKit only unpublishes the video half, and the audio track would keep
+    // playing into the call on its own.
+    const oldAudioTrack = room.localParticipant.getTrackPublication(
+      Track.Source.ScreenShareAudio,
+    );
+    if (oldAudioTrack?.track) {
+      try {
+        await room.localParticipant.unpublishTrack(oldAudioTrack.track);
+      } catch {
+        /* already gone */
+      }
+    }
+
+    if (await this.#recoverScreenShare(room)) return;
+
+    // No bridge, nothing to recover, or recovery failed: stop as before.
+    this.toggleScreenshare();
+  }
+
+  /**
+   * Try to restart a screen share whose capture died underneath us.
+   *
+   * Needs the desktop bridge: only the main process can find the window again
+   * and answer the next getDisplayMedia without showing the picker. On plain
+   * web this always returns false and the share simply ends.
+   * @param room Room
+   * @returns Whether the share is back up
+   */
+  async #recoverScreenShare(room: Room): Promise<boolean> {
+    const reacquire = window.native?.reacquireScreenShare;
+    if (typeof reacquire !== "function") return false;
+
+    const choice = this.#lastShareChoice;
+    if (!choice || this.#recovering || !this.screenshare()) return false;
+
+    const now = Date.now();
+    this.#recoveryAttempts = this.#recoveryAttempts.filter(
+      (at) => now - at < RECOVERY_WINDOW_MS,
+    );
+    if (this.#recoveryAttempts.length >= MAX_RECOVERIES) {
+      console.warn("[rtc] screen share keeps dying, giving up on recovery");
+      return false;
+    }
+    this.#recoveryAttempts.push(now);
+
+    this.#recovering = true;
+    try {
+      // Main waits (up to a few minutes) for the window to come back; a
+      // minimised window cannot be captured, so this can take a while.
+      if (!(await reacquire())) return false;
+
+      const localTrack = await room.localParticipant.setScreenShareEnabled(
+        true,
+        {
+          resolution:
+            this.getEnabledScreenShareQualities()[choice.qualityName]
+              ?.resolution,
+          audio: SCREEN_SHARE_AUDIO,
+        },
+        SCREEN_SHARE_PUBLISH,
+      );
+
+      if (!localTrack) return false;
+
+      this.#setScreenshare(room.localParticipant.isScreenShareEnabled);
+      this.#armScreenShareEnded(room, localTrack);
+
+      // No modal and no start sound: as far as the sharer is concerned this
+      // never stopped.
+      await this.#applyShareChoice(
+        room,
+        localTrack,
+        choice.qualityName,
+        choice.audio,
+        false,
+      );
+
+      return true;
+    } catch (err) {
+      console.warn("[rtc] screen share recovery failed", err);
+      return false;
+    } finally {
+      this.#recovering = false;
     }
   }
 
