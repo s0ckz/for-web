@@ -334,12 +334,16 @@ export class Voice extends AbstractStore<"voice", TypeVoice> {
   }
 
   /**
-   * Get whether a user's screen share is muted
+   * Get whether a user's screen share is muted.
+   *
+   * Defaults to false: audio only reaches you for shares you chose to watch
+   * (see RoomAudioManager), so it does not also need to start muted -- that
+   * only led to people watching a stream in silence and assuming it was broken.
    * @param userId User ID
    * @returns Whether muted
    */
   getScreenShareMuted(userId: string): boolean {
-    return this.get().screenShareMutes[userId] ?? true;
+    return this.get().screenShareMutes[userId] ?? false;
   }
 
   /**

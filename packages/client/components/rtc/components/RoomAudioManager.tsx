@@ -66,7 +66,13 @@ export function RoomAudioManager() {
                     track().participant.identity,
                   )
                 : track().source === Track.Source.ScreenShareAudio
-                  ? state.voice.getScreenShareMuted(
+                  ? // Screen share audio follows the watch choice: a stream you
+                    // declined should not be audible, and `muted` maps to
+                    // setEnabled(false) so the server stops sending it too.
+                    state.voice.getScreenShareMuted(
+                      track().participant.identity,
+                    ) ||
+                    !state.voice.getScreenShareWatching(
                       track().participant.identity,
                     )
                   : state.voice.getUserMuted(track().participant.identity)) ||
