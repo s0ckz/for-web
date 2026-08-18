@@ -15,6 +15,7 @@ import { Motion, Presence } from "solid-motionone";
 
 import { flip, offset, shift } from "@floating-ui/dom";
 import { Trans, useLingui } from "@lingui/solid/macro";
+import { cva } from "styled-system/css";
 import { styled } from "styled-system/jsx";
 
 import { SoundboardEntry, useSoundboardLibrary, useVoice } from "@revolt/rtc";
@@ -343,10 +344,10 @@ function SoundTile(props: {
       </Symbol>
       <TileName>{props.entry.name}</TileName>
       <Show when={props.onRemove}>
-        <Remove
+        <span
+          class={remove({ confirm: confirm() })}
           role="button"
           aria-label={t`Remove sound`}
-          confirm={confirm()}
           onClick={(e) => {
             e.stopPropagation();
             if (confirm()) {
@@ -365,7 +366,7 @@ function SoundTile(props: {
           }}
         >
           <Symbol size={14}>{confirm() ? "delete_forever" : "close"}</Symbol>
-        </Remove>
+        </span>
       </Show>
     </Tile>
   );
@@ -588,7 +589,7 @@ const TileName = styled("span", {
   },
 });
 
-const Remove = styled("span", {
+const remove = cva({
   base: {
     position: "absolute",
     top: "2px",
