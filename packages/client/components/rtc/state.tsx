@@ -617,10 +617,10 @@ class Voice {
                         max: quality.resolution.width,
                       },
                 height:
-                  quality.resolution.width === 0
+                  quality.resolution.height === 0
                     ? undefined
                     : {
-                        ideal: quality.resolution.width,
+                        ideal: quality.resolution.height,
                         max: quality.resolution.height,
                       },
               });
@@ -671,10 +671,17 @@ class Voice {
               });
             } else {
               callback(
-                this.#settings.screenShareQuality || "low",
+                this.#screenShareQuality(),
                 this.#settings.screenShareAudio,
               );
             }
+          } else {
+            // "Always ask" off and no native picker: nothing used to apply the
+            // saved quality or honour the audio preference at all.
+            callback(
+              this.#screenShareQuality(),
+              this.#settings.screenShareAudio,
+            );
           }
         }
       } catch (e) {

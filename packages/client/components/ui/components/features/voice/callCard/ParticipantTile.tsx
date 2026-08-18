@@ -268,7 +268,10 @@ export function ParticipantTile(props: TileProps) {
                 overflow: "hidden",
               }}
               trackRef={track as TrackReference}
-              manageSubscription={true}
+              // We drive setSubscribed ourselves from the watch choice above;
+              // letting VideoTrack manage it unsubscribes 3s after the element
+              // is hidden and then fights us over it.
+              manageSubscription={false}
               ref={videoRef}
               on:resize={() => {
                 setVideoDims({
