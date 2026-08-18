@@ -819,6 +819,19 @@ class Voice {
       // minimised window cannot be captured, so this can take a while.
       if (!(await reacquire())) return false;
 
+      // LiveKit unpublishes a track that ended, but it does so asynchronously
+      // and we may well get here first. setScreenShareEnabled(true) reuses any
+      // publication it finds and merely unmutes it, which would "recover" the
+      // share into the dead track we are trying to replace -- so make sure the
+      // old one is really gone before capturing again.
+      if (room.localParticipant.getTrackPublication(Track.Source.ScreenShare)) {
+        try {
+          await room.localParticipant.setScreenShareEnabled(false);
+        } catch {
+          /* already unpublished */
+        }
+      }
+
       const localTrack = await room.localParticipant.setScreenShareEnabled(
         true,
         {
