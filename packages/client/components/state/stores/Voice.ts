@@ -14,9 +14,13 @@ const NoiseSuppresionStates: NoiseSuppresionState[] = [
 ];
 
 /**
- * Possible screen share qualities. Low is 720p@30fps, high 1080p@30fps and text is source@5fps.
+ * Possible screen share qualities. Low is 720p@30fps and high is 1080p@30fps.
+ *
+ * The upstream "text" mode (source resolution at 5 fps) is removed: it only
+ * appeared on instances whose video_resolution limit allows 1080p, and it is
+ * far too easy to select by accident and then assume the client is broken.
  */
-export type ScreenShareQualityName = "low" | "high" | "text";
+export type ScreenShareQualityName = "low" | "high";
 
 /**
  * Array of available screen share quality names.
@@ -24,7 +28,6 @@ export type ScreenShareQualityName = "low" | "high" | "text";
 export const ScreenShareQualityNames: ScreenShareQualityName[] = [
   "low",
   "high",
-  "text",
 ];
 
 export interface TypeVoice {

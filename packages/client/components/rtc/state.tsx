@@ -417,6 +417,15 @@ class Voice {
    * @param name The name of the screen share quality to get
    * @returns A partial record of ScreenShareQualityName to ScreenShareQuality. Will always contain "low" quality.
    */
+  /**
+   * Resolve the configured quality, healing settings that were saved while the
+   * removed "text" option still existed.
+   */
+  #screenShareQuality(): ScreenShareQualityName {
+    const saved = this.#settings.screenShareQuality;
+    return saved === "low" || saved === "high" ? saved : "low";
+  }
+
   getEnabledScreenShareQualities(): Partial<
     Record<ScreenShareQualityName, ScreenShareQuality>
   > {
@@ -445,25 +454,11 @@ class Voice {
         fullName: `1080p 30FPS`,
         contentHint: "motion",
       };
-      const originalResolution = ScreenSharePresets.original.resolution;
-      originalResolution.frameRate = 5;
-      originalResolution.aspectRatio = 0;
 
-      const limit = this.limits().video_resolution;
-      originalResolution.width = limit[0];
-      originalResolution.height = limit[1];
-      // If both resolutions are limited, set aspect ratio
-      if (originalResolution.height !== 0 && originalResolution.width !== 0) {
-        originalResolution.aspectRatio =
-          originalResolution.width / originalResolution.height;
-      }
-
-      qualities.text = {
-        name: "text",
-        resolution: originalResolution,
-        fullName: `Source 5FPS`,
-        contentHint: "text",
-      };
+      // The upstream "Source 5FPS" option lived here. It is deliberately gone:
+      // it shares this 1080p-capable branch, so raising an instance's
+      // video_resolution limit silently added a 5 fps mode that is easy to
+      // pick by accident and looks broken when you do.
     }
 
     return qualities;
@@ -516,7 +511,7 @@ class Voice {
           {
             resolution:
               this.getEnabledScreenShareQualities()[
-                this.#settings.screenShareQuality || "low"
+                this.#screenShareQuality()
               ]?.resolution,
             audio: {
               autoGainControl: false,
