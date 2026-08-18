@@ -25,6 +25,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # stoat.js and solid-livekit-components are submodules; without them
+          # rollup cannot resolve "stoat.js" and the vite build dies. The
+          # private brand assets submodule is skipped via update=none in
+          # .gitmodules, and the client falls back to scripts/assets_fallback.
+          submodules: recursive
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3

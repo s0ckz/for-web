@@ -53,6 +53,11 @@ export interface TypeVoice {
 
   screenShareVolumes: Record<string, number>;
   screenShareMutes: Record<string, boolean>;
+
+  /** Screen shares the user has explicitly chosen to watch, keyed by user id */
+  screenShareWatching: Record<string, boolean>;
+  /** Show the playback statistics overlay on screen shares */
+  screenShareStats: boolean;
 }
 
 /**
@@ -93,6 +98,8 @@ export class Voice extends AbstractStore<"voice", TypeVoice> {
       userMutes: {},
       screenShareVolumes: {},
       screenShareMutes: {},
+      screenShareWatching: {},
+      screenShareStats: false,
     };
   }
 
@@ -172,6 +179,19 @@ export class Voice extends AbstractStore<"voice", TypeVoice> {
             typeof userId === "string" && typeof volume === "number",
         )
         .forEach(([k, v]) => (data.userVolumes[k] = v));
+    }
+
+    if (typeof input.screenShareWatching === "object") {
+      Object.entries(input.screenShareWatching)
+        .filter(
+          ([userId, watching]) =>
+            typeof userId === "string" && watching === true,
+        )
+        .forEach(([k, v]) => (data.screenShareWatching[k] = v));
+    }
+
+    if (typeof input.screenShareStats === "boolean") {
+      data.screenShareStats = input.screenShareStats;
     }
 
     if (typeof input.userMutes === "object") {
@@ -272,6 +292,41 @@ export class Voice extends AbstractStore<"voice", TypeVoice> {
    */
   getScreenShareMuted(userId: string): boolean {
     return this.get().screenShareMutes[userId] ?? true;
+  }
+
+  /**
+   * Set whether the user is watching a given screen share
+   * @param userId User ID
+   * @param watching Whether to subscribe to their screen share
+   */
+  setScreenShareWatching(userId: string, watching: boolean) {
+    this.set("screenShareWatching", userId, watching);
+  }
+
+  /**
+   * Get whether the user is watching a given screen share.
+   *
+   * Defaults to false: screen shares are opt-in, so joining a busy call does
+   * not immediately pull several video streams you did not ask for.
+   * @param userId User ID
+   * @returns Whether watching
+   */
+  getScreenShareWatching(userId: string): boolean {
+    return this.get().screenShareWatching[userId] ?? false;
+  }
+
+  /**
+   * Whether the playback statistics overlay is enabled
+   */
+  get screenShareStats(): boolean {
+    return this.get().screenShareStats;
+  }
+
+  /**
+   * Toggle the playback statistics overlay
+   */
+  set screenShareStats(value: boolean) {
+    this.set("screenShareStats", value);
   }
 
   /**
