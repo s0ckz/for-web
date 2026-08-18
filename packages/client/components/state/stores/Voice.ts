@@ -59,6 +59,13 @@ export interface TypeVoice {
   /** Show the playback statistics overlay on screen shares */
   screenShareStats: boolean;
 
+  /**
+   * Show participants that have no camera/screen share in the call grid.
+   * Off = only tiles that carry live video (Discord's "Show non-video
+   * participants" toggle).
+   */
+  showNonVideoParticipants: boolean;
+
   /** Volume applied to every soundboard sound (yours included) */
   soundboardVolume: number;
   /** Mute all soundboard sounds */
@@ -107,6 +114,7 @@ export class Voice extends AbstractStore<"voice", TypeVoice> {
       screenShareMutes: {},
       screenShareWatching: {},
       screenShareStats: false,
+      showNonVideoParticipants: true,
       soundboardVolume: 1.0,
       soundboardMuted: false,
       soundboardUserMutes: {},
@@ -202,6 +210,10 @@ export class Voice extends AbstractStore<"voice", TypeVoice> {
 
     if (typeof input.screenShareStats === "boolean") {
       data.screenShareStats = input.screenShareStats;
+    }
+
+    if (typeof input.showNonVideoParticipants === "boolean") {
+      data.showNonVideoParticipants = input.showNonVideoParticipants;
     }
 
     if (typeof input.soundboardVolume === "number") {
@@ -353,6 +365,20 @@ export class Voice extends AbstractStore<"voice", TypeVoice> {
    */
   set screenShareStats(value: boolean) {
     this.set("screenShareStats", value);
+  }
+
+  /**
+   * Whether participants without video are shown in the call grid
+   */
+  get showNonVideoParticipants(): boolean {
+    return this.get().showNonVideoParticipants ?? true;
+  }
+
+  /**
+   * Show or hide participants without video in the call grid
+   */
+  set showNonVideoParticipants(value: boolean) {
+    this.set("showNonVideoParticipants", value);
   }
 
   /**

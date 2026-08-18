@@ -1,10 +1,11 @@
 import { useLingui } from "@lingui/solid/macro";
 import { createResizeObserver } from "@solid-primitives/resize-observer";
-import { createEffect, For, onMount, Show } from "solid-js";
+import { createEffect, createMemo, For, onMount, Show } from "solid-js";
 import { TrackLoop } from "solid-livekit-components";
 import { styled } from "styled-system/jsx";
 
 import { InRoom, useVoice } from "@revolt/rtc";
+import { useState } from "@revolt/state";
 import { IconButton } from "@revolt/ui/components/design";
 import { Symbol } from "@revolt/ui/components/utils/Symbol";
 import { scrollableStyles } from "@revolt/ui/directives";
@@ -22,6 +23,7 @@ export function VoiceCallCardActiveRoom() {
       <Participants />
       <VoiceCallControls>
         <VoiceCallControlHolder right>
+          <VoiceShowNonVideoParticipants />
           <VoiceCallFullscreen />
         </VoiceCallControlHolder>
         <VoiceCallCardActions size="sm" />
@@ -48,6 +50,39 @@ function VoiceCallFullscreen() {
   );
 }
 
+/**
+ * Toggle whether participants with no camera or screen share get a tile.
+ *
+ * With a few people idling in a call, their avatar tiles squeeze whoever is
+ * actually sharing something down to a thumbnail.
+ */
+function VoiceShowNonVideoParticipants() {
+  const state = useState();
+  const { t } = useLingui();
+
+  const shown = () => state.voice.showNonVideoParticipants;
+
+  return (
+    <IconButton
+      size="sm"
+      variant={"standard"}
+      onPress={() => (state.voice.showNonVideoParticipants = !shown())}
+      use:floating={{
+        tooltip: {
+          placement: "top",
+          content: shown()
+            ? t`Hide non-video participants`
+            : t`Show non-video participants`,
+        },
+      }}
+    >
+      <Show when={shown()} fallback={<Symbol>videocam_off</Symbol>}>
+        <Symbol>videocam</Symbol>
+      </Show>
+    </IconButton>
+  );
+}
+
 const TILE_MIN_WIDTH = "250px",
   TILE_MIN_FOCUS_HEIGHT = "100px";
 
@@ -56,6 +91,7 @@ const TILE_MIN_WIDTH = "250px",
  */
 function Participants() {
   const voice = useVoice();
+  const state = useState();
   const { t } = useLingui();
 
   // Modify this value to get test tracks
@@ -63,10 +99,27 @@ function Participants() {
 
   let callRef: HTMLDivElement | undefined;
 
-  const tileWidth = () => {
-    const vidWidth = Math.round(
-      100 / (voice.vidTracks().length + testTrackCount),
+  /**
+   * Everything that is not currently focused, optionally narrowed to tiles
+   * that actually carry video.
+   *
+   * A camera placeholder has no publication at all, a camera that is off has
+   * one that is muted, and a screen share always counts as video. If the
+   * filter would empty the grid entirely, keep everyone: an empty call card is
+   * worse than a few avatars.
+   */
+  const gridTracks = createMemo(() => {
+    const tracks = voice.vidTracks().filter((t) => !voice.isFocus(t));
+    if (state.voice.showNonVideoParticipants) return tracks;
+
+    const withVideo = tracks.filter(
+      (t) => t.publication && !t.publication.isMuted,
     );
+    return withVideo.length ? withVideo : tracks;
+  });
+
+  const tileWidth = () => {
+    const vidWidth = Math.round(100 / (gridTracks().length + testTrackCount));
     return `max(${TILE_MIN_WIDTH}, ${vidWidth}% - var(--gap-md))`;
   };
 
@@ -118,11 +171,7 @@ function Participants() {
           class={voice.focusId() ? scrollableStyles({ direction: "x" }) : ""}
           style={{ "--vc-tile-width": tileWidth() }}
         >
-          <TrackLoop
-            tracks={() => voice.vidTracks().filter((t) => !voice.isFocus(t))}
-          >
-            {() => <ParticipantTile />}
-          </TrackLoop>
+          <TrackLoop tracks={gridTracks}>{() => <ParticipantTile />}</TrackLoop>
           <For each={Array(testTrackCount)}>
             {() => (
               <div
