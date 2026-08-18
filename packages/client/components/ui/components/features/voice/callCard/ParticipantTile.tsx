@@ -1,4 +1,4 @@
-import { createSignal, Show } from "solid-js";
+import { createEffect, createSignal, onCleanup, Show } from "solid-js";
 import {
   TrackReference,
   useEnsureParticipant,
@@ -9,6 +9,7 @@ import {
 } from "solid-livekit-components";
 
 import { Track } from "livekit-client";
+import type { RemoteTrackPublication } from "livekit-client";
 import { cva } from "styled-system/css";
 import { styled } from "styled-system/jsx";
 
@@ -23,9 +24,14 @@ import { Symbol } from "@revolt/ui/components/utils/Symbol";
 
 import { VoiceStatefulUserIcons } from "../VoiceStatefulUserIcons";
 
+import { ScreenShareStats } from "./ScreenShareStats";
+
 type TileProps = {
   focus?: boolean;
 };
+
+/** How long the pointer must be still before fullscreen chrome fades out */
+const IDLE_TIMEOUT = 2500;
 
 /**
  * Individual participant tile
@@ -38,11 +44,16 @@ export function ParticipantTile(props: TileProps) {
   const user = useUser(participant.identity);
 
   let videoRef: HTMLVideoElement | undefined;
+  let tileRef: HTMLDivElement | undefined;
 
   const [videoDims, setVideoDims] = createSignal<{
     height: number;
     width: number;
   }>({ height: 0, width: 0 });
+
+  const [showStats, setShowStats] = createSignal(false);
+  const [isFullscreen, setFullscreen] = createSignal(false);
+  const [pointerIdle, setPointerIdle] = createSignal(false);
 
   const isMuted = useIsMuted({
     participant,
@@ -72,8 +83,77 @@ export function ParticipantTile(props: TileProps) {
   const isVideo = () => !isVideoMuted();
   const isScreenShare = () => track.source === Track.Source.ScreenShare;
   const isSpeaking = useIsSpeaking(participant);
+  const isSelf = () => !!user().user?.self;
+
+  /**
+   * Screen shares are opt-in: joining a call with several people sharing should
+   * not immediately pull down every stream. Your own share is always shown.
+   */
+  const isWatching = () =>
+    !isScreenShare() ||
+    isSelf() ||
+    state.voice.getScreenShareWatching(participant.identity);
+
+  /**
+   * Drive the actual LiveKit subscription from that choice, so declining to
+   * watch genuinely stops the server sending video rather than just hiding it.
+   */
+  createEffect(() => {
+    if (!isScreenShare() || isSelf()) return;
+    const publication = track.publication as RemoteTrackPublication | undefined;
+    if (typeof publication?.setSubscribed !== "function") return;
+    try {
+      publication.setSubscribed(isWatching());
+    } catch {
+      /* publication went away */
+    }
+  });
+
+  const startWatching = (e: MouseEvent) => {
+    e.stopPropagation();
+    state.voice.setScreenShareWatching(participant.identity, true);
+  };
+
+  const stopWatching = (e: MouseEvent) => {
+    e.stopPropagation();
+    setShowStats(false);
+    state.voice.setScreenShareWatching(participant.identity, false);
+  };
+
+  // -- fullscreen ---------------------------------------------------------
+
+  const onFullscreenChange = () =>
+    setFullscreen(document.fullscreenElement === tileRef);
+
+  document.addEventListener("fullscreenchange", onFullscreenChange);
+  onCleanup(() =>
+    document.removeEventListener("fullscreenchange", onFullscreenChange),
+  );
+
+  const toggleFullscreen = (e: MouseEvent) => {
+    e.stopPropagation();
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+    } else {
+      tileRef?.requestFullscreen?.().catch(() => {});
+    }
+  };
+
+  // Chrome only fades out while the pointer is still; any movement brings it
+  // straight back.
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  const pokePointer = () => {
+    if (!isFullscreen()) return;
+    setPointerIdle(false);
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => setPointerIdle(true), IDLE_TIMEOUT);
+  };
+  onCleanup(() => clearTimeout(idleTimer));
+
+  const chromeHidden = () => isFullscreen() && pointerIdle();
 
   const getHeight = () => {
+    if (isFullscreen()) return { width: "100%", height: "100%" };
     if (!props.focus || videoDims().height == 0) return {};
     // Calculate the aspect ratio
     const ratio = videoDims().width / videoDims().height;
@@ -86,6 +166,7 @@ export function ParticipantTile(props: TileProps) {
   return (
     <Show when={!isScreenShare() || !isRemoteScreenShareMuted()}>
       <div
+        ref={tileRef}
         class={
           tile({
             speaking: !isScreenShare() && isSpeaking(),
@@ -95,6 +176,7 @@ export function ParticipantTile(props: TileProps) {
           }) + (isScreenShare() ? " vc_tile group" : " vc_tile")
         }
         onClick={() => voice.toggleFocus(track)}
+        onMouseMove={pokePointer}
         use:floating={{
           // TODO: Conflicts with focusing, maybe only show if clicking name itself
           //   userCard: {
@@ -110,7 +192,7 @@ export function ParticipantTile(props: TileProps) {
             />
           ),
         }}
-        style={{ ...getHeight() }}
+        style={{ ...getHeight(), cursor: chromeHidden() ? "none" : undefined }}
       >
         <Show
           when={isVideo() || isScreenShare()}
@@ -125,52 +207,103 @@ export function ParticipantTile(props: TileProps) {
             </AvatarOnly>
           }
         >
-          <VideoTrack
-            style={{
-              "grid-area": "1/1",
-              "object-fit": "contain",
-              width: "100%",
-              height: "100%",
-              overflow: "hidden",
-            }}
+          <Show
+            when={isWatching()}
+            fallback={
+              <NotWatching onClick={startWatching}>
+                <Symbol size={32}>screen_share</Symbol>
+                <NotWatchingTitle>
+                  {user().username} is sharing their screen
+                </NotWatchingTitle>
+                <WatchButton>Watch stream</WatchButton>
+              </NotWatching>
+            }
+          >
+            <VideoTrack
+              style={{
+                "grid-area": "1/1",
+                "object-fit": "contain",
+                width: "100%",
+                height: "100%",
+                overflow: "hidden",
+              }}
+              trackRef={track as TrackReference}
+              manageSubscription={!isScreenShare()}
+              ref={videoRef}
+              on:resize={() => {
+                setVideoDims({
+                  height: videoRef?.videoHeight || 0,
+                  width: videoRef?.videoWidth || 0,
+                });
+              }}
+            />
+          </Show>
+        </Show>
+
+        <Show when={isScreenShare() && isWatching() && showStats()}>
+          <ScreenShareStats
             trackRef={track as TrackReference}
-            manageSubscription={true}
-            ref={videoRef}
-            on:resize={() => {
-              setVideoDims({
-                height: videoRef?.videoHeight || 0,
-                width: videoRef?.videoWidth || 0,
-              });
-            }}
+            username={user().username}
+            onClose={() => setShowStats(false)}
           />
         </Show>
-        <Overlay showOnHover={isScreenShare()}>
-          <OverlayInner>
-            <OverflowingText>{user().username}</OverflowingText>
-            <Row gap="md">
-              {isScreenShare() ? (
-                <Show when={isScreenShareAudioUserMuted()}>
-                  <Symbol
-                    size={18}
-                    color={
-                      isScreenShareAudioUserMuted() === "by-user"
-                        ? "var(--md-sys-color-error)"
-                        : undefined
-                    }
-                  >
-                    no_sound
-                  </Symbol>
-                </Show>
-              ) : (
-                <VoiceStatefulUserIcons
-                  userId={participant.identity}
-                  muted={isMuted()}
-                  camera={isVideo()}
-                />
-              )}
-            </Row>
-          </OverlayInner>
-        </Overlay>
+
+        <Show when={isScreenShare() && isWatching() && !chromeHidden()}>
+          <Controls onClick={(e) => e.stopPropagation()}>
+            <ControlButton
+              title="Statistics"
+              onClick={(e) => {
+                e.stopPropagation();
+                setShowStats((v) => !v);
+              }}
+            >
+              <Symbol size={18}>analytics</Symbol>
+            </ControlButton>
+            <Show when={!isSelf()}>
+              <ControlButton title="Stop watching" onClick={stopWatching}>
+                <Symbol size={18}>visibility_off</Symbol>
+              </ControlButton>
+            </Show>
+            <ControlButton
+              title={isFullscreen() ? "Exit fullscreen" : "Fullscreen"}
+              onClick={toggleFullscreen}
+            >
+              <Symbol size={18}>
+                {isFullscreen() ? "fullscreen_exit" : "fullscreen"}
+              </Symbol>
+            </ControlButton>
+          </Controls>
+        </Show>
+
+        <Show when={!chromeHidden()}>
+          <Overlay showOnHover={isScreenShare()}>
+            <OverlayInner>
+              <OverflowingText>{user().username}</OverflowingText>
+              <Row gap="md">
+                {isScreenShare() ? (
+                  <Show when={isScreenShareAudioUserMuted()}>
+                    <Symbol
+                      size={18}
+                      color={
+                        isScreenShareAudioUserMuted() === "by-user"
+                          ? "var(--md-sys-color-error)"
+                          : undefined
+                      }
+                    >
+                      no_sound
+                    </Symbol>
+                  </Show>
+                ) : (
+                  <VoiceStatefulUserIcons
+                    userId={participant.identity}
+                    muted={isMuted()}
+                    camera={isVideo()}
+                  />
+                )}
+              </Row>
+            </OverlayInner>
+          </Overlay>
+        </Show>
       </div>
     </Show>
   );
@@ -194,6 +327,17 @@ export const tile = cva({
     outlineStyle: "solid",
     outlineOffset: "-3px",
     outlineColor: "transparent",
+
+    // Fullscreen must fill the screen rather than keep the grid sizing.
+    "&:fullscreen": {
+      width: "100%",
+      height: "100%",
+      maxWidth: "none",
+      maxHeight: "none",
+      aspectRatio: "auto",
+      borderRadius: 0,
+      background: "#000",
+    },
   },
   variants: {
     speaking: {
@@ -248,6 +392,77 @@ const AvatarOnly = styled("div", {
       height: "30% !important",
       minHeight: "48px",
     },
+  },
+});
+
+const NotWatching = styled("div", {
+  base: {
+    gridArea: "1/1",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: "var(--gap-sm)",
+    padding: "var(--gap-lg)",
+    textAlign: "center",
+    background: "#0003",
+    cursor: "pointer",
+  },
+});
+
+const NotWatchingTitle = styled("div", {
+  base: {
+    fontSize: "0.8rem",
+    opacity: 0.75,
+    minWidth: 0,
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+    maxWidth: "100%",
+  },
+});
+
+const WatchButton = styled("div", {
+  base: {
+    marginTop: "var(--gap-sm)",
+    padding: "var(--gap-sm) var(--gap-lg)",
+    borderRadius: "var(--borderRadius-full, 999px)",
+    background: "var(--md-sys-color-primary)",
+    color: "var(--md-sys-color-on-primary)",
+    fontSize: "0.8rem",
+    fontWeight: 600,
+  },
+});
+
+const Controls = styled("div", {
+  base: {
+    gridArea: "1/1",
+    alignSelf: "start",
+    justifySelf: "end",
+    margin: "var(--gap-md)",
+    zIndex: 9,
+
+    display: "flex",
+    gap: "var(--gap-sm)",
+
+    opacity: 0,
+    transition: "var(--transitions-fast) opacity",
+    _groupHover: { opacity: 1 },
+  },
+});
+
+const ControlButton = styled("button", {
+  base: {
+    all: "unset",
+    cursor: "pointer",
+    display: "grid",
+    placeItems: "center",
+    width: "28px",
+    height: "28px",
+    borderRadius: "var(--borderRadius-md)",
+    background: "#000000aa",
+    color: "#fff",
+    _hover: { background: "#000000dd" },
   },
 });
 
