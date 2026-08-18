@@ -40,7 +40,12 @@ let context: AudioContext | undefined;
 let timer: ReturnType<typeof setInterval> | undefined;
 
 /**
- * Shared AudioContext, created on first use and closed with the last meter
+ * Shared AudioContext.
+ *
+ * Kept for the lifetime of the page rather than closed with the last meter:
+ * the track references are rebuilt on every room event, so meters churn, and
+ * browsers cap how many AudioContexts may exist at once. It is suspended
+ * while nothing is being metered instead.
  */
 function audioContext(): AudioContext {
   if (!context) context = new AudioContext();
@@ -147,8 +152,7 @@ export function registerSpeakingMeter(
         timer = undefined;
       }
 
-      context?.close().catch(() => {});
-      context = undefined;
+      context?.suspend().catch(() => {});
     }
   };
 }
