@@ -147,6 +147,11 @@ function Participants() {
     const withVideo = tracks.filter(
       (t) => t.publication && !t.publication.isMuted,
     );
+
+    // While something is focused the grid is just the strip underneath it, and
+    // an empty strip is exactly what was asked for. It is only the unfocused
+    // grid -- the whole card -- that must not end up blank.
+    if (voice.focusId()) return withVideo;
     return withVideo.length ? withVideo : tracks;
   });
 
