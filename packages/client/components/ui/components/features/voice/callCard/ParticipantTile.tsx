@@ -109,6 +109,43 @@ export function ParticipantTile(props: TileProps) {
     }
   });
 
+  /**
+   * Subscribing is asynchronous, so there is a window after clicking "watch"
+   * where the publication exists but carries no media. Rendering the video
+   * element then leaves an empty, collapsed tile -- so wait for the track.
+   */
+  const [trackReady, setTrackReady] = createSignal(false);
+
+  createEffect(() => {
+    if (!isScreenShare()) {
+      setTrackReady(true);
+      return;
+    }
+    if (!isWatching()) {
+      setTrackReady(false);
+      return;
+    }
+
+    const hasTrack = () => {
+      const publication = track.publication as
+        | RemoteTrackPublication
+        | undefined;
+      const ready = !!publication?.track;
+      setTrackReady(ready);
+      return ready;
+    };
+
+    if (hasTrack()) return;
+    const poll = setInterval(() => {
+      if (hasTrack()) clearInterval(poll);
+    }, 200);
+    onCleanup(() => clearInterval(poll));
+  });
+
+  /** Whether an actual video surface is on screen, as opposed to a placeholder */
+  const showingVideo = () =>
+    isVideo() || (isScreenShare() && isWatching() && trackReady());
+
   const startWatching = (e: MouseEvent) => {
     e.stopPropagation();
     state.voice.setScreenShareWatching(participant.identity, true);
@@ -170,7 +207,7 @@ export function ParticipantTile(props: TileProps) {
         class={
           tile({
             speaking: !isScreenShare() && isSpeaking(),
-            video: isVideo() || isScreenShare(),
+            video: showingVideo(),
             fullscreen: voice.fullscreen(),
             ...props,
           }) + (isScreenShare() ? " vc_tile group" : " vc_tile")
@@ -219,6 +256,12 @@ export function ParticipantTile(props: TileProps) {
               </NotWatching>
             }
           >
+            <Show when={!trackReady()}>
+              <Connecting>
+                <Symbol size={28}>hourglass_top</Symbol>
+                <NotWatchingTitle>Connecting…</NotWatchingTitle>
+              </Connecting>
+            </Show>
             <VideoTrack
               style={{
                 "grid-area": "1/1",
@@ -228,7 +271,7 @@ export function ParticipantTile(props: TileProps) {
                 overflow: "hidden",
               }}
               trackRef={track as TrackReference}
-              manageSubscription={!isScreenShare()}
+              manageSubscription={true}
               ref={videoRef}
               on:resize={() => {
                 setVideoDims({
@@ -419,6 +462,19 @@ const NotWatchingTitle = styled("div", {
     textOverflow: "ellipsis",
     whiteSpace: "nowrap",
     maxWidth: "100%",
+  },
+});
+
+const Connecting = styled("div", {
+  base: {
+    gridArea: "1/1",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: "var(--gap-sm)",
+    background: "#0004",
+    zIndex: 2,
   },
 });
 

@@ -521,6 +521,24 @@ class Voice {
               restrictOwnAudio: true,
             },
           },
+          {
+            // LiveKit's h1080fps30 preset caps the stream at roughly 2.5 Mbps.
+            // 1080p screen content cannot hold 30fps within that, so the
+            // encoder trades frames away and settles around 10-12fps even on a
+            // connection with plenty of headroom. Give it room, and tell it to
+            // protect the framerate rather than the resolution.
+            screenShareEncoding: {
+              maxBitrate: 6_000_000,
+              maxFramerate: 30,
+              priority: "high",
+            },
+            // VP9 is dramatically more efficient than VP8 on screen content
+            // (large flat areas, sharp text). backupCodec keeps clients that
+            // cannot decode it working via a VP8 stream.
+            videoCodec: "vp9",
+            backupCodec: true,
+            degradationPreference: "maintain-framerate",
+          },
         );
 
         const screenAudioTrack = room.localParticipant.getTrackPublication(
