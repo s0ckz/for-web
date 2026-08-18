@@ -47,6 +47,7 @@ import {
 } from "./soundboard";
 import { registerSpeakingMeter } from "./speaking";
 import { VoiceProcessor } from "./VoiceProcessor";
+import { perceptualGain } from "./volume";
 
 type State =
   | "READY"
@@ -225,7 +226,10 @@ class Voice {
       const settings = getSettings();
       const muted = settings.soundboardMuted || settings.deafen;
       soundboard.setMonitorVolume(
-        muted ? 0 : settings.soundboardVolume * settings.outputVolume,
+        muted
+          ? 0
+          : perceptualGain(settings.soundboardVolume) *
+              perceptualGain(settings.outputVolume),
       );
     });
 

@@ -285,7 +285,9 @@ export class Voice extends AbstractStore<"voice", TypeVoice> {
    * @returns Volume or default
    */
   getUserVolume(userId: string): number {
-    return this.get().userVolumes[userId] || 1.0;
+    // ?? rather than ||: 0 is a legitimate setting, and `||` turned a slider
+    // dragged to zero back into full volume.
+    return this.get().userVolumes[userId] ?? 1.0;
   }
 
   /**
@@ -321,7 +323,8 @@ export class Voice extends AbstractStore<"voice", TypeVoice> {
    * @returns Volume or default
    */
   getScreenShareVolume(userId: string): number {
-    return this.get().screenShareVolumes[userId] || 1.0;
+    // ?? rather than ||, see getUserVolume
+    return this.get().screenShareVolumes[userId] ?? 1.0;
   }
 
   /**

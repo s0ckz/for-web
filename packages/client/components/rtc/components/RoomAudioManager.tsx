@@ -14,6 +14,7 @@ import { useState } from "@revolt/state";
 import { isSoundboardPublication } from "../soundboard";
 import { registerSpeakingMeter } from "../speaking";
 import { useVoice } from "../state";
+import { perceptualGain } from "../volume";
 
 /**
  * Meter a remote participant's real microphone so the speaking indicator can
@@ -78,14 +79,16 @@ export function RoomAudioManager() {
             <AudioTrack
               trackRef={track()}
               volume={
-                state.voice.outputVolume *
-                (isSoundboardPublication(track().publication)
-                  ? state.voice.soundboardVolume
-                  : track().source === Track.Source.ScreenShareAudio
-                    ? state.voice.getScreenShareVolume(
-                        track().participant.identity,
-                      )
-                    : state.voice.getUserVolume(track().participant.identity))
+                perceptualGain(state.voice.outputVolume) *
+                perceptualGain(
+                  isSoundboardPublication(track().publication)
+                    ? state.voice.soundboardVolume
+                    : track().source === Track.Source.ScreenShareAudio
+                      ? state.voice.getScreenShareVolume(
+                          track().participant.identity,
+                        )
+                      : state.voice.getUserVolume(track().participant.identity),
+                )
               }
               muted={
                 (isSoundboardPublication(track().publication)
