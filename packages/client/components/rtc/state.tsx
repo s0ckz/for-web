@@ -513,12 +513,18 @@ class Voice {
       let screenPickerQualityName: ScreenShareQualityName | undefined;
       let screenPickerAudio: boolean | undefined;
 
+      // The desktop picker answers a cancel with `callback({})`, which
+      // getDisplayMedia rejects with something other than NotAllowedError, so
+      // the generic error modal used to pop up on a plain "never mind".
+      let cancelled = false;
+
       // Register the modal on screen picker handler if it exists
       if (window.native && window.native.onceScreenPicker) {
         window.native.onceScreenPicker((sources) => {
           this.openModal({
             type: "screen_share_picker",
             onCancel: () => {
+              cancelled = true;
               window.native.screenPickerCallback(-1, false);
             },
             callback: (
@@ -638,6 +644,7 @@ class Voice {
               screenAudioTrack?.pauseUpstream();
               this.openModal({
                 onCancel: async () => {
+                  cancelled = true;
                   await room.localParticipant.setScreenShareEnabled(false);
                   this.#setScreenshare(
                     room.localParticipant.isScreenShareEnabled,
@@ -671,6 +678,7 @@ class Voice {
           }
         }
       } catch (e) {
+        if (cancelled) return;
         this.onErr(e);
       }
     }
@@ -811,7 +819,10 @@ class Voice {
   }
 
   private onErr(e: unknown) {
-    if ((e as Error).name !== "NotAllowedError")
+    // NotAllowedError is the spec cancel; Firefox/Safari answer a dismissed
+    // picker with AbortError. Neither is worth an error modal.
+    const name = (e as Error)?.name;
+    if (name !== "NotAllowedError" && name !== "AbortError")
       this.openModal({ type: "error2", error: e });
   }
 }
