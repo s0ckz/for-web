@@ -1,6 +1,13 @@
 import { useLingui } from "@lingui/solid/macro";
 import { createResizeObserver } from "@solid-primitives/resize-observer";
-import { createEffect, createMemo, For, onMount, Show } from "solid-js";
+import {
+  createEffect,
+  createMemo,
+  For,
+  onCleanup,
+  onMount,
+  Show,
+} from "solid-js";
 import { TrackLoop } from "solid-livekit-components";
 import { styled } from "styled-system/jsx";
 
@@ -119,6 +126,18 @@ const TILE_MIN_WIDTH = "250px",
   TILE_MIN_FOCUS_HEIGHT = "100px";
 
 /**
+ * How long a pinned stream may be missing before the pin is given up.
+ *
+ * Windows ends a screen capture when the shared window is destroyed or
+ * minimised -- alt-tabbing out of a fullscreen game does both -- so the track
+ * is unpublished and a new one takes its place a few seconds later. The pin is
+ * keyed by participant rather than by track, so simply not letting go of it
+ * means the stream drops back into place by itself and nobody has to click the
+ * tile again.
+ */
+const FOCUS_GRACE_MS = 60_000;
+
+/**
  * Show a grid of participants
  */
 function Participants() {
@@ -130,6 +149,15 @@ function Participants() {
   const testTrackCount = 0;
 
   let callRef: HTMLDivElement | undefined;
+
+  /**
+   * Whether something is focused *and* actually on screen right now.
+   *
+   * While a pinned stream is away the pin is still remembered, but the layout
+   * has to behave as though nothing were focused -- otherwise the card sits
+   * there with an empty focus area above a strip.
+   */
+  const focused = createMemo(() => !!voice.focusTrack());
 
   /**
    * Everything that is not currently focused, optionally narrowed to tiles
@@ -151,7 +179,7 @@ function Participants() {
     // While something is focused the grid is just the strip underneath it, and
     // an empty strip is exactly what was asked for. It is only the unfocused
     // grid -- the whole card -- that must not end up blank.
-    if (voice.focusId()) return withVideo;
+    if (focused()) return withVideo;
     return withVideo.length ? withVideo : tracks;
   });
 
@@ -160,10 +188,23 @@ function Participants() {
     return `max(${TILE_MIN_WIDTH}, ${vidWidth}% - var(--gap-md))`;
   };
 
-  // Clear out any focus when the track that was focused is no longer available.
+  // Give a pinned stream that disappears a chance to come back before letting
+  // go of it; see FOCUS_GRACE_MS.
+  let focusGrace: ReturnType<typeof setTimeout> | undefined;
+
   createEffect(() => {
-    if (!voice.focusTrack()) voice.toggleFocus();
+    const pinnedButMissing = !!voice.focusId() && !voice.focusTrack();
+
+    clearTimeout(focusGrace);
+    if (!pinnedButMissing) return;
+
+    focusGrace = setTimeout(() => {
+      // Still nothing after the grace period, so it is not coming back.
+      if (!voice.focusTrack()) voice.toggleFocus();
+    }, FOCUS_GRACE_MS);
   });
+
+  onCleanup(() => clearTimeout(focusGrace));
 
   onMount(() => {
     createResizeObserver(callRef, ({ width, height }, el) => {
@@ -175,10 +216,10 @@ function Participants() {
   });
 
   return (
-    <Call ref={callRef} class={voice.focusId() ? "" : scrollableStyles()}>
+    <Call ref={callRef} class={focused() ? "" : scrollableStyles()}>
       <InRoom>
         <FocusedParticipant />
-        <Show when={voice.focusId()}>
+        <Show when={focused()}>
           <ShowBarButtonHolder>
             <div style={{ "margin-bottom": "10px" }}>
               <IconButton
@@ -203,9 +244,9 @@ function Participants() {
           </ShowBarButtonHolder>
         </Show>
         <Grid
-          focus={!!voice.focusId()}
+          focus={focused()}
           show={voice.showBar()}
-          class={voice.focusId() ? scrollableStyles({ direction: "x" }) : ""}
+          class={focused() ? scrollableStyles({ direction: "x" }) : ""}
           style={{ "--vc-tile-width": tileWidth() }}
         >
           <TrackLoop tracks={gridTracks}>{() => <ParticipantTile />}</TrackLoop>
