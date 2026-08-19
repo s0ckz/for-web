@@ -2,14 +2,19 @@ import { createSignal, For, onCleanup, Show } from "solid-js";
 
 import type { TrackReference } from "solid-livekit-components";
 
+import { isLocal } from "@livekit/components-core";
 import { styled } from "styled-system/jsx";
 
 /**
- * Playback statistics for a screen share you are watching.
+ * Statistics for a screen share.
  *
- * Reads WebRTC inbound-rtp stats straight off the receiver, so it reports what
- * actually arrived rather than what was requested. The copy button produces a
- * plain text block suitable for pasting into a bug report.
+ * For a share you are watching, this reads inbound-rtp off the receiver, so it
+ * reports what actually arrived rather than what was requested. For your own
+ * share it reads outbound-rtp and media-source off the sender instead, which
+ * is the only way to tell the two halves of a framerate problem apart: what
+ * the capturer produced versus what the encoder managed to send, and why it
+ * was held back. The copy button produces a plain text block suitable for
+ * pasting into a bug report.
  */
 
 type Row = { label: string; value: string };
@@ -34,10 +39,160 @@ export function ScreenShareStats(props: {
   let lastBytes = 0;
   let lastAt = 0;
   let lastFramesDecoded = 0;
+  let lastFramesSent = 0;
+
+  const sending = () => isLocal(props.trackRef.participant);
+
+  /**
+   * Stats for your own share: what the capturer produced, what the encoder
+   * actually sent, and what held it back.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const sampleOutbound = async (track: any) => {
+    const sender: RTCRtpSender | undefined = track?.sender;
+
+    if (!sender?.getStats) {
+      setRows([{ label: "Status", value: "not publishing" }]);
+      return;
+    }
+
+    let report: RTCStatsReport;
+    try {
+      report = await sender.getStats();
+    } catch {
+      setRows([{ label: "Status", value: "stats unavailable" }]);
+      return;
+    }
+
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    let outbound: any = null;
+    let source: any = null;
+    let remoteInbound: any = null;
+    let candidatePair: any = null;
+    const codecs = new Map<string, any>();
+    let bytes = 0;
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+
+    report.forEach((stat) => {
+      if (stat.type === "codec") codecs.set(stat.id, stat);
+      if (stat.type === "media-source" && stat.kind === "video") source = stat;
+      if (stat.type === "remote-inbound-rtp" && stat.kind === "video")
+        remoteInbound = stat;
+      if (stat.type === "candidate-pair" && stat.nominated)
+        candidatePair = stat;
+      if (stat.type === "outbound-rtp" && stat.kind === "video") {
+        bytes += stat.bytesSent ?? 0;
+        // Simulcast or a backup codec means several outbound streams; report
+        // the largest, which is the one people are actually watching.
+        if (!outbound || (stat.frameWidth ?? 0) > (outbound.frameWidth ?? 0)) {
+          outbound = stat;
+        }
+      }
+    });
+
+    if (!outbound) {
+      setRows([{ label: "Status", value: "no video being sent" }]);
+      return;
+    }
+
+    const now = performance.now();
+    let bitrate = 0;
+    if (lastAt) {
+      const seconds = (now - lastAt) / 1000;
+      if (seconds > 0) bitrate = ((bytes - lastBytes) * 8) / seconds;
+    }
+
+    let fps: number | undefined = outbound.framesPerSecond;
+    const framesSent = outbound.framesSent ?? 0;
+    if (fps === undefined && lastAt) {
+      const seconds = (now - lastAt) / 1000;
+      if (seconds > 0) fps = (framesSent - lastFramesSent) / seconds;
+    }
+
+    lastBytes = bytes;
+    lastAt = now;
+    lastFramesSent = framesSent;
+
+    const codec = codecs.get(outbound.codecId);
+
+    // Where the time went while quality was limited -- `cpu` here means the
+    // encoder could not keep up, `bandwidth` means the network could not.
+    const durations = outbound.qualityLimitationDurations ?? {};
+    const limitBreakdown = ["cpu", "bandwidth", "other"]
+      .filter((k) => (durations[k] ?? 0) > 0.1)
+      .map((k) => `${k} ${(durations[k] as number).toFixed(1)}s`)
+      .join(", ");
+
+    const next: Row[] = [
+      {
+        label: "Capture",
+        value: source?.width ? `${source.width}x${source.height}` : NA,
+      },
+      {
+        label: "Capture rate",
+        value:
+          source?.framesPerSecond !== undefined
+            ? `${Math.round(source.framesPerSecond)} fps`
+            : NA,
+      },
+      {
+        label: "Sending",
+        value: outbound.frameWidth
+          ? `${outbound.frameWidth}x${outbound.frameHeight}`
+          : NA,
+      },
+      { label: "Send rate", value: fps ? `${Math.round(fps)} fps` : NA },
+      { label: "Bitrate", value: formatBitrate(bitrate) },
+      {
+        label: "Codec",
+        value: codec?.mimeType ? codec.mimeType.replace("video/", "") : NA,
+      },
+      { label: "Encoder", value: outbound.encoderImplementation ?? NA },
+      { label: "Scalability", value: outbound.scalabilityMode ?? NA },
+      {
+        label: "Limited by",
+        value: outbound.qualityLimitationReason ?? NA,
+      },
+      { label: "Limited for", value: limitBreakdown || "never" },
+      {
+        label: "Frames sent",
+        value: `${framesSent} of ${outbound.framesEncoded ?? 0} encoded`,
+      },
+      {
+        label: "Packets lost",
+        value:
+          remoteInbound?.packetsLost !== undefined
+            ? `${remoteInbound.packetsLost}`
+            : NA,
+      },
+      {
+        label: "Round trip",
+        value:
+          remoteInbound?.roundTripTime !== undefined
+            ? `${Math.round(remoteInbound.roundTripTime * 1000)} ms`
+            : NA,
+      },
+      {
+        label: "Link capacity",
+        value: candidatePair?.availableOutgoingBitrate
+          ? formatBitrate(candidatePair.availableOutgoingBitrate)
+          : NA,
+      },
+      {
+        label: "NACK / PLI",
+        value: `${outbound.nackCount ?? 0} / ${outbound.pliCount ?? 0}`,
+      },
+    ];
+
+    setRows(next);
+  };
 
   const sample = async () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const track = props.trackRef.publication?.track as any;
+
+    if (sending()) return sampleOutbound(track);
+
     const receiver: RTCRtpReceiver | undefined = track?.receiver;
 
     if (!receiver?.getStats) {
@@ -63,7 +218,8 @@ export function ScreenShareStats(props: {
     report.forEach((stat) => {
       if (stat.type === "codec") codecs.set(stat.id, stat);
       if (stat.type === "inbound-rtp" && stat.kind === "video") inbound = stat;
-      if (stat.type === "candidate-pair" && stat.nominated) candidatePair = stat;
+      if (stat.type === "candidate-pair" && stat.nominated)
+        candidatePair = stat;
     });
 
     if (!inbound) {
@@ -157,7 +313,10 @@ export function ScreenShareStats(props: {
           ? formatBitrate(candidatePair.availableIncomingBitrate)
           : NA,
       },
-      { label: "NACK / PLI", value: `${inbound.nackCount ?? 0} / ${inbound.pliCount ?? 0}` },
+      {
+        label: "NACK / PLI",
+        value: `${inbound.nackCount ?? 0} / ${inbound.pliCount ?? 0}`,
+      },
     ];
 
     setRows(next);
@@ -173,6 +332,7 @@ export function ScreenShareStats(props: {
       .join("\n");
     const text = [
       `screen share stats -- ${props.username}`,
+      `direction ${sending() ? "outbound (sender)" : "inbound (viewer)"}`,
       `captured ${new Date().toISOString()}`,
       `user agent ${navigator.userAgent}`,
       "",
@@ -190,7 +350,7 @@ export function ScreenShareStats(props: {
   return (
     <Panel onClick={(e) => e.stopPropagation()}>
       <Header>
-        <span>stats for nerds</span>
+        <span>stats for nerds{sending() ? " -- your share" : ""}</span>
         <Buttons>
           <Action onClick={copy}>{copied() ? "copied" : "copy"}</Action>
           <Show when={props.onClose}>

@@ -98,15 +98,19 @@ function at60(resolution: VideoResolution): VideoResolution {
  * @param frameRate Target framerate
  * @returns Publish options
  */
+function screenShareEncoding(frameRate: number) {
+  return {
+    // Twice the frames need roughly half again the bitrate; VP9 absorbs the
+    // rest. 60fps at 6 Mbps would just be 30fps with extra steps.
+    maxBitrate: frameRate > 30 ? 9_000_000 : 6_000_000,
+    maxFramerate: frameRate,
+    priority: "high" as const,
+  };
+}
+
 function screenSharePublishOptions(frameRate: number): TrackPublishOptions {
   return {
-    screenShareEncoding: {
-      // Twice the frames need roughly half again the bitrate; VP9 absorbs the
-      // rest. 60fps at 6 Mbps would just be 30fps with extra steps.
-      maxBitrate: frameRate > 30 ? 9_000_000 : 6_000_000,
-      maxFramerate: frameRate,
-      priority: "high",
-    },
+    screenShareEncoding: screenShareEncoding(frameRate),
     // VP9 is dramatically more efficient than VP8 on screen content (large
     // flat areas, sharp text). backupCodec keeps clients that cannot decode it
     // working via a VP8 stream.
@@ -750,6 +754,57 @@ class Voice {
    * @param audio Whether the share's audio should be kept
    * @param announce Whether to play the "stream started" sound
    */
+  /**
+   * Bring the encoder in line with a quality chosen *after* publishing.
+   *
+   * Publish options are fixed when the track goes up, from the saved quality,
+   * while the "always ask" dialog only re-applied capture constraints. The two
+   * could therefore disagree: picking 60fps on top of a saved 30fps default
+   * left `maxFramerate: 30` on the sender, so the share stayed pinned at 30 no
+   * matter how many frames the capturer produced.
+   * @param localTrack Screen share publication
+   * @param frameRate Framerate the user actually chose
+   */
+  async #applyEncoderLimits(
+    localTrack: LocalTrackPublication,
+    frameRate: number,
+  ) {
+    const sender = localTrack.videoTrack?.sender;
+    if (!sender?.getParameters) return;
+
+    try {
+      const params = sender.getParameters();
+      if (!params.encodings?.length) return;
+
+      const { maxBitrate, maxFramerate } = screenShareEncoding(frameRate);
+      let changed = false;
+
+      for (const encoding of params.encodings) {
+        if (encoding.maxFramerate !== maxFramerate) {
+          encoding.maxFramerate = maxFramerate;
+          changed = true;
+        }
+
+        // Only touch the bitrate when there is a single encoding. Simulcast
+        // layers carry deliberately different ceilings and must not all be
+        // flattened to the top one; screen shares with an SVC codec (our case)
+        // publish exactly one.
+        if (
+          params.encodings.length === 1 &&
+          encoding.maxBitrate !== maxBitrate
+        ) {
+          encoding.maxBitrate = maxBitrate;
+          changed = true;
+        }
+      }
+
+      if (changed) await sender.setParameters(params);
+    } catch (err) {
+      // Not fatal: the share is up, it is just capped where it was published.
+      console.warn("[rtc] could not update screen share encoder limits", err);
+    }
+  }
+
   async #applyShareChoice(
     room: Room,
     localTrack: LocalTrackPublication,
@@ -788,6 +843,11 @@ class Voice {
     });
 
     localTrack.videoTrack.mediaStreamTrack.contentHint = quality.contentHint;
+
+    await this.#applyEncoderLimits(
+      localTrack,
+      quality.resolution.frameRate ?? 30,
+    );
 
     if (!audio) {
       const screenAudioTrack = room.localParticipant.getTrackPublication(
