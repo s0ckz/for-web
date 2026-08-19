@@ -3,6 +3,7 @@ import { createResizeObserver } from "@solid-primitives/resize-observer";
 import {
   createEffect,
   createMemo,
+  createSignal,
   For,
   onCleanup,
   onMount,
@@ -122,8 +123,13 @@ function VoiceShowNonVideoParticipants() {
   );
 }
 
-const TILE_MIN_WIDTH = "250px",
-  TILE_MIN_FOCUS_HEIGHT = "100px";
+const TILE_MIN_WIDTH = 250,
+  TILE_MIN_FOCUS_HEIGHT = "100px",
+  TILE_ASPECT = 16 / 9,
+  /** Mirrors --gap-md, the gap the grid puts between tiles. */
+  GRID_GAP = 8,
+  /** How much larger a layout with more rows must be to be worth stacking. */
+  ROW_PENALTY = 1.1;
 
 /**
  * How long a pinned stream may be missing before the pin is given up.
@@ -149,6 +155,9 @@ function Participants() {
   const testTrackCount = 0;
 
   let callRef: HTMLDivElement | undefined;
+
+  /** Size of the grid area, kept up to date by the resize observer below. */
+  const [box, setBox] = createSignal({ w: 0, h: 0 });
 
   /**
    * Whether something is focused *and* actually on screen right now.
@@ -183,9 +192,73 @@ function Participants() {
     return withVideo.length ? withVideo : tracks;
   });
 
+  /**
+   * Column count that makes the tiles as large as the card allows.
+   *
+   * Every tile is 16/9, so a candidate column count is worth exactly the tile
+   * width it yields: a column has to fit across the width, and the row it
+   * belongs to has to fit down the height, whichever binds first. Handing out
+   * 1/N of the width instead -- which is what this used to do -- always packs
+   * everyone onto one row, so four people on a tall card got quarter-width
+   * tiles and three quarters of the card stayed empty.
+   *
+   * Near-ties go to the layout with fewer rows: two people side by side reads
+   * better than two people stacked even where stacking is a few percent
+   * larger, and 6 belongs in 3x2 rather than 2x3. An exact tie goes to the
+   * wider layout, because when the height is what binds, the tiles end up
+   * narrower than their column and flex would pack that many per row anyway.
+   */
+  const columns = createMemo(() => {
+    const n = gridTracks().length + testTrackCount;
+    const { w, h } = box();
+    if (n < 2 || !w || !h) return Math.max(1, n);
+
+    const options: { c: number; rows: number; size: number }[] = [];
+    for (let c = 1; c <= n; c++) {
+      const rows = Math.ceil(n / c);
+      options.push({
+        c,
+        rows,
+        size: Math.min(
+          (w - (c - 1) * GRID_GAP) / c,
+          ((h - (rows - 1) * GRID_GAP) / rows) * TILE_ASPECT,
+        ),
+      });
+    }
+
+    const largest = Math.max(...options.map((o) => o.size));
+    return options
+      .filter((o) => o.size >= largest / ROW_PENALTY)
+      .sort(
+        (a, b) =>
+          a.rows - b.rows ||
+          Math.round(b.size) - Math.round(a.size) ||
+          b.c - a.c,
+      )[0].c;
+  });
+
+  /**
+   * Width of a single tile, which through `aspect-ratio` sets its height too.
+   *
+   * The 1px comes off because `cols * ((100% - gaps) / cols)` can land a hair
+   * over 100% once the browser snaps each flex item to 1/64px, which wraps a
+   * row early and drops the last tile out of view. Clamping by row height as
+   * well keeps a full grid inside the card; the `max()` floor is what is left
+   * over from the old behaviour, and still lets a crowded small card wrap and
+   * scroll rather than shrink tiles to nothing. Until the observer has
+   * measured the card --vc-h is missing, and the 100vh fallback simply leaves
+   * the column width binding for that first frame.
+   */
   const tileWidth = () => {
-    const vidWidth = Math.round(100 / (gridTracks().length + testTrackCount));
-    return `max(${TILE_MIN_WIDTH}, ${vidWidth}% - var(--gap-md))`;
+    const cols = columns();
+    const rows = Math.max(
+      1,
+      Math.ceil((gridTracks().length + testTrackCount) / cols),
+    );
+    const colGaps = (cols - 1) * GRID_GAP,
+      rowGaps = (rows - 1) * GRID_GAP;
+
+    return `max(${TILE_MIN_WIDTH}px, calc(min((100% - ${colGaps}px) / ${cols}, (var(--vc-h, 100vh) - ${rowGaps}px) / ${rows} * 16 / 9) - 1px))`;
   };
 
   // Give a pinned stream that disappears a chance to come back before letting
@@ -211,6 +284,7 @@ function Participants() {
       if (el === callRef) {
         el.style.setProperty("--vc-w", `${width}px`);
         el.style.setProperty("--vc-h", `${height}px`);
+        setBox({ w: width, h: height });
       }
     });
   });
