@@ -20,14 +20,20 @@ const NoiseSuppresionStates: NoiseSuppresionState[] = [
  * appeared on instances whose video_resolution limit allows 1080p, and it is
  * far too easy to select by accident and then assume the client is broken.
  */
-export type ScreenShareQualityName = "low" | "high";
+export type ScreenShareQualityName = "low" | "low60" | "high" | "high60";
 
 /**
  * Array of available screen share quality names.
+ *
+ * The `60` variants are the same resolutions at 60fps. There is no
+ * server-side framerate limit -- LiveKit simply ships no preset above 30 --
+ * so they are built by hand in `getEnabledScreenShareQualities`.
  */
 export const ScreenShareQualityNames: ScreenShareQualityName[] = [
   "low",
+  "low60",
   "high",
+  "high60",
 ];
 
 export interface TypeVoice {

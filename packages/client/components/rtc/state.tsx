@@ -74,24 +74,47 @@ const SCREEN_SHARE_AUDIO: ScreenShareCaptureOptions["audio"] = {
   restrictOwnAudio: true,
 };
 
-const SCREEN_SHARE_PUBLISH: TrackPublishOptions = {
-  // LiveKit's h1080fps30 preset caps the stream at roughly 2.5 Mbps.
-  // 1080p screen content cannot hold 30fps within that, so the encoder trades
-  // frames away and settles around 10-12fps even on a connection with plenty
-  // of headroom. Give it room, and tell it to protect the framerate rather
-  // than the resolution.
-  screenShareEncoding: {
-    maxBitrate: 6_000_000,
-    maxFramerate: 30,
-    priority: "high",
-  },
-  // VP9 is dramatically more efficient than VP8 on screen content (large flat
-  // areas, sharp text). backupCodec keeps clients that cannot decode it
-  // working via a VP8 stream.
-  videoCodec: "vp9",
-  backupCodec: true,
-  degradationPreference: "maintain-framerate",
-};
+/**
+ * The same resolution at 60fps.
+ *
+ * LiveKit ships no preset above 30 (`h720fps30`, `h1080fps15`, `h1080fps30`)
+ * and the instance imposes no framerate limit of its own, so the 60fps modes
+ * are simply the stock resolutions with the framerate raised.
+ * @param resolution Source resolution
+ * @returns Resolution at 60fps
+ */
+function at60(resolution: VideoResolution): VideoResolution {
+  return { ...resolution, frameRate: 60 };
+}
+
+/**
+ * Publishing options for a screen share at a given framerate.
+ *
+ * LiveKit's h1080fps30 preset caps the stream at roughly 2.5 Mbps. 1080p
+ * screen content cannot hold 30fps within that, so the encoder trades frames
+ * away and settles around 10-12fps even on a connection with plenty of
+ * headroom. Give it room, and tell it to protect the framerate rather than the
+ * resolution -- which is also what makes 60fps meaningful rather than a label.
+ * @param frameRate Target framerate
+ * @returns Publish options
+ */
+function screenSharePublishOptions(frameRate: number): TrackPublishOptions {
+  return {
+    screenShareEncoding: {
+      // Twice the frames need roughly half again the bitrate; VP9 absorbs the
+      // rest. 60fps at 6 Mbps would just be 30fps with extra steps.
+      maxBitrate: frameRate > 30 ? 9_000_000 : 6_000_000,
+      maxFramerate: frameRate,
+      priority: "high",
+    },
+    // VP9 is dramatically more efficient than VP8 on screen content (large
+    // flat areas, sharp text). backupCodec keeps clients that cannot decode it
+    // working via a VP8 stream.
+    videoCodec: "vp9",
+    backupCodec: true,
+    degradationPreference: "maintain-framerate",
+  };
+}
 
 /** At most this many automatic share recoveries ... */
 const MAX_RECOVERIES = 3;
@@ -523,7 +546,11 @@ class Voice {
    */
   #screenShareQuality(): ScreenShareQualityName {
     const saved = this.#settings.screenShareQuality;
-    return saved === "low" || saved === "high" ? saved : "low";
+    // Only offer back a quality this instance actually enables, so a saved
+    // 1080p60 does not survive the video limit being lowered.
+    return saved && this.getEnabledScreenShareQualities()[saved]
+      ? saved
+      : "low";
   }
 
   getEnabledScreenShareQualities(): Partial<
@@ -539,6 +566,12 @@ class Voice {
         fullName: `720p 30FPS`,
         contentHint: "motion",
       },
+      low60: {
+        name: "low60",
+        resolution: at60(ScreenSharePresets.h720fps30.resolution),
+        fullName: `720p 60FPS`,
+        contentHint: "motion",
+      },
     };
 
     const limit = this.limits().video_resolution;
@@ -552,6 +585,13 @@ class Voice {
         name: "high",
         resolution: ScreenSharePresets.h1080fps30.resolution,
         fullName: `1080p 30FPS`,
+        contentHint: "motion",
+      };
+
+      qualities.high60 = {
+        name: "high60",
+        resolution: at60(ScreenSharePresets.h1080fps30.resolution),
+        fullName: `1080p 60FPS`,
         contentHint: "motion",
       };
 
@@ -616,15 +656,18 @@ class Voice {
       }
 
       try {
+        // The picker can still change this, but capturing at the saved quality
+        // means a 60fps share starts at 60 rather than being raised into it.
+        const startingQuality =
+          qualities[this.#screenShareQuality()] ?? qualities.low!;
+
         const localTrack = await room.localParticipant.setScreenShareEnabled(
           true,
           {
-            resolution:
-              this.getEnabledScreenShareQualities()[this.#screenShareQuality()]
-                ?.resolution,
+            resolution: startingQuality.resolution,
             audio: SCREEN_SHARE_AUDIO,
           },
-          SCREEN_SHARE_PUBLISH,
+          screenSharePublishOptions(startingQuality.resolution.frameRate ?? 30),
         );
 
         const screenAudioTrack = room.localParticipant.getTrackPublication(
@@ -722,7 +765,12 @@ class Voice {
     if (!localTrack.videoTrack) return;
 
     await localTrack.videoTrack.mediaStreamTrack.applyConstraints({
-      frameRate: { max: quality.resolution.frameRate },
+      // `ideal` as well as `max`: asking only for a ceiling lets the source
+      // stay wherever it started, which is how a 60fps pick used to deliver 30.
+      frameRate: {
+        ideal: quality.resolution.frameRate,
+        max: quality.resolution.frameRate,
+      },
       width:
         quality.resolution.width === 0
           ? undefined
@@ -832,15 +880,16 @@ class Voice {
         }
       }
 
+      const recoveredQuality =
+        this.getEnabledScreenShareQualities()[choice.qualityName];
+
       const localTrack = await room.localParticipant.setScreenShareEnabled(
         true,
         {
-          resolution:
-            this.getEnabledScreenShareQualities()[choice.qualityName]
-              ?.resolution,
+          resolution: recoveredQuality?.resolution,
           audio: SCREEN_SHARE_AUDIO,
         },
-        SCREEN_SHARE_PUBLISH,
+        screenSharePublishOptions(recoveredQuality?.resolution.frameRate ?? 30),
       );
 
       if (!localTrack) return false;
