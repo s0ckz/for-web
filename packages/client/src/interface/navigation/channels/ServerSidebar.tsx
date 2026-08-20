@@ -476,6 +476,9 @@ function Entry(
 
   const inCall = () => props.channel.id === voice.channel()?.id;
 
+  const canAutoJoin = () =>
+    props.channel.isVoice && voice.channel()?.id !== props.channel.id;
+
   const attentionState = createMemo(() =>
     props.active
       ? "selected"
@@ -492,6 +495,7 @@ function Entry(
     <Column gap="sm">
       <MenuButton
         href={`/server/${props.channel.serverId}/channel/${props.channel.id}`}
+        onClick={canAutoJoin() ? () => voice.connect(props.channel) : undefined}
         use:floating={props.menuGenerator(props.channel)}
         size="normal"
         alert={alertState()}
