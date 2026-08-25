@@ -280,12 +280,27 @@ function Participants() {
   onCleanup(() => clearTimeout(focusGrace));
 
   onMount(() => {
+    // This observer writes to the element it is observing, so it can drive
+    // itself: --vc-h sizes the tiles, the tiles change the content height, the
+    // card's own scrollbar appears or disappears, and its box changes again.
+    // Sub-pixel jitter alone was enough to keep that going -- the log filled
+    // with "ResizeObserver loop completed with undelivered notifications" and
+    // the renderer sat on a full core for the whole call. Round to whole
+    // pixels and write only on a real change.
+    let lastW = -1;
+    let lastH = -1;
     createResizeObserver(callRef, ({ width, height }, el) => {
-      if (el === callRef) {
-        el.style.setProperty("--vc-w", `${width}px`);
-        el.style.setProperty("--vc-h", `${height}px`);
-        setBox({ w: width, h: height });
-      }
+      if (el !== callRef) return;
+
+      const w = Math.round(width);
+      const h = Math.round(height);
+      if (w === lastW && h === lastH) return;
+      lastW = w;
+      lastH = h;
+
+      el.style.setProperty("--vc-w", `${w}px`);
+      el.style.setProperty("--vc-h", `${h}px`);
+      setBox({ w, h });
     });
   });
 

@@ -247,17 +247,42 @@ export function VoiceChannelCallCardMount(props: {
   const setInfo = useContext(callCardContext)!;
   let ref: HTMLDivElement | undefined;
 
+  // The floating card is positioned from this rect, and with the chat hidden it
+  // grows to fill this very marker -- so publishing a fresh object on every
+  // observation feeds the card's own size back into the observer that measured
+  // it. Only publish when something actually moved.
+  let lastKey = "";
+
   function updateInfo() {
     const vc = voice.channel();
+    const drawer = state.appDrawer()?.state;
+    const expanded = props.expanded;
+    const elsewhere = !!vc && vc.id !== props.channel.id;
+    const pos = ref!.getBoundingClientRect();
+
+    const key = elsewhere
+      ? "elsewhere"
+      : [
+          props.channel.id,
+          Math.round(pos.x),
+          Math.round(pos.y),
+          Math.round(pos.width),
+          Math.round(pos.height),
+          drawer,
+          expanded,
+        ].join("|");
+    if (key === lastKey) return;
+    lastKey = key;
+
     setInfo(
-      !vc || vc.id === props.channel.id
-        ? {
+      elsewhere
+        ? undefined
+        : {
             channel: props.channel,
-            pos: ref!.getBoundingClientRect(),
-            drawer: state.appDrawer()?.state,
-            expanded: props.expanded,
-          }
-        : undefined,
+            pos,
+            drawer,
+            expanded,
+          },
     );
   }
 
