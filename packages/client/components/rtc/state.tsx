@@ -22,6 +22,7 @@ import {
   Track,
   TrackEvent,
   TrackPublishOptions,
+  VideoCodec,
   VideoResolution,
 } from "livekit-client";
 import { Channel } from "stoat.js";
@@ -100,22 +101,59 @@ function at60(resolution: VideoResolution): VideoResolution {
  */
 function screenShareEncoding(frameRate: number) {
   return {
-    // Twice the frames need roughly half again the bitrate; VP9 absorbs the
-    // rest. 60fps at 6 Mbps would just be 30fps with extra steps.
+    // Twice the frames need roughly half again the bitrate. This is a
+    // ceiling, not a target -- a hardware H.26x encoder settles well under
+    // it, so the extra headroom just leaves it room to breathe rather than
+    // forcing it there. 60fps at 6 Mbps would just be 30fps with extra steps.
     maxBitrate: frameRate > 30 ? 9_000_000 : 6_000_000,
     maxFramerate: frameRate,
     priority: "high" as const,
   };
 }
 
+/**
+ * The best codec this client can hardware-encode, in preference order.
+ *
+ * H.265 and H.264 are encoded by the GPU's fixed-function encoder on every
+ * current NVIDIA/AMD/Intel part; VP9 is hardware-encoded only on Intel, and
+ * LiveKit's forced L1T3 blocks even that -- so VP9 means libvpx on the CPU.
+ * Shares here are games and video, where H.26x's weak spot (sharp text on
+ * flat backgrounds) does not apply.
+ *
+ * AV1 is deliberately absent: LiveKit treats it as SVC and forces L1T3,
+ * which non-Intel hardware cannot do, so it would quietly land on libaom.
+ */
+let cachedScreenShareCodec: VideoCodec | undefined;
+function pickScreenShareCodec(): VideoCodec {
+  if (cachedScreenShareCodec) return cachedScreenShareCodec;
+
+  // Deliberately not cached: with no RTCRtpSender there is nothing to ask, and
+  // caching the guess would pin it for the browser that asks again later.
+  if (typeof RTCRtpSender === "undefined") return "vp9";
+
+  const codecs = RTCRtpSender.getCapabilities?.("video")?.codecs ?? [];
+  const mimeTypes = new Set(
+    codecs.map((codec) => codec.mimeType.toLowerCase()),
+  );
+
+  if (mimeTypes.has("video/h265")) return (cachedScreenShareCodec = "h265");
+  if (mimeTypes.has("video/h264")) return (cachedScreenShareCodec = "h264");
+  return (cachedScreenShareCodec = "vp9");
+}
+
 function screenSharePublishOptions(frameRate: number): TrackPublishOptions {
+  const videoCodec = pickScreenShareCodec();
   return {
     screenShareEncoding: screenShareEncoding(frameRate),
-    // VP9 is dramatically more efficient than VP8 on screen content (large
-    // flat areas, sharp text). backupCodec keeps clients that cannot decode it
-    // working via a VP8 stream.
-    videoCodec: "vp9",
-    backupCodec: true,
+    videoCodec,
+    // vp8 and h264 are the only codecs LiveKit accepts as a backup. Prefer
+    // h264 so the fallback stream is hardware-encoded too -- `backupCodec:
+    // true` resolves to vp8, which puts a software encoder back in the path.
+    backupCodec: videoCodec === "h264" ? { codec: "vp8" } : { codec: "h264" },
+    // h264/h265 are not SVC codecs, so LiveKit routes them down its simulcast
+    // branch and adds a second 960x540 encode. One hardware encode is the
+    // whole point, and `simulcast` defaults to true, so say no explicitly.
+    simulcast: false,
     degradationPreference: "maintain-framerate",
   };
 }
@@ -787,8 +825,8 @@ class Voice {
 
         // Only touch the bitrate when there is a single encoding. Simulcast
         // layers carry deliberately different ceilings and must not all be
-        // flattened to the top one; screen shares with an SVC codec (our case)
-        // publish exactly one.
+        // flattened to the top one; screen shares publish with `simulcast:
+        // false` (our case), so there is exactly one.
         if (
           params.encodings.length === 1 &&
           encoding.maxBitrate !== maxBitrate
