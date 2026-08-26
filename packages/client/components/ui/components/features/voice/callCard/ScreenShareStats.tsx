@@ -131,6 +131,24 @@ export function ScreenShareStats(props: {
 
     const codec = codecs.get(outbound.codecId);
 
+    // The budget line for "Encode time" needs the framerate we asked for,
+    // not `fps` (the measured send rate) -- when the encoder stalls, the
+    // measured rate drops, which *grows* the budget and makes a stalled
+    // encoder look healthier the worse it gets. `sender.getParameters()` is
+    // the encoder's actual ceiling; `getConstraints()` (max, then ideal) is
+    // what capture was asked for if the sender has no encodings yet.
+    // Deliberately never `getSettings().frameRate` here -- that is measured
+    // too, and would reintroduce the same circularity.
+    const targetFrameRate: number | undefined = (() => {
+      const maxFramerate = sender.getParameters().encodings?.[0]?.maxFramerate;
+      if (maxFramerate) return maxFramerate;
+
+      const frameRateConstraint =
+        track?.mediaStreamTrack?.getConstraints?.().frameRate;
+      if (typeof frameRateConstraint === "number") return frameRateConstraint;
+      return frameRateConstraint?.max ?? frameRateConstraint?.ideal;
+    })();
+
     // Where the time went while quality was limited -- `cpu` here means the
     // encoder could not keep up, `bandwidth` means the network could not.
     const durations = outbound.qualityLimitationDurations ?? {};
@@ -163,12 +181,19 @@ export function ScreenShareStats(props: {
         label: "Codec",
         value: codec?.mimeType ? codec.mimeType.replace("video/", "") : NA,
       },
+      // Lets the CBP assumption behind the h264 hardware probe (see
+      // screenShareCodec in rtc/state.tsx) be checked empirically: this is
+      // the profile actually negotiated with the SFU, not just the one we
+      // asked for.
+      { label: "Codec params", value: codec?.sdpFmtpLine ?? NA },
       { label: "Encoder", value: outbound.encoderImplementation ?? NA },
       {
         label: "Encode time",
         value:
-          encodeTimeMs !== undefined && fps
-            ? `${encodeTimeMs.toFixed(1)} ms / ${(1000 / fps).toFixed(1)} ms`
+          encodeTimeMs !== undefined
+            ? targetFrameRate
+              ? `${encodeTimeMs.toFixed(1)} ms / ${(1000 / targetFrameRate).toFixed(1)} ms`
+              : `${encodeTimeMs.toFixed(1)} ms`
             : NA,
       },
       { label: "Scalability", value: outbound.scalabilityMode ?? NA },

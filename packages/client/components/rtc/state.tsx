@@ -41,6 +41,7 @@ import { VoiceCallCardContext } from "@revolt/ui/components/features/voice/callC
 import { Device, useDevice } from "@revolt/common";
 import { InRoom } from "./components/InRoom";
 import { RoomAudioManager } from "./components/RoomAudioManager";
+import { setNextScreenShareFrameRate } from "./screenShareCapture";
 import {
   getMicPublication,
   hasSoundboardPublication,
@@ -111,52 +112,321 @@ function screenShareEncoding(frameRate: number) {
   };
 }
 
+/** One `mediaCapabilities.encodingInfo` probe's outcome, kept for logging. */
+type CodecProbe = {
+  contentType: string;
+  supported: boolean;
+  powerEfficient: boolean;
+};
+
 /**
- * The best codec this client can hardware-encode, in preference order.
- *
- * H.265 and H.264 are encoded by the GPU's fixed-function encoder on every
- * current NVIDIA/AMD/Intel part; VP9 is hardware-encoded only on Intel, and
- * LiveKit's forced L1T3 blocks even that -- so VP9 means libvpx on the CPU.
- * Shares here are games and video, where H.26x's weak spot (sharp text on
- * flat backgrounds) does not apply.
- *
- * AV1 is deliberately absent: LiveKit treats it as SVC and forces L1T3,
- * which non-Intel hardware cannot do, so it would quietly land on libaom.
+ * The codec decision computed for one resolution/framerate key, kept around
+ * so `screenSharePublishOptions` can read the CBP hardware verdict back out
+ * without re-probing, and so `getScreenShareCodecDecision()` can expose it.
  */
-let cachedScreenShareCodec: VideoCodec | undefined;
-function pickScreenShareCodec(): VideoCodec {
-  if (cachedScreenShareCodec) return cachedScreenShareCodec;
+type ScreenShareCodecDecision = {
+  key: string;
+  codec: VideoCodec;
+  reason: string;
+  probes: CodecProbe[];
+  /** Whether hardware H.264 was found at Constrained Baseline specifically. */
+  cbpHardware: boolean;
+  at: number;
+};
 
-  // Deliberately not cached: with no RTCRtpSender there is nothing to ask, and
-  // caching the guess would pin it for the browser that asks again later.
-  if (typeof RTCRtpSender === "undefined") return "vp9";
+/** Last decision computed by {@link screenShareCodec}, for devtools inspection. */
+let lastScreenShareCodecDecision: ScreenShareCodecDecision | undefined;
 
-  const codecs = RTCRtpSender.getCapabilities?.("video")?.codecs ?? [];
-  const mimeTypes = new Set(
-    codecs.map((codec) => codec.mimeType.toLowerCase()),
-  );
+/**
+ * Decisions already computed, keyed by `${width}x${height}@${frameRate}`.
+ *
+ * A failed probe (see {@link screenShareCodec}) is never written here, so a
+ * cold GPU process timing out on the first share does not pin every later
+ * share at that resolution to software.
+ */
+const screenShareCodecDecisions = new Map<string, ScreenShareCodecDecision>();
 
-  if (mimeTypes.has("video/h265")) return (cachedScreenShareCodec = "h265");
-  if (mimeTypes.has("video/h264")) return (cachedScreenShareCodec = "h264");
-  return (cachedScreenShareCodec = "vp9");
+/** In-flight probes, so priming and a fast publish share one probe rather than racing two. */
+const screenShareCodecInFlight = new Map<string, Promise<VideoCodec>>();
+
+/** How long the whole probe batch gets before giving up and using vp9 for this share. */
+const SCREEN_SHARE_CODEC_PROBE_TIMEOUT_MS = 1_500;
+
+const H265_CONTENT_TYPE = "video/H265";
+/**
+ * The only H.264 probe we can act on. On Windows, Chromium does not
+ * advertise hardware Constrained Baseline support unless the
+ * `PlatformH264CbpEncoding` feature is enabled, while Main/High are
+ * advertised regardless of it -- and LiveKit only takes `videoCodec:
+ * "h264"`, never a specific profile; the profile is decided afterwards by
+ * SDP negotiation with the SFU. So a Main/High-only hardware hit is not
+ * something we can hand LiveKit, and trusting it would reproduce this exact
+ * regression under a different profile string.
+ */
+const H264_CBP_CONTENT_TYPE =
+  "video/H264;profile-level-id=42e01f;packetization-mode=1";
+/** Diagnostics only, never decisive -- see {@link H264_CBP_CONTENT_TYPE}. */
+const H264_MAIN_CONTENT_TYPE =
+  "video/H264;profile-level-id=4d001f;packetization-mode=1";
+/** Diagnostics only, never decisive -- see {@link H264_CBP_CONTENT_TYPE}. */
+const H264_HIGH_CONTENT_TYPE =
+  "video/H264;profile-level-id=640c1f;packetization-mode=1";
+
+/** A probe counts as hardware only when both flags agree -- see {@link screenShareCodec}. */
+function isHardware(probe: CodecProbe): boolean {
+  return probe.supported && probe.powerEfficient;
 }
 
-function screenSharePublishOptions(frameRate: number): TrackPublishOptions {
-  const videoCodec = pickScreenShareCodec();
+/**
+ * The best codec this client can hardware-encode for a share at the given
+ * resolution/framerate, in preference order h265 > h264 (Constrained
+ * Baseline only) > vp9.
+ *
+ * `RTCRtpSender.getCapabilities("video")` lists every codec Chromium can
+ * *negotiate*, including OpenH264 -- a software fallback Chromium always
+ * bundles and therefore always lists -- so relying on it alone picks H.264
+ * on a machine with no working hardware encoder at all and silently lands
+ * on software (confirmed in production: `encoderImplementation:
+ * "OpenH264"` at 5.28 Mbps for only 1280x536, worse than the VP9/libvpx it
+ * replaced).
+ *
+ * `navigator.mediaCapabilities.encodingInfo()`'s `powerEfficient` flag is
+ * Chromium's own hardware-encode signal: it routes through the same
+ * `webrtc::VideoEncoderFactory::QueryCodecSupport()` that PeerConnection
+ * itself uses. `smooth` is deliberately never read -- it depends on encode
+ * history a fresh profile does not have, and reports false on perfectly
+ * good hardware.
+ *
+ * A codec only counts as usable here if it is BOTH (a) present in
+ * `RTCRtpSender.getCapabilities("video")` -- necessary, it must be
+ * offerable in SDP -- AND (b) hardware per {@link isHardware} -- sufficient,
+ * it must not be software.
+ *
+ * Probed at the resolution/framerate about to be published, not some fixed
+ * default: Chromium applies per-profile min/max resolution filtering, so
+ * e.g. 1080p60 HEVC can be genuinely absent on hardware that has 720p30
+ * HEVC. Every probe is wrapped in one shared {@link
+ * SCREEN_SHARE_CODEC_PROBE_TIMEOUT_MS} timeout (`Promise.all` inside a
+ * single race, so the wall-clock cost is one probe's worth, not four) --
+ * a slow first `encodingInfo` call on a cold GPU process must not stall the
+ * share starting. If `mediaCapabilities.encodingInfo` is missing, any probe
+ * rejects, or the timeout fires, this returns "vp9" for *this* call only
+ * and writes nothing to the cache, so the next attempt retries from
+ * scratch.
+ *
+ * AV1 is deliberately never probed: LiveKit treats it as SVC and forces
+ * L1T3, which non-Intel hardware cannot do, so it would quietly land on
+ * libaom regardless of what we found here.
+ * @param resolution Resolution/framerate about to be published, or
+ * undefined to probe at 1920x1080@30 (only the recovery path can pass
+ * undefined, and over-asking there is the safe direction)
+ * @returns The codec to publish with
+ */
+async function screenShareCodec(
+  resolution: VideoResolution | undefined,
+): Promise<VideoCodec> {
+  const width = resolution?.width || 1920;
+  const height = resolution?.height || 1080;
+  const frameRate = resolution?.frameRate || 30;
+  const key = `${width}x${height}@${frameRate}`;
+
+  const cached = screenShareCodecDecisions.get(key);
+  if (cached) {
+    lastScreenShareCodecDecision = cached;
+    return cached.codec;
+  }
+
+  const inFlight = screenShareCodecInFlight.get(key);
+  if (inFlight) return inFlight;
+
+  const promise = (async (): Promise<VideoCodec> => {
+    // Typed as non-optional in lib.dom.d.ts, but not every Chromium build
+    // actually implements `encodingInfo` -- check before using it rather
+    // than trust the type.
+    const mediaCapabilities: MediaCapabilities | undefined =
+      navigator.mediaCapabilities;
+
+    if (
+      typeof RTCRtpSender === "undefined" ||
+      !mediaCapabilities?.encodingInfo
+    ) {
+      // Same reasoning as the timeout path below: record it so a stale
+      // `cbpHardware` from an earlier share cannot leak into the backup
+      // codec choice, but do not cache it.
+      lastScreenShareCodecDecision = {
+        key,
+        codec: "vp9",
+        reason:
+          "mediaCapabilities.encodingInfo unavailable; cannot verify hardware",
+        probes: [],
+        cbpHardware: false,
+        at: Date.now(),
+      };
+      return "vp9";
+    }
+
+    const negotiable = new Set(
+      (RTCRtpSender.getCapabilities?.("video")?.codecs ?? []).map((codec) =>
+        codec.mimeType.toLowerCase(),
+      ),
+    );
+
+    const bitrate = screenShareEncoding(frameRate).maxBitrate;
+
+    const probe = (contentType: string): Promise<CodecProbe> =>
+      mediaCapabilities
+        .encodingInfo({
+          type: "webrtc",
+          video: {
+            contentType,
+            width,
+            height,
+            framerate: frameRate,
+            bitrate,
+            scalabilityMode: "L1T1",
+          },
+        })
+        .then((info) => ({
+          contentType,
+          supported: info.supported,
+          powerEfficient: info.powerEfficient,
+        }));
+
+    let probes: CodecProbe[] | undefined;
+    try {
+      probes = await Promise.race([
+        Promise.all([
+          probe(H265_CONTENT_TYPE),
+          probe(H264_CBP_CONTENT_TYPE),
+          probe(H264_MAIN_CONTENT_TYPE),
+          probe(H264_HIGH_CONTENT_TYPE),
+        ]),
+        new Promise<undefined>((resolve) =>
+          setTimeout(
+            () => resolve(undefined),
+            SCREEN_SHARE_CODEC_PROBE_TIMEOUT_MS,
+          ),
+        ),
+      ]);
+    } catch {
+      probes = undefined;
+    }
+
+    if (!probes) {
+      console.info(
+        `[rtc] screen share codec probe for ${key} timed out or failed, using vp9 for this share only`,
+      );
+      // Record it as the last decision without caching it. Skipping this
+      // would leave `lastScreenShareCodecDecision` pointing at some earlier
+      // share's result, and `screenSharePublishOptions` reads `cbpHardware`
+      // off it -- so a stale `true` would pick an h264 backup codec on the
+      // strength of a probe that never ran for this configuration.
+      lastScreenShareCodecDecision = {
+        key,
+        codec: "vp9",
+        reason: "probe timed out or failed; not cached, will retry next share",
+        probes: [],
+        cbpHardware: false,
+        at: Date.now(),
+      };
+      return "vp9";
+    }
+
+    const [h265, h264Cbp, h264Main, h264High] = probes;
+
+    let codec: VideoCodec;
+    let reason: string;
+
+    if (negotiable.has("video/h265") && isHardware(h265)) {
+      codec = "h265";
+      reason = "hardware h265 available and negotiable";
+    } else if (negotiable.has("video/h264") && isHardware(h264Cbp)) {
+      codec = "h264";
+      reason = "hardware h264 available at constrained baseline";
+    } else if (isHardware(h264Main) || isHardware(h264High)) {
+      codec = "vp9";
+      reason =
+        "hardware h264 exists here but only for main/high, which the SFU will not negotiate -- falling back to vp9";
+    } else {
+      codec = "vp9";
+      reason = "no hardware h265/h264 found, falling back to vp9";
+    }
+
+    const decision: ScreenShareCodecDecision = {
+      key,
+      codec,
+      reason,
+      probes,
+      cbpHardware: isHardware(h264Cbp),
+      at: Date.now(),
+    };
+
+    console.info(
+      `[rtc] screen share codec for ${key}: ${codec} (${reason})`,
+      probes.map(
+        (p) =>
+          `${p.contentType} supported=${p.supported} powerEfficient=${p.powerEfficient}`,
+      ),
+    );
+
+    screenShareCodecDecisions.set(key, decision);
+    lastScreenShareCodecDecision = decision;
+
+    return codec;
+  })();
+
+  screenShareCodecInFlight.set(key, promise);
+  try {
+    return await promise;
+  } finally {
+    screenShareCodecInFlight.delete(key);
+  }
+}
+
+/**
+ * The last screen share codec decision computed, for inspection from
+ * devtools during a live call.
+ */
+export function getScreenShareCodecDecision() {
+  return lastScreenShareCodecDecision;
+}
+
+async function screenSharePublishOptions(
+  resolution: VideoResolution | undefined,
+): Promise<TrackPublishOptions> {
+  const frameRate = resolution?.frameRate || 30;
+  const videoCodec = await screenShareCodec(resolution);
+  const decision = getScreenShareCodecDecision();
+
   return {
     screenShareEncoding: screenShareEncoding(frameRate),
     videoCodec,
-    // vp8 and h264 are the only codecs LiveKit accepts as a backup. Prefer
-    // h264 so the fallback stream is hardware-encoded too -- `backupCodec:
-    // true` resolves to vp8, which puts a software encoder back in the path.
-    backupCodec: videoCodec === "h264" ? { codec: "vp8" } : { codec: "h264" },
+    // vp8 and h264 are the only codecs LiveKit accepts as a backup. Reaching
+    // for h264 just because it's "probably hardware" was the exact mistake
+    // behind the bug this codec picker fixes -- doing that for the *backup*
+    // codec would reproduce it one layer down. So h264 is only offered here
+    // when the Constrained Baseline probe that decided the primary codec
+    // actually found hardware for it, and it isn't already the primary
+    // (asking for a second hardware encode of the same codec is pointless).
+    // Everything else falls back to vp8.
+    backupCodec:
+      decision?.cbpHardware && videoCodec !== "h264"
+        ? { codec: "h264" }
+        : { codec: "vp8" },
     // h264/h265 are not SVC codecs, so LiveKit routes them down its simulcast
-    // branch and adds a second 960x540 encode. One hardware encode is the
-    // whole point, and `simulcast` defaults to true, so say no explicitly.
+    // branch and adds a second 960x540 encode -- one hardware encode is the
+    // whole point, so this matters for them. For vp9 it's redundant on its
+    // own: LiveKit's SVC branch in computeVideoEncodings returns before ever
+    // reading `options.simulcast`. Redundant, not harmful, so there is no
+    // reason to special-case it away -- `simulcast` defaults to true, so say
+    // no explicitly regardless of which codec was picked.
     simulcast: false,
     degradationPreference: "maintain-framerate",
   };
 }
+
+/** How long to wait after publishing before sampling for a software encoder. */
+const SOFTWARE_FALLBACK_CHECK_DELAY_MS = 5_000;
 
 /** At most this many automatic share recoveries ... */
 const MAX_RECOVERIES = 3;
@@ -402,6 +672,10 @@ class Voice {
         }
       }
       this.sound.playSound("userJoinVoice");
+      // Only here, not the constructor: `this.limits()` (from `useInstance`)
+      // isn't populated yet at construction, so priming earlier could probe
+      // the wrong resolution for an instance that hasn't granted 1080p.
+      this.#primeScreenShareCodec();
     });
 
     room.addListener("disconnected", () => this.#setState("DISCONNECTED"));
@@ -646,6 +920,17 @@ class Voice {
     return qualities;
   }
 
+  /**
+   * Warm the codec probe for the currently configured quality without
+   * anyone waiting on it, so the first real `toggleScreenshare` call finds
+   * an already-cached decision instead of eating the probe's latency.
+   */
+  #primeScreenShareCodec() {
+    const quality =
+      this.getEnabledScreenShareQualities()[this.#screenShareQuality()];
+    void screenShareCodec(quality?.resolution);
+  }
+
   async toggleScreenshare() {
     const room = this.room();
     if (!room) throw "invalid state";
@@ -703,14 +988,32 @@ class Voice {
         const startingQuality =
           qualities[this.#screenShareQuality()] ?? qualities.low!;
 
-        const localTrack = await room.localParticipant.setScreenShareEnabled(
-          true,
-          {
-            resolution: startingQuality.resolution,
-            audio: SCREEN_SHARE_AUDIO,
-          },
-          screenSharePublishOptions(startingQuality.resolution.frameRate ?? 30),
+        // Computed before setScreenShareEnabled so the codec decision it
+        // made is available for the post-publish software-fallback check
+        // below without depending on nothing else having probed a different
+        // resolution in between.
+        const publishOptions = await screenSharePublishOptions(
+          startingQuality.resolution,
         );
+        const codecDecision = getScreenShareCodecDecision();
+
+        // Deliberately no `resolution` below: see the comment on
+        // setNextScreenShareFrameRate (screenShareCapture.ts) and the
+        // getDisplayMedia wrapper in index.ts for why the framerate still
+        // has to be threaded in separately once resolution is gone.
+        setNextScreenShareFrameRate(startingQuality.resolution.frameRate ?? 30);
+        let localTrack: LocalTrackPublication | undefined;
+        try {
+          localTrack = await room.localParticipant.setScreenShareEnabled(
+            true,
+            {
+              audio: SCREEN_SHARE_AUDIO,
+            },
+            publishOptions,
+          );
+        } finally {
+          setNextScreenShareFrameRate(undefined);
+        }
 
         const screenAudioTrack = room.localParticipant.getTrackPublication(
           Track.Source.ScreenShareAudio,
@@ -720,6 +1023,7 @@ class Voice {
 
         if (localTrack) {
           this.#armScreenShareEnded(room, localTrack);
+          this.#watchForSoftwareFallback(localTrack, codecDecision);
 
           const callback = (
             qualityName: ScreenShareQualityName,
@@ -800,12 +1104,24 @@ class Voice {
    * could therefore disagree: picking 60fps on top of a saved 30fps default
    * left `maxFramerate: 30` on the sender, so the share stayed pinned at 30 no
    * matter how many frames the capturer produced.
+   *
+   * Also owns `scaleResolutionDownBy`: capture no longer asks for a
+   * resolution (see `toggleScreenshare`/`#recoverScreenShare`), so the
+   * capturer is free to hand the encoder whatever the source's actual size
+   * is, and this is where that gets scaled down to the chosen quality
+   * instead -- on the encoder, where a hardware H.26x makes it nearly free,
+   * rather than as a libyuv rescale on Chromium's throttled capture thread.
+   * This runs on every call, not just at publish, and is read fresh each
+   * time rather than cached, precisely so a mid-share quality change (this
+   * is only ever called from `#applyShareChoice`, which re-reads the live
+   * track's settings every time it runs) recomputes it against the new
+   * target instead of the one the share started with.
    * @param localTrack Screen share publication
-   * @param frameRate Framerate the user actually chose
+   * @param resolution Resolution/framerate the user actually chose
    */
   async #applyEncoderLimits(
     localTrack: LocalTrackPublication,
-    frameRate: number,
+    resolution: VideoResolution,
   ) {
     const sender = localTrack.videoTrack?.sender;
     if (!sender?.getParameters) return;
@@ -814,12 +1130,32 @@ class Voice {
       const params = sender.getParameters();
       if (!params.encodings?.length) return;
 
-      const { maxBitrate, maxFramerate } = screenShareEncoding(frameRate);
+      const { maxBitrate, maxFramerate } = screenShareEncoding(
+        resolution.frameRate ?? 30,
+      );
+
+      // The capturer's actual output, now that capture no longer requests a
+      // resolution -- may be larger (a 4K monitor) or smaller (a small
+      // window) than what was asked for.
+      const capturedHeight =
+        localTrack.videoTrack?.mediaStreamTrack.getSettings().height;
+      // Never upscale: a captured frame smaller than the target quality is
+      // already as good as it gets.
+      const scaleResolutionDownBy =
+        capturedHeight && resolution.height
+          ? Math.max(1, capturedHeight / resolution.height)
+          : 1;
+
       let changed = false;
 
       for (const encoding of params.encodings) {
         if (encoding.maxFramerate !== maxFramerate) {
           encoding.maxFramerate = maxFramerate;
+          changed = true;
+        }
+
+        if (encoding.scaleResolutionDownBy !== scaleResolutionDownBy) {
+          encoding.scaleResolutionDownBy = scaleResolutionDownBy;
           changed = true;
         }
 
@@ -860,32 +1196,24 @@ class Voice {
     await localTrack.videoTrack.mediaStreamTrack.applyConstraints({
       // `ideal` as well as `max`: asking only for a ceiling lets the source
       // stay wherever it started, which is how a 60fps pick used to deliver 30.
+      //
+      // Deliberately no `width`/`height` here any more: constraining capture
+      // resolution forced a full-frame libyuv rescale on Chromium's capture
+      // thread even when the source was already smaller, and Chromium's
+      // capture governor (`capture_period = max(2 x last_capture_duration,
+      // 1/target_fps)`) doubles the cost of anything that runs there.
+      // `#applyEncoderLimits`'s `scaleResolutionDownBy` controls output
+      // resolution on the encoder instead, where it's nearly free with
+      // hardware H.26x.
       frameRate: {
         ideal: quality.resolution.frameRate,
         max: quality.resolution.frameRate,
       },
-      width:
-        quality.resolution.width === 0
-          ? undefined
-          : {
-              ideal: quality.resolution.width,
-              max: quality.resolution.width,
-            },
-      height:
-        quality.resolution.height === 0
-          ? undefined
-          : {
-              ideal: quality.resolution.height,
-              max: quality.resolution.height,
-            },
     });
 
     localTrack.videoTrack.mediaStreamTrack.contentHint = quality.contentHint;
 
-    await this.#applyEncoderLimits(
-      localTrack,
-      quality.resolution.frameRate ?? 30,
-    );
+    await this.#applyEncoderLimits(localTrack, quality.resolution);
 
     if (!audio) {
       const screenAudioTrack = room.localParticipant.getTrackPublication(
@@ -897,6 +1225,55 @@ class Voice {
     }
 
     if (announce) this.sound.playSound("streamStart");
+  }
+
+  /**
+   * Self-healing check: a few seconds after publishing, sample the sender's
+   * actual encoder once. If we picked h264/h265 because the probe said it
+   * was hardware, but the browser handed us a software encoder anyway (a
+   * driver update, a GPU process crash-and-restart onto software, or a
+   * probe that was simply wrong), overwrite the cached decision for that
+   * resolution with vp9 so the *next* share gets it right.
+   *
+   * Deliberately does not republish the live share -- swapping codecs
+   * mid-share would drop the stream for a moment, which is far more
+   * disruptive than one share running on an unexpectedly software encoder.
+   * @param localTrack The just-published screen share publication
+   * @param decision The codec decision that publish was made with
+   */
+  #watchForSoftwareFallback(
+    localTrack: LocalTrackPublication,
+    decision: ReturnType<typeof getScreenShareCodecDecision>,
+  ) {
+    if (!decision || decision.codec === "vp9") return;
+
+    setTimeout(async () => {
+      try {
+        const sender = localTrack.videoTrack?.sender;
+        if (!sender?.getStats) return;
+
+        const report = await sender.getStats();
+        let implementation: string | undefined;
+        report.forEach((stat) => {
+          if (stat.type === "outbound-rtp" && stat.kind === "video") {
+            implementation = stat.encoderImplementation;
+          }
+        });
+
+        if (implementation && /OpenH264|libvpx|libaom/i.test(implementation)) {
+          console.warn(
+            `[rtc] picked ${decision.codec} for ${decision.key} but got software encoder "${implementation}" -- forcing vp9 for the next share at this resolution`,
+          );
+          screenShareCodecDecisions.set(decision.key, {
+            ...decision,
+            codec: "vp9",
+            reason: `${decision.reason}; corrected to vp9 after observing software encoder "${implementation}"`,
+          });
+        }
+      } catch {
+        // Best-effort: the share is already up either way.
+      }
+    }, SOFTWARE_FALLBACK_CHECK_DELAY_MS);
   }
 
   /**
@@ -981,19 +1358,35 @@ class Voice {
       const recoveredQuality =
         this.getEnabledScreenShareQualities()[choice.qualityName];
 
-      const localTrack = await room.localParticipant.setScreenShareEnabled(
-        true,
-        {
-          resolution: recoveredQuality?.resolution,
-          audio: SCREEN_SHARE_AUDIO,
-        },
-        screenSharePublishOptions(recoveredQuality?.resolution.frameRate ?? 30),
+      // Computed up front for the same reason as toggleScreenshare: the
+      // codec decision needs to be captured for the post-publish check
+      // below before anything else can probe a different resolution.
+      const publishOptions = await screenSharePublishOptions(
+        recoveredQuality?.resolution,
       );
+      const codecDecision = getScreenShareCodecDecision();
+
+      // Same "no resolution, thread the framerate separately" shape as
+      // toggleScreenshare -- see setNextScreenShareFrameRate's comment.
+      setNextScreenShareFrameRate(recoveredQuality?.resolution.frameRate ?? 30);
+      let localTrack: LocalTrackPublication | undefined;
+      try {
+        localTrack = await room.localParticipant.setScreenShareEnabled(
+          true,
+          {
+            audio: SCREEN_SHARE_AUDIO,
+          },
+          publishOptions,
+        );
+      } finally {
+        setNextScreenShareFrameRate(undefined);
+      }
 
       if (!localTrack) return false;
 
       this.#setScreenshare(room.localParticipant.isScreenShareEnabled);
       this.#armScreenShareEnded(room, localTrack);
+      this.#watchForSoftwareFallback(localTrack, codecDecision);
 
       // No modal and no start sound: as far as the sharer is concerned this
       // never stopped.
