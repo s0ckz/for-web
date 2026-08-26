@@ -6,6 +6,11 @@ name: Build web client image
 on:
   push:
     branches:
+      # main is the trunk now. This is the only workflow that publishes the
+      # :latest tag the droplet pulls -- docker-build.yml only tags :main and
+      # :<sha> -- so it has to run from main or deploys go stale.
+      - main
+      - fix/capture-and-shell-stability
       - feat/self-hosted-tweaks
   workflow_dispatch:
 
