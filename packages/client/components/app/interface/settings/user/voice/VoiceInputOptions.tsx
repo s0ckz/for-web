@@ -40,7 +40,18 @@ export function VoiceInputOptions() {
  */
 function SelectInput(props: { kind: MediaDeviceKind }) {
   const state = useState();
-  const media = createMemo(() => useMediaDeviceSelect({ kind: props.kind }));
+  const media = createMemo(() =>
+    useMediaDeviceSelect({
+      kind: props.kind,
+      // Without this, a rejected getUserMedia({video:true}) label-probe
+      // (e.g. camera permission denied, or the camera already in use)
+      // silently collapses `devices()` to `[]` -- @livekit/components-core
+      // calls `subscriber.next([])` on that rejection -- which renders as a
+      // lone "Default" entry indistinguishable from "you have no cameras".
+      onError: (e) =>
+        console.warn(`[rtc] failed to enumerate ${props.kind} devices`, e),
+    }),
+  );
 
   const setKey = () =>
     props.kind === "videoinput"

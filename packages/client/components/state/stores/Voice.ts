@@ -19,21 +19,20 @@ const NoiseSuppresionStates: NoiseSuppresionState[] = [
  * The upstream "text" mode (source resolution at 5 fps) is removed: it only
  * appeared on instances whose video_resolution limit allows 1080p, and it is
  * far too easy to select by accident and then assume the client is broken.
+ *
+ * There used to be `low60`/`high60` variants of both presets. They are gone:
+ * Chromium's desktop-capture governor caps a 1440p-class source around 28 fps
+ * regardless of the target framerate requested, so a 60fps option promised
+ * something the capture pipeline could never deliver.
  */
-export type ScreenShareQualityName = "low" | "low60" | "high" | "high60";
+export type ScreenShareQualityName = "low" | "high";
 
 /**
  * Array of available screen share quality names.
- *
- * The `60` variants are the same resolutions at 60fps. There is no
- * server-side framerate limit -- LiveKit simply ships no preset above 30 --
- * so they are built by hand in `getEnabledScreenShareQualities`.
  */
 export const ScreenShareQualityNames: ScreenShareQualityName[] = [
   "low",
-  "low60",
   "high",
-  "high60",
 ];
 
 export interface TypeVoice {
@@ -171,7 +170,15 @@ export class Voice extends AbstractStore<"voice", TypeVoice> {
       data.autoGainControl = input.autoGainControl;
     }
 
-    if (
+    // migrate legacy 60fps presets to their remaining 30fps equivalent --
+    // ScreenShareQualityNames.includes below is a hard drop, not a remap, so
+    // without this a saved "high60" would fall through to the "low" default,
+    // demoting a 1080p user to 720p.
+    if ((input.screenShareQuality as unknown) === "low60") {
+      data.screenShareQuality = "low";
+    } else if ((input.screenShareQuality as unknown) === "high60") {
+      data.screenShareQuality = "high";
+    } else if (
       input.screenShareQuality &&
       ScreenShareQualityNames.includes(input.screenShareQuality)
     ) {

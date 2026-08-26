@@ -15,11 +15,19 @@ export function ScreenShareSettingsModal(
   const { voice } = useState();
   const { t } = useLingui();
 
+  // Seed from the offered list, not blindly from the saved setting: the
+  // saved quality can be "high" while this instance's video_resolution
+  // limit only offers "low", which used to leave the button group's value
+  // matching no button.
+  const initialQualityName =
+    props.qualities.find((q) => q.name === voice.screenShareQuality)?.name ??
+    props.qualities[0]?.name ??
+    "low";
+
   const group = createFormGroup({
-    qualityName: createFormControl<ScreenShareQualityName>(
-      voice.screenShareQuality || "low",
-      { required: true },
-    ),
+    qualityName: createFormControl<ScreenShareQualityName>(initialQualityName, {
+      required: true,
+    }),
     audio: createFormControl(props.audio && voice.screenShareAudio, {
       disabled: !props.audio,
     }),
