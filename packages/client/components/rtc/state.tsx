@@ -17,8 +17,11 @@ import {
 import {
   LocalTrackPublication,
   Room,
+  ScreenShareCaptureOptions,
   ScreenSharePresets,
   Track,
+  TrackEvent,
+  TrackPublishOptions,
   VideoResolution,
 } from "livekit-client";
 import { Channel } from "stoat.js";
@@ -37,7 +40,16 @@ import { VoiceCallCardContext } from "@revolt/ui/components/features/voice/callC
 import { Device, useDevice } from "@revolt/common";
 import { InRoom } from "./components/InRoom";
 import { RoomAudioManager } from "./components/RoomAudioManager";
+import {
+  getMicPublication,
+  hasSoundboardPublication,
+  isSoundboardPublication,
+  SoundboardPlayer,
+  SoundboardSound,
+} from "./soundboard";
+import { registerSpeakingMeter } from "./speaking";
 import { VoiceProcessor } from "./VoiceProcessor";
+import { perceptualGain } from "./volume";
 
 type State =
   | "READY"
@@ -52,6 +64,67 @@ type ScreenShareQuality = {
   fullName: string;
   contentHint: string;
 };
+
+/** Capture constraints for the screen share's audio half */
+const SCREEN_SHARE_AUDIO: ScreenShareCaptureOptions["audio"] = {
+  autoGainControl: false,
+  echoCancellation: false,
+  noiseSuppression: false,
+  voiceIsolation: false,
+  restrictOwnAudio: true,
+};
+
+/**
+ * The same resolution at 60fps.
+ *
+ * LiveKit ships no preset above 30 (`h720fps30`, `h1080fps15`, `h1080fps30`)
+ * and the instance imposes no framerate limit of its own, so the 60fps modes
+ * are simply the stock resolutions with the framerate raised.
+ * @param resolution Source resolution
+ * @returns Resolution at 60fps
+ */
+function at60(resolution: VideoResolution): VideoResolution {
+  return { ...resolution, frameRate: 60 };
+}
+
+/**
+ * Publishing options for a screen share at a given framerate.
+ *
+ * LiveKit's h1080fps30 preset caps the stream at roughly 2.5 Mbps. 1080p
+ * screen content cannot hold 30fps within that, so the encoder trades frames
+ * away and settles around 10-12fps even on a connection with plenty of
+ * headroom. Give it room, and tell it to protect the framerate rather than the
+ * resolution -- which is also what makes 60fps meaningful rather than a label.
+ * @param frameRate Target framerate
+ * @returns Publish options
+ */
+function screenShareEncoding(frameRate: number) {
+  return {
+    // Twice the frames need roughly half again the bitrate; VP9 absorbs the
+    // rest. 60fps at 6 Mbps would just be 30fps with extra steps.
+    maxBitrate: frameRate > 30 ? 9_000_000 : 6_000_000,
+    maxFramerate: frameRate,
+    priority: "high" as const,
+  };
+}
+
+function screenSharePublishOptions(frameRate: number): TrackPublishOptions {
+  return {
+    screenShareEncoding: screenShareEncoding(frameRate),
+    // VP9 is dramatically more efficient than VP8 on screen content (large
+    // flat areas, sharp text). backupCodec keeps clients that cannot decode it
+    // working via a VP8 stream.
+    videoCodec: "vp9",
+    backupCodec: true,
+    degradationPreference: "maintain-framerate",
+  };
+}
+
+/** At most this many automatic share recoveries ... */
+const MAX_RECOVERIES = 3;
+
+/** ... within this window, so a permanently broken capture cannot loop */
+const RECOVERY_WINDOW_MS = 60_000;
 
 class Voice {
   #settings: VoiceSettings;
@@ -85,6 +158,9 @@ class Voice {
   showBar: Accessor<boolean>;
   #setShowBar: Setter<boolean>;
 
+  soundboard: Accessor<SoundboardPlayer | undefined>;
+  #setSoundboard: Setter<SoundboardPlayer | undefined>;
+
   private sound: SoundController;
   private device: Device;
 
@@ -93,6 +169,12 @@ class Voice {
   private limits;
   private screenShareTracks: Set<string>;
   private voiceProcessor?: VoiceProcessor;
+  #localSpeakingMeter?: () => void;
+
+  /** What the last successful share was started with, for recovery */
+  #lastShareChoice?: { qualityName: ScreenShareQualityName; audio: boolean };
+  #recoveryAttempts: number[] = [];
+  #recovering = false;
 
   constructor(
     voiceSettings: VoiceSettings,
@@ -140,6 +222,10 @@ class Voice {
     const [showBar, setShowBar] = createSignal(true);
     this.showBar = showBar;
     this.#setShowBar = setShowBar;
+
+    const [soundboard, setSoundboard] = createSignal<SoundboardPlayer>();
+    this.soundboard = soundboard;
+    this.#setSoundboard = setSoundboard;
 
     const inst = useInstance();
     this.config = inst.config;
@@ -199,6 +285,25 @@ class Voice {
       setNoiseSuppression(getSettings().noiseSupression ?? "browser");
       restartTrack();
     });
+
+    // Keep local monitoring of our own soundboard sounds in line with settings
+    createEffect(() => {
+      const soundboard = this.soundboard();
+      if (!soundboard) return;
+
+      const settings = getSettings();
+      const muted = settings.soundboardMuted || settings.deafen;
+      soundboard.setMonitorVolume(
+        muted
+          ? 0
+          : perceptualGain(settings.soundboardVolume) *
+              perceptualGain(settings.outputVolume),
+      );
+    });
+
+    createEffect(() => {
+      this.soundboard()?.setSinkId(getSettings().preferredAudioOutputDevice);
+    });
   }
 
   async connect(channel: Channel, auth?: { url: string; token: string }) {
@@ -241,16 +346,15 @@ class Voice {
       this.#setState("CONNECTING");
       this.#setVideo(false);
       this.#setScreenshare(false);
+      this.#setSoundboard(new SoundboardPlayer(room));
     });
 
     room.addListener("connected", () => {
       this.#setState("CONNECTED");
       if (this.speakingPermission)
-        room.localParticipant
-          .setMicrophoneEnabled(this.#settings.micOn)
-          .then((track) => {
-            this.#settings.micOn = track != null;
-          });
+        this.#setMicEnabled(room, this.#settings.micOn).then((track) => {
+          this.#settings.micOn = track != null;
+        });
       for (const p of room.remoteParticipants.values()) {
         const screenShareTrack = p.getTrackPublication(
           Track.Source.ScreenShare,
@@ -265,12 +369,28 @@ class Voice {
     room.addListener("disconnected", () => this.#setState("DISCONNECTED"));
 
     room.addListener("localTrackPublished", (pub) => {
-      if (pub.audioTrack && pub.audioTrack.source === Track.Source.Microphone) {
+      if (
+        pub.audioTrack &&
+        pub.audioTrack.source === Track.Source.Microphone &&
+        !isSoundboardPublication(pub)
+      ) {
         if (!pub.audioTrack.getProcessor()) {
           pub.audioTrack?.setProcessor(
             (this.voiceProcessor = new VoiceProcessor(this.#settings)),
           );
         }
+
+        this.#meterLocalMicrophone(room, pub);
+      }
+    });
+
+    room.addListener("localTrackUnpublished", (pub) => {
+      if (
+        pub.source === Track.Source.Microphone &&
+        !isSoundboardPublication(pub)
+      ) {
+        this.#localSpeakingMeter?.();
+        this.#localSpeakingMeter = undefined;
       }
     });
 
@@ -328,6 +448,14 @@ class Voice {
       const room = this.room();
       if (!room) return;
 
+      this.soundboard()?.dispose();
+
+      this.#localSpeakingMeter?.();
+      this.#localSpeakingMeter = undefined;
+
+      this.#lastShareChoice = undefined;
+      this.#recoveryAttempts = [];
+
       room.removeAllListeners();
       room.disconnect();
 
@@ -336,6 +464,7 @@ class Voice {
         this.#setRoom();
         this.#setChannel();
         this.#setFullscreen(false);
+        this.#setSoundboard();
         this.vidTracks = () => [];
       });
 
@@ -351,14 +480,14 @@ class Voice {
     try {
       const room = this.room();
       if (!room) throw "invalid state";
-      await room.localParticipant.setMicrophoneEnabled(
-        (this.#settings.micOn || !!fromMute) &&
-          !room.localParticipant.isMicrophoneEnabled,
+      await this.#setMicEnabled(
+        room,
+        (this.#settings.micOn || !!fromMute) && !this.#isMicEnabled(room),
       );
 
       this.#settings.deafen = !this.#settings.deafen;
       if (fromMute) {
-        this.#settings.micOn = room.localParticipant.isMicrophoneEnabled;
+        this.#settings.micOn = this.#isMicEnabled(room);
       }
       if (this.#settings.deafen) {
         this.sound.playSound("deafen");
@@ -378,11 +507,9 @@ class Voice {
     try {
       const room = this.room();
       if (!room) throw "invalid state";
-      await room.localParticipant.setMicrophoneEnabled(
-        !room.localParticipant.isMicrophoneEnabled,
-      );
+      await this.#setMicEnabled(room, !this.#isMicEnabled(room));
 
-      this.#settings.micOn = room.localParticipant.isMicrophoneEnabled;
+      this.#settings.micOn = this.#isMicEnabled(room);
 
       if (this.#settings.micOn) {
         this.sound.playSound("unmute");
@@ -417,6 +544,19 @@ class Voice {
    * @param name The name of the screen share quality to get
    * @returns A partial record of ScreenShareQualityName to ScreenShareQuality. Will always contain "low" quality.
    */
+  /**
+   * Resolve the configured quality, healing settings that were saved while the
+   * removed "text" option still existed.
+   */
+  #screenShareQuality(): ScreenShareQualityName {
+    const saved = this.#settings.screenShareQuality;
+    // Only offer back a quality this instance actually enables, so a saved
+    // 1080p60 does not survive the video limit being lowered.
+    return saved && this.getEnabledScreenShareQualities()[saved]
+      ? saved
+      : "low";
+  }
+
   getEnabledScreenShareQualities(): Partial<
     Record<ScreenShareQualityName, ScreenShareQuality>
   > {
@@ -428,6 +568,12 @@ class Voice {
         name: "low",
         resolution: ScreenSharePresets.h720fps30.resolution,
         fullName: `720p 30FPS`,
+        contentHint: "motion",
+      },
+      low60: {
+        name: "low60",
+        resolution: at60(ScreenSharePresets.h720fps30.resolution),
+        fullName: `720p 60FPS`,
         contentHint: "motion",
       },
     };
@@ -445,25 +591,18 @@ class Voice {
         fullName: `1080p 30FPS`,
         contentHint: "motion",
       };
-      const originalResolution = ScreenSharePresets.original.resolution;
-      originalResolution.frameRate = 5;
-      originalResolution.aspectRatio = 0;
 
-      const limit = this.limits().video_resolution;
-      originalResolution.width = limit[0];
-      originalResolution.height = limit[1];
-      // If both resolutions are limited, set aspect ratio
-      if (originalResolution.height !== 0 && originalResolution.width !== 0) {
-        originalResolution.aspectRatio =
-          originalResolution.width / originalResolution.height;
-      }
-
-      qualities.text = {
-        name: "text",
-        resolution: originalResolution,
-        fullName: `Source 5FPS`,
-        contentHint: "text",
+      qualities.high60 = {
+        name: "high60",
+        resolution: at60(ScreenSharePresets.h1080fps30.resolution),
+        fullName: `1080p 60FPS`,
+        contentHint: "motion",
       };
+
+      // The upstream "Source 5FPS" option lived here. It is deliberately gone:
+      // it shares this 1080p-capable branch, so raising an instance's
+      // video_resolution limit silently added a 5 fps mode that is easy to
+      // pick by accident and looks broken when you do.
     }
 
     return qualities;
@@ -474,6 +613,10 @@ class Voice {
     if (!room) throw "invalid state";
 
     if (this.screenshare()) {
+      // Deliberately stopping means there is nothing left to recover.
+      this.#lastShareChoice = undefined;
+      this.#recoveryAttempts = [];
+
       await room.localParticipant.setScreenShareEnabled(false);
 
       this.#setScreenshare(room.localParticipant.isScreenShareEnabled);
@@ -484,12 +627,18 @@ class Voice {
       let screenPickerQualityName: ScreenShareQualityName | undefined;
       let screenPickerAudio: boolean | undefined;
 
+      // The desktop picker answers a cancel with `callback({})`, which
+      // getDisplayMedia rejects with something other than NotAllowedError, so
+      // the generic error modal used to pop up on a plain "never mind".
+      let cancelled = false;
+
       // Register the modal on screen picker handler if it exists
       if (window.native && window.native.onceScreenPicker) {
         window.native.onceScreenPicker((sources) => {
           this.openModal({
             type: "screen_share_picker",
             onCancel: () => {
+              cancelled = true;
               window.native.screenPickerCallback(-1, false);
             },
             callback: (
@@ -511,21 +660,18 @@ class Voice {
       }
 
       try {
+        // The picker can still change this, but capturing at the saved quality
+        // means a 60fps share starts at 60 rather than being raised into it.
+        const startingQuality =
+          qualities[this.#screenShareQuality()] ?? qualities.low!;
+
         const localTrack = await room.localParticipant.setScreenShareEnabled(
           true,
           {
-            resolution:
-              this.getEnabledScreenShareQualities()[
-                this.#settings.screenShareQuality || "low"
-              ]?.resolution,
-            audio: {
-              autoGainControl: false,
-              echoCancellation: false,
-              noiseSuppression: false,
-              voiceIsolation: false,
-              restrictOwnAudio: true,
-            },
+            resolution: startingQuality.resolution,
+            audio: SCREEN_SHARE_AUDIO,
           },
+          screenSharePublishOptions(startingQuality.resolution.frameRate ?? 30),
         );
 
         const screenAudioTrack = room.localParticipant.getTrackPublication(
@@ -535,51 +681,12 @@ class Voice {
         this.#setScreenshare(room.localParticipant.isScreenShareEnabled);
 
         if (localTrack) {
-          // This event is only fired if the screen share is ended by closing the window being streamed.
-          // This catches the ending and disables screen sharing on our side. If this weren't here,
-          // livekit would still share stream audio after closing the window being streamed.
-          localTrack.on("ended", () => {
-            this.toggleScreenshare();
-            const oldAudioTrack = room.localParticipant.getTrackPublication(
-              Track.Source.ScreenShareAudio,
-            );
-            if (oldAudioTrack && oldAudioTrack.track) {
-              room.localParticipant.unpublishTrack(oldAudioTrack.track);
-            }
-          });
+          this.#armScreenShareEnded(room, localTrack);
 
-          const callback = async (
+          const callback = (
             qualityName: ScreenShareQualityName,
             audio: boolean,
-          ) => {
-            const quality = qualities[qualityName] || qualities.low!;
-
-            if (localTrack.videoTrack) {
-              await localTrack.videoTrack.mediaStreamTrack.applyConstraints({
-                frameRate: { max: quality.resolution.frameRate },
-                width:
-                  quality.resolution.width === 0
-                    ? undefined
-                    : {
-                        ideal: quality.resolution.width,
-                        max: quality.resolution.width,
-                      },
-                height:
-                  quality.resolution.width === 0
-                    ? undefined
-                    : {
-                        ideal: quality.resolution.width,
-                        max: quality.resolution.height,
-                      },
-              });
-              localTrack.videoTrack.mediaStreamTrack.contentHint =
-                quality.contentHint;
-              if (!audio && screenAudioTrack?.track) {
-                room.localParticipant.unpublishTrack(screenAudioTrack.track);
-              }
-              this.sound.playSound("streamStart");
-            }
-          };
+          ) => this.#applyShareChoice(room, localTrack, qualityName, audio);
 
           if (screenPickerQualityName) {
             callback(
@@ -592,6 +699,7 @@ class Voice {
               screenAudioTrack?.pauseUpstream();
               this.openModal({
                 onCancel: async () => {
+                  cancelled = true;
                   await room.localParticipant.setScreenShareEnabled(false);
                   this.#setScreenshare(
                     room.localParticipant.isScreenShareEnabled,
@@ -618,15 +726,253 @@ class Voice {
               });
             } else {
               callback(
-                this.#settings.screenShareQuality || "low",
+                this.#screenShareQuality(),
                 this.#settings.screenShareAudio,
               );
             }
+          } else {
+            // "Always ask" off and no native picker: nothing used to apply the
+            // saved quality or honour the audio preference at all.
+            callback(
+              this.#screenShareQuality(),
+              this.#settings.screenShareAudio,
+            );
           }
         }
       } catch (e) {
+        if (cancelled) return;
         this.onErr(e);
       }
+    }
+  }
+
+  /**
+   * Apply a quality/audio choice to a live screen share and remember it.
+   * @param room Room
+   * @param localTrack Screen share publication
+   * @param qualityName Chosen quality
+   * @param audio Whether the share's audio should be kept
+   * @param announce Whether to play the "stream started" sound
+   */
+  /**
+   * Bring the encoder in line with a quality chosen *after* publishing.
+   *
+   * Publish options are fixed when the track goes up, from the saved quality,
+   * while the "always ask" dialog only re-applied capture constraints. The two
+   * could therefore disagree: picking 60fps on top of a saved 30fps default
+   * left `maxFramerate: 30` on the sender, so the share stayed pinned at 30 no
+   * matter how many frames the capturer produced.
+   * @param localTrack Screen share publication
+   * @param frameRate Framerate the user actually chose
+   */
+  async #applyEncoderLimits(
+    localTrack: LocalTrackPublication,
+    frameRate: number,
+  ) {
+    const sender = localTrack.videoTrack?.sender;
+    if (!sender?.getParameters) return;
+
+    try {
+      const params = sender.getParameters();
+      if (!params.encodings?.length) return;
+
+      const { maxBitrate, maxFramerate } = screenShareEncoding(frameRate);
+      let changed = false;
+
+      for (const encoding of params.encodings) {
+        if (encoding.maxFramerate !== maxFramerate) {
+          encoding.maxFramerate = maxFramerate;
+          changed = true;
+        }
+
+        // Only touch the bitrate when there is a single encoding. Simulcast
+        // layers carry deliberately different ceilings and must not all be
+        // flattened to the top one; screen shares with an SVC codec (our case)
+        // publish exactly one.
+        if (
+          params.encodings.length === 1 &&
+          encoding.maxBitrate !== maxBitrate
+        ) {
+          encoding.maxBitrate = maxBitrate;
+          changed = true;
+        }
+      }
+
+      if (changed) await sender.setParameters(params);
+    } catch (err) {
+      // Not fatal: the share is up, it is just capped where it was published.
+      console.warn("[rtc] could not update screen share encoder limits", err);
+    }
+  }
+
+  async #applyShareChoice(
+    room: Room,
+    localTrack: LocalTrackPublication,
+    qualityName: ScreenShareQualityName,
+    audio: boolean,
+    announce = true,
+  ) {
+    const qualities = this.getEnabledScreenShareQualities();
+    const quality = qualities[qualityName] || qualities.low!;
+
+    this.#lastShareChoice = { qualityName, audio };
+
+    if (!localTrack.videoTrack) return;
+
+    await localTrack.videoTrack.mediaStreamTrack.applyConstraints({
+      // `ideal` as well as `max`: asking only for a ceiling lets the source
+      // stay wherever it started, which is how a 60fps pick used to deliver 30.
+      frameRate: {
+        ideal: quality.resolution.frameRate,
+        max: quality.resolution.frameRate,
+      },
+      width:
+        quality.resolution.width === 0
+          ? undefined
+          : {
+              ideal: quality.resolution.width,
+              max: quality.resolution.width,
+            },
+      height:
+        quality.resolution.height === 0
+          ? undefined
+          : {
+              ideal: quality.resolution.height,
+              max: quality.resolution.height,
+            },
+    });
+
+    localTrack.videoTrack.mediaStreamTrack.contentHint = quality.contentHint;
+
+    await this.#applyEncoderLimits(
+      localTrack,
+      quality.resolution.frameRate ?? 30,
+    );
+
+    if (!audio) {
+      const screenAudioTrack = room.localParticipant.getTrackPublication(
+        Track.Source.ScreenShareAudio,
+      );
+      if (screenAudioTrack?.track) {
+        room.localParticipant.unpublishTrack(screenAudioTrack.track);
+      }
+    }
+
+    if (announce) this.sound.playSound("streamStart");
+  }
+
+  /**
+   * Watch a screen share publication for its capture ending.
+   *
+   * Windows' WGC capturer reports a permanent error when the captured window
+   * is destroyed and recreated -- which is what a game does when it switches
+   * to fullscreen -- and LiveKit then unpublishes the track. The share is
+   * fine, the capture handle is not, so try to pick the window back up.
+   */
+  #armScreenShareEnded(room: Room, localTrack: LocalTrackPublication) {
+    localTrack.on("ended", () => {
+      this.#onScreenShareEnded(room);
+    });
+  }
+
+  async #onScreenShareEnded(room: Room) {
+    // LiveKit only unpublishes the video half, and the audio track would keep
+    // playing into the call on its own.
+    const oldAudioTrack = room.localParticipant.getTrackPublication(
+      Track.Source.ScreenShareAudio,
+    );
+    if (oldAudioTrack?.track) {
+      try {
+        await room.localParticipant.unpublishTrack(oldAudioTrack.track);
+      } catch {
+        /* already gone */
+      }
+    }
+
+    if (await this.#recoverScreenShare(room)) return;
+
+    // No bridge, nothing to recover, or recovery failed: stop as before.
+    this.toggleScreenshare();
+  }
+
+  /**
+   * Try to restart a screen share whose capture died underneath us.
+   *
+   * Needs the desktop bridge: only the main process can find the window again
+   * and answer the next getDisplayMedia without showing the picker. On plain
+   * web this always returns false and the share simply ends.
+   * @param room Room
+   * @returns Whether the share is back up
+   */
+  async #recoverScreenShare(room: Room): Promise<boolean> {
+    const reacquire = window.native?.reacquireScreenShare;
+    if (typeof reacquire !== "function") return false;
+
+    const choice = this.#lastShareChoice;
+    if (!choice || this.#recovering || !this.screenshare()) return false;
+
+    const now = Date.now();
+    this.#recoveryAttempts = this.#recoveryAttempts.filter(
+      (at) => now - at < RECOVERY_WINDOW_MS,
+    );
+    if (this.#recoveryAttempts.length >= MAX_RECOVERIES) {
+      console.warn("[rtc] screen share keeps dying, giving up on recovery");
+      return false;
+    }
+    this.#recoveryAttempts.push(now);
+
+    this.#recovering = true;
+    try {
+      // Main waits (up to a few minutes) for the window to come back; a
+      // minimised window cannot be captured, so this can take a while.
+      if (!(await reacquire())) return false;
+
+      // LiveKit unpublishes a track that ended, but it does so asynchronously
+      // and we may well get here first. setScreenShareEnabled(true) reuses any
+      // publication it finds and merely unmutes it, which would "recover" the
+      // share into the dead track we are trying to replace -- so make sure the
+      // old one is really gone before capturing again.
+      if (room.localParticipant.getTrackPublication(Track.Source.ScreenShare)) {
+        try {
+          await room.localParticipant.setScreenShareEnabled(false);
+        } catch {
+          /* already unpublished */
+        }
+      }
+
+      const recoveredQuality =
+        this.getEnabledScreenShareQualities()[choice.qualityName];
+
+      const localTrack = await room.localParticipant.setScreenShareEnabled(
+        true,
+        {
+          resolution: recoveredQuality?.resolution,
+          audio: SCREEN_SHARE_AUDIO,
+        },
+        screenSharePublishOptions(recoveredQuality?.resolution.frameRate ?? 30),
+      );
+
+      if (!localTrack) return false;
+
+      this.#setScreenshare(room.localParticipant.isScreenShareEnabled);
+      this.#armScreenShareEnded(room, localTrack);
+
+      // No modal and no start sound: as far as the sharer is concerned this
+      // never stopped.
+      await this.#applyShareChoice(
+        room,
+        localTrack,
+        choice.qualityName,
+        choice.audio,
+        false,
+      );
+
+      return true;
+    } catch (err) {
+      console.warn("[rtc] screen share recovery failed", err);
+      return false;
+    } finally {
+      this.#recovering = false;
     }
   }
 
@@ -674,10 +1020,111 @@ class Voice {
   }
 
   getMicrophoneTrack(): LocalTrackPublication | undefined {
-    const track = this.room()?.localParticipant.getTrackPublication(
-      Track.Source.Microphone,
-    );
-    return track;
+    const room = this.room();
+    if (!room) return undefined;
+    return getMicPublication(room.localParticipant) as
+      | LocalTrackPublication
+      | undefined;
+  }
+
+  /**
+   * Whether our real microphone is published and unmuted.
+   *
+   * localParticipant.isMicrophoneEnabled cannot be used: it looks at the
+   * first microphone-source publication, which may be the soundboard track.
+   */
+  #isMicEnabled(room: Room): boolean {
+    const pub = getMicPublication(room.localParticipant);
+    return !!pub && !pub.isMuted;
+  }
+
+  /**
+   * Soundboard-aware setMicrophoneEnabled.
+   */
+  async #setMicEnabled(
+    room: Room,
+    enabled: boolean,
+  ): Promise<LocalTrackPublication | undefined> {
+    const participant = room.localParticipant;
+    const pub = getMicPublication(participant) as
+      | LocalTrackPublication
+      | undefined;
+
+    if (pub) {
+      if (enabled) await pub.unmute();
+      else await pub.mute();
+      return pub;
+    }
+
+    if (!enabled) return undefined;
+
+    // Without a soundboard track LiveKit's own logic is exactly what we want.
+    if (!hasSoundboardPublication(participant)) {
+      return participant.setMicrophoneEnabled(true);
+    }
+
+    // With one, setMicrophoneEnabled would find the soundboard track first and
+    // "unmute" that instead of capturing a microphone, so do it by hand.
+    const [track] = await participant.createTracks({ audio: true });
+    if (!track) return undefined;
+    return participant.publishTrack(track, {
+      source: Track.Source.Microphone,
+    });
+  }
+
+  /**
+   * Meter our own microphone so our tile lights up as fast as everyone else's.
+   *
+   * Re-arms when the track restarts, which is how the voice settings effect
+   * applies new constraints -- the old MediaStreamTrack is dead by then and
+   * would read as permanent silence.
+   */
+  #meterLocalMicrophone(room: Room, pub: LocalTrackPublication) {
+    const track = pub.audioTrack;
+    if (!track) return;
+
+    const identity = room.localParticipant.identity;
+
+    const arm = () => {
+      this.#localSpeakingMeter?.();
+      this.#localSpeakingMeter = registerSpeakingMeter(
+        identity,
+        track.mediaStreamTrack,
+      );
+    };
+
+    arm();
+    track.on(TrackEvent.Restarted, arm);
+  }
+
+  /**
+   * Play a soundboard sound for everyone in the call
+   */
+  async playSoundboard(sound: SoundboardSound) {
+    try {
+      const soundboard = this.soundboard();
+      if (!soundboard) throw "invalid state";
+      await soundboard.play(sound);
+    } catch (e) {
+      this.onErr(e);
+    }
+  }
+
+  /**
+   * Stop every soundboard sound we are playing
+   */
+  stopSoundboard() {
+    this.soundboard()?.stopAll();
+  }
+
+  /**
+   * Publish the soundboard track ahead of time so the first sound is instant
+   */
+  prepareSoundboard() {
+    if (!this.speakingPermission) return;
+    this.soundboard()
+      ?.ensurePublished()
+      .catch((e) => this.onErr(e));
   }
 
   get listenPermission() {
@@ -689,7 +1136,10 @@ class Voice {
   }
 
   private onErr(e: unknown) {
-    if ((e as Error).name !== "NotAllowedError")
+    // NotAllowedError is the spec cancel; Firefox/Safari answer a dismissed
+    // picker with AbortError. Neither is worth an error modal.
+    const name = (e as Error)?.name;
+    if (name !== "NotAllowedError" && name !== "AbortError")
       this.openModal({ type: "error2", error: e });
   }
 }

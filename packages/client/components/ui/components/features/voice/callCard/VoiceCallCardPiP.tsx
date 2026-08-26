@@ -1,10 +1,10 @@
-import { Show } from "solid-js";
+import { createMemo, Show } from "solid-js";
 import {
   TrackLoop,
   TrackReference,
+  TrackReferenceOrPlaceholder,
   useEnsureParticipant,
   useIsMuted,
-  useIsSpeaking,
   useTrackRefContext,
   useTracks,
   VideoTrack,
@@ -14,7 +14,12 @@ import { Track } from "livekit-client";
 import { styled } from "styled-system/jsx";
 
 import { useUser } from "@revolt/markdown/users";
-import { useVoice } from "@revolt/rtc";
+import {
+  isSoundboardPublication,
+  useIsMicMuted,
+  useIsSpeakingFast,
+  useVoice,
+} from "@revolt/rtc";
 import { Avatar } from "@revolt/ui/components/design";
 import { Row } from "@revolt/ui/components/layout";
 import { Symbol } from "@revolt/ui/components/utils/Symbol";
@@ -24,10 +29,41 @@ import { VoiceCallCardStatus } from "./VoiceCallCardStatus";
 
 export function VoiceCallCardPiP() {
   const voice = useVoice();
-  const audTracks = useTracks(
+  const allAudTracks = useTracks(
     [{ source: Track.Source.Microphone, withPlaceholder: true }],
     { onlySubscribed: false },
   );
+
+  // The soundboard is a second microphone-source track, which would give its
+  // owner two avatars here. Keep exactly one entry per participant.
+  const audTracks = createMemo(() => {
+    const seen = new Set<string>();
+    const result: TrackReferenceOrPlaceholder[] = [];
+    const soundboardOnly = new Map<string, TrackReferenceOrPlaceholder>();
+
+    for (const ref of allAudTracks()) {
+      const id = ref.participant.identity;
+      if (isSoundboardPublication(ref.publication)) {
+        if (!seen.has(id)) soundboardOnly.set(id, ref);
+        continue;
+      }
+      if (seen.has(id)) continue;
+      seen.add(id);
+      soundboardOnly.delete(id);
+      result.push(ref);
+    }
+
+    for (const ref of soundboardOnly.values()) {
+      if (seen.has(ref.participant.identity)) continue;
+      seen.add(ref.participant.identity);
+      result.push({
+        participant: ref.participant,
+        source: Track.Source.Microphone,
+      });
+    }
+
+    return result;
+  });
 
   const hasFocusVideo = () => {
     const track = voice.focusTrack();
@@ -58,12 +94,9 @@ export function VoiceCallCardPiP() {
 function ConnectedUser() {
   const participant = useEnsureParticipant();
 
-  const isMuted = useIsMuted({
-    participant,
-    source: Track.Source.Microphone,
-  });
+  const isMuted = useIsMicMuted(participant);
 
-  const isSpeaking = useIsSpeaking(participant);
+  const isSpeaking = useIsSpeakingFast(participant);
   const user = useUser(participant.identity);
 
   return (

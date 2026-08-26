@@ -41,6 +41,15 @@ declare global {
         ) => void,
       ): void;
       screenPickerCallback(idx: number, audio: boolean): void;
+      /**
+       * Wait for the last shared window to come back and answer the next
+       * display media request with it, skipping the picker.
+       *
+       * Only present in builds of the desktop app that ship the recovery IPC,
+       * hence optional -- the web client must degrade to simply ending the
+       * share.
+       */
+      reacquireScreenShare?(): Promise<boolean>;
       isWayland?(): boolean;
     };
 

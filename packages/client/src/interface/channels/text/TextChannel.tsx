@@ -16,6 +16,7 @@ import { DraftMessages, Messages } from "@revolt/app";
 import { useClient } from "@revolt/client";
 import { Keybind, KeybindAction, createKeybind } from "@revolt/keybinds";
 import { useNavigate, useSmartParams } from "@revolt/routing";
+import { useVoice } from "@revolt/rtc";
 import { useState } from "@revolt/state";
 import { LAYOUT_SECTIONS } from "@revolt/state/stores/Layout";
 import {
@@ -76,6 +77,18 @@ const LARGE_SERVERS = [
 export function TextChannel(props: ChannelPageProps) {
   const state = useState();
   const client = useClient();
+  const voice = useVoice();
+
+  /**
+   * Whether the call card should take over the channel area.
+   *
+   * Only while actually in a call in *this* channel -- otherwise the setting
+   * would blank out every other channel's chat.
+   */
+  const expanded = () =>
+    state.voice.hideChatInCall &&
+    canConnect() &&
+    voice.channel()?.id === props.channel.id;
 
   // Last unread message id
   const [lastId, setLastId] = createSignal<string>();
@@ -216,35 +229,40 @@ export function TextChannel(props: ChannelPageProps) {
               </BelowFloatingHeader>
             }
           >
-            <VoiceChannelCallCardMount channel={props.channel} />
+            <VoiceChannelCallCardMount
+              channel={props.channel}
+              expanded={expanded()}
+            />
           </Show>
 
-          <Messages
-            channel={props.channel}
-            lastReadId={lastId}
-            pendingMessages={(pendingProps) => (
-              <DraftMessages
-                channel={props.channel}
-                tail={pendingProps.tail}
-                sentIds={pendingProps.ids}
-              />
-            )}
-            typingIndicator={
-              <TypingIndicator
-                users={props.channel.typing}
-                ownId={client().user!.id}
-              />
-            }
-            highlightedMessageId={highlightMessageId}
-            clearHighlightedMessage={() => navigate(".")}
-            jumpToBottomRef={(ref) => (jumpToBottomRef = ref)}
-            atEnd={[atEnd, setEnd]}
-          />
+          <Show when={!expanded()}>
+            <Messages
+              channel={props.channel}
+              lastReadId={lastId}
+              pendingMessages={(pendingProps) => (
+                <DraftMessages
+                  channel={props.channel}
+                  tail={pendingProps.tail}
+                  sentIds={pendingProps.ids}
+                />
+              )}
+              typingIndicator={
+                <TypingIndicator
+                  users={props.channel.typing}
+                  ownId={client().user!.id}
+                />
+              }
+              highlightedMessageId={highlightMessageId}
+              clearHighlightedMessage={() => navigate(".")}
+              jumpToBottomRef={(ref) => (jumpToBottomRef = ref)}
+              atEnd={[atEnd, setEnd]}
+            />
 
-          <MessageComposition
-            channel={props.channel}
-            onMessageSend={() => jumpToBottomRef?.()}
-          />
+            <MessageComposition
+              channel={props.channel}
+              onMessageSend={() => jumpToBottomRef?.()}
+            />
+          </Show>
         </main>
         <Show
           when={

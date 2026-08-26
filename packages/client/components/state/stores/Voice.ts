@@ -14,17 +14,26 @@ const NoiseSuppresionStates: NoiseSuppresionState[] = [
 ];
 
 /**
- * Possible screen share qualities. Low is 720p@30fps, high 1080p@30fps and text is source@5fps.
+ * Possible screen share qualities. Low is 720p@30fps and high is 1080p@30fps.
+ *
+ * The upstream "text" mode (source resolution at 5 fps) is removed: it only
+ * appeared on instances whose video_resolution limit allows 1080p, and it is
+ * far too easy to select by accident and then assume the client is broken.
  */
-export type ScreenShareQualityName = "low" | "high" | "text";
+export type ScreenShareQualityName = "low" | "low60" | "high" | "high60";
 
 /**
  * Array of available screen share quality names.
+ *
+ * The `60` variants are the same resolutions at 60fps. There is no
+ * server-side framerate limit -- LiveKit simply ships no preset above 30 --
+ * so they are built by hand in `getEnabledScreenShareQualities`.
  */
 export const ScreenShareQualityNames: ScreenShareQualityName[] = [
   "low",
+  "low60",
   "high",
-  "text",
+  "high60",
 ];
 
 export interface TypeVoice {
@@ -50,6 +59,30 @@ export interface TypeVoice {
 
   screenShareVolumes: Record<string, number>;
   screenShareMutes: Record<string, boolean>;
+
+  /** Screen shares the user has explicitly chosen to watch, keyed by user id */
+  screenShareWatching: Record<string, boolean>;
+  /** Show the playback statistics overlay on screen shares */
+  screenShareStats: boolean;
+
+  /**
+   * Show participants that have no camera/screen share in the call grid.
+   * Off = only tiles that carry live video (Discord's "Show non-video
+   * participants" toggle).
+   */
+  showNonVideoParticipants: boolean;
+  /**
+   * Hide the text chat while in a call so the call card fills the channel
+   * area (an expanded view that is not fullscreen).
+   */
+  hideChatInCall: boolean;
+
+  /** Volume applied to every soundboard sound (yours included) */
+  soundboardVolume: number;
+  /** Mute all soundboard sounds */
+  soundboardMuted: boolean;
+  /** Users whose soundboard sounds are muted, keyed by user id */
+  soundboardUserMutes: Record<string, boolean>;
 }
 
 /**
@@ -90,6 +123,13 @@ export class Voice extends AbstractStore<"voice", TypeVoice> {
       userMutes: {},
       screenShareVolumes: {},
       screenShareMutes: {},
+      screenShareWatching: {},
+      screenShareStats: false,
+      showNonVideoParticipants: true,
+      hideChatInCall: false,
+      soundboardVolume: 1.0,
+      soundboardMuted: false,
+      soundboardUserMutes: {},
     };
   }
 
@@ -171,6 +211,43 @@ export class Voice extends AbstractStore<"voice", TypeVoice> {
         .forEach(([k, v]) => (data.userVolumes[k] = v));
     }
 
+    if (typeof input.screenShareWatching === "object") {
+      Object.entries(input.screenShareWatching)
+        .filter(
+          ([userId, watching]) =>
+            typeof userId === "string" && watching === true,
+        )
+        .forEach(([k, v]) => (data.screenShareWatching[k] = v));
+    }
+
+    if (typeof input.screenShareStats === "boolean") {
+      data.screenShareStats = input.screenShareStats;
+    }
+
+    if (typeof input.showNonVideoParticipants === "boolean") {
+      data.showNonVideoParticipants = input.showNonVideoParticipants;
+    }
+
+    if (typeof input.hideChatInCall === "boolean") {
+      data.hideChatInCall = input.hideChatInCall;
+    }
+
+    if (typeof input.soundboardVolume === "number") {
+      data.soundboardVolume = input.soundboardVolume;
+    }
+
+    if (typeof input.soundboardMuted === "boolean") {
+      data.soundboardMuted = input.soundboardMuted;
+    }
+
+    if (typeof input.soundboardUserMutes === "object") {
+      Object.entries(input.soundboardUserMutes)
+        .filter(
+          ([userId, muted]) => typeof userId === "string" && muted === true,
+        )
+        .forEach(([k, v]) => (data.soundboardUserMutes[k] = v));
+    }
+
     if (typeof input.userMutes === "object") {
       Object.entries(input.userMutes)
         .filter(
@@ -214,7 +291,9 @@ export class Voice extends AbstractStore<"voice", TypeVoice> {
    * @returns Volume or default
    */
   getUserVolume(userId: string): number {
-    return this.get().userVolumes[userId] || 1.0;
+    // ?? rather than ||: 0 is a legitimate setting, and `||` turned a slider
+    // dragged to zero back into full volume.
+    return this.get().userVolumes[userId] ?? 1.0;
   }
 
   /**
@@ -250,7 +329,8 @@ export class Voice extends AbstractStore<"voice", TypeVoice> {
    * @returns Volume or default
    */
   getScreenShareVolume(userId: string): number {
-    return this.get().screenShareVolumes[userId] || 1.0;
+    // ?? rather than ||, see getUserVolume
+    return this.get().screenShareVolumes[userId] ?? 1.0;
   }
 
   /**
@@ -263,12 +343,125 @@ export class Voice extends AbstractStore<"voice", TypeVoice> {
   }
 
   /**
-   * Get whether a user's screen share is muted
+   * Get whether a user's screen share is muted.
+   *
+   * Defaults to false: audio only reaches you for shares you chose to watch
+   * (see RoomAudioManager), so it does not also need to start muted -- that
+   * only led to people watching a stream in silence and assuming it was broken.
    * @param userId User ID
    * @returns Whether muted
    */
   getScreenShareMuted(userId: string): boolean {
-    return this.get().screenShareMutes[userId] ?? true;
+    return this.get().screenShareMutes[userId] ?? false;
+  }
+
+  /**
+   * Set whether the user is watching a given screen share
+   * @param userId User ID
+   * @param watching Whether to subscribe to their screen share
+   */
+  setScreenShareWatching(userId: string, watching: boolean) {
+    this.set("screenShareWatching", userId, watching);
+  }
+
+  /**
+   * Get whether the user is watching a given screen share.
+   *
+   * Defaults to false: screen shares are opt-in, so joining a busy call does
+   * not immediately pull several video streams you did not ask for.
+   * @param userId User ID
+   * @returns Whether watching
+   */
+  getScreenShareWatching(userId: string): boolean {
+    return this.get().screenShareWatching[userId] ?? false;
+  }
+
+  /**
+   * Whether the playback statistics overlay is enabled
+   */
+  get screenShareStats(): boolean {
+    return this.get().screenShareStats;
+  }
+
+  /**
+   * Toggle the playback statistics overlay
+   */
+  set screenShareStats(value: boolean) {
+    this.set("screenShareStats", value);
+  }
+
+  /**
+   * Whether participants without video are shown in the call grid
+   */
+  get showNonVideoParticipants(): boolean {
+    return this.get().showNonVideoParticipants ?? true;
+  }
+
+  /**
+   * Show or hide participants without video in the call grid
+   */
+  set showNonVideoParticipants(value: boolean) {
+    this.set("showNonVideoParticipants", value);
+  }
+
+  /**
+   * Whether the text chat is hidden while in a call
+   */
+  get hideChatInCall(): boolean {
+    return this.get().hideChatInCall ?? false;
+  }
+
+  /**
+   * Hide or show the text chat while in a call
+   */
+  set hideChatInCall(value: boolean) {
+    this.set("hideChatInCall", value);
+  }
+
+  /**
+   * Volume applied to every soundboard sound
+   */
+  get soundboardVolume(): number {
+    return this.get().soundboardVolume ?? 1.0;
+  }
+
+  /**
+   * Set the soundboard volume
+   */
+  set soundboardVolume(value: number) {
+    this.set("soundboardVolume", value);
+  }
+
+  /**
+   * Whether every soundboard sound is muted
+   */
+  get soundboardMuted(): boolean {
+    return this.get().soundboardMuted ?? false;
+  }
+
+  /**
+   * Mute or unmute every soundboard sound
+   */
+  set soundboardMuted(value: boolean) {
+    this.set("soundboardMuted", value);
+  }
+
+  /**
+   * Set whether a user's soundboard sounds are muted
+   * @param userId User ID
+   * @param muted Whether they should be muted
+   */
+  setSoundboardUserMuted(userId: string, muted: boolean) {
+    this.set("soundboardUserMutes", userId, muted);
+  }
+
+  /**
+   * Get whether a user's soundboard sounds are muted
+   * @param userId User ID
+   * @returns Whether muted
+   */
+  getSoundboardUserMuted(userId: string): boolean {
+    return this.get().soundboardUserMutes?.[userId] || false;
   }
 
   /**

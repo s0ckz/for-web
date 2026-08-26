@@ -31,6 +31,8 @@ type Info = {
   channel: Channel;
   pos: DOMRect;
   drawer?: SlideState;
+  /** Chat is hidden, so the card should fill the whole channel area */
+  expanded?: boolean;
 };
 
 const PAD = 16,
@@ -109,10 +111,14 @@ export function VoiceCallCardContext(props: { children: JSX.Element }) {
     if (voice.fullscreen()) {
       sty.transform = ``;
       sty.width = `100%`;
+      sty.height = ``;
       setMode();
     } else if (inf?.pos && (!inf.drawer || inf.drawer === SlideState.SHOWN)) {
       sty.transform = `translate(${inf.pos.x}px, ${inf.pos.y}px)`;
       sty.width = `${inf.pos.width}px`;
+      // With the chat hidden the mount marker grows to fill <main>, so the
+      // card can simply take its height instead of the default 40vh.
+      sty.height = inf.expanded ? `${inf.pos.height}px` : ``;
       setMode();
     } else if (!inCall()) {
       const y = inf?.pos.y ?? ref.getBoundingClientRect().y;
@@ -129,6 +135,7 @@ export function VoiceCallCardContext(props: { children: JSX.Element }) {
       y = float[0] === "t" ? PAD_Y : `calc(100vh - var(--flt-h) - ${PAD_Y})`;
     sty.transform = `translate(${x}, ${y})`;
     sty.width = "";
+    sty.height = "";
     setMode("floating");
   }
 
@@ -231,22 +238,51 @@ const Float = styled("div", {
 });
 
 /** 'Marker' to send position information for mounting the floating call card */
-export function VoiceChannelCallCardMount(props: { channel: Channel }) {
+export function VoiceChannelCallCardMount(props: {
+  channel: Channel;
+  expanded?: boolean;
+}) {
   const voice = useVoice();
   const state = useState();
   const setInfo = useContext(callCardContext)!;
   let ref: HTMLDivElement | undefined;
 
+  // The floating card is positioned from this rect, and with the chat hidden it
+  // grows to fill this very marker -- so publishing a fresh object on every
+  // observation feeds the card's own size back into the observer that measured
+  // it. Only publish when something actually moved.
+  let lastKey = "";
+
   function updateInfo() {
     const vc = voice.channel();
+    const drawer = state.appDrawer()?.state;
+    const expanded = props.expanded;
+    const elsewhere = !!vc && vc.id !== props.channel.id;
+    const pos = ref!.getBoundingClientRect();
+
+    const key = elsewhere
+      ? "elsewhere"
+      : [
+          props.channel.id,
+          Math.round(pos.x),
+          Math.round(pos.y),
+          Math.round(pos.width),
+          Math.round(pos.height),
+          drawer,
+          expanded,
+        ].join("|");
+    if (key === lastKey) return;
+    lastKey = key;
+
     setInfo(
-      !vc || vc.id === props.channel.id
-        ? {
+      elsewhere
+        ? undefined
+        : {
             channel: props.channel,
-            pos: ref!.getBoundingClientRect(),
-            drawer: state.appDrawer()?.state,
-          }
-        : undefined,
+            pos,
+            drawer,
+            expanded,
+          },
     );
   }
 
@@ -262,7 +298,12 @@ export function VoiceChannelCallCardMount(props: { channel: Channel }) {
     setInfo();
   });
 
-  return <div ref={ref!} />;
+  return (
+    <div
+      ref={ref!}
+      style={props.expanded ? { flex: 1, "min-height": 0 } : {}}
+    />
+  );
 }
 
 /**
@@ -297,6 +338,7 @@ const Base = styled("div", {
     padding: "var(--gap-md)",
 
     width: "100%",
+    height: "100%",
     position: "absolute",
 
     zIndex: 2,
@@ -352,7 +394,9 @@ const Card = styled("div", {
       active: [true],
       fullscreen: [false],
       css: {
-        height: "40vh",
+        // Float is 40vh by default and the whole channel area when the chat is
+        // hidden; either way the card fills it, minus Base's padding.
+        height: "calc(100% - 2 * var(--gap-md))",
       },
     },
   ],
