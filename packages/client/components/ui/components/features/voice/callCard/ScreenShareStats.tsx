@@ -40,6 +40,8 @@ export function ScreenShareStats(props: {
   let lastAt = 0;
   let lastFramesDecoded = 0;
   let lastFramesSent = 0;
+  let lastTotalEncodeTime = 0;
+  let lastFramesEncoded = 0;
 
   const sending = () => isLocal(props.trackRef.participant);
 
@@ -109,9 +111,23 @@ export function ScreenShareStats(props: {
       if (seconds > 0) fps = (framesSent - lastFramesSent) / seconds;
     }
 
+    // Mean time the encoder spent per frame, over just this sample window
+    // (not the cumulative average since the share started) -- against the
+    // budget one frame has at the current framerate.
+    const totalEncodeTime = outbound.totalEncodeTime ?? 0;
+    const framesEncoded = outbound.framesEncoded ?? 0;
+    const framesEncodedDelta = framesEncoded - lastFramesEncoded;
+    let encodeTimeMs: number | undefined;
+    if (lastAt && framesEncodedDelta > 0) {
+      encodeTimeMs =
+        ((totalEncodeTime - lastTotalEncodeTime) / framesEncodedDelta) * 1000;
+    }
+
     lastBytes = bytes;
     lastAt = now;
     lastFramesSent = framesSent;
+    lastTotalEncodeTime = totalEncodeTime;
+    lastFramesEncoded = framesEncoded;
 
     const codec = codecs.get(outbound.codecId);
 
@@ -148,6 +164,13 @@ export function ScreenShareStats(props: {
         value: codec?.mimeType ? codec.mimeType.replace("video/", "") : NA,
       },
       { label: "Encoder", value: outbound.encoderImplementation ?? NA },
+      {
+        label: "Encode time",
+        value:
+          encodeTimeMs !== undefined && fps
+            ? `${encodeTimeMs.toFixed(1)} ms / ${(1000 / fps).toFixed(1)} ms`
+            : NA,
+      },
       { label: "Scalability", value: outbound.scalabilityMode ?? NA },
       {
         label: "Limited by",
