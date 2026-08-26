@@ -34,6 +34,7 @@ import { useState } from "@revolt/state";
 import {
   NoiseSuppresionState,
   ScreenShareQualityName,
+  ScreenShareQualityNames,
   Voice as VoiceSettings,
 } from "@revolt/state/stores/Voice";
 import { VoiceCallCardContext } from "@revolt/ui/components/features/voice/callCard/VoiceCallCard";
@@ -77,39 +78,72 @@ const SCREEN_SHARE_AUDIO: ScreenShareCaptureOptions["audio"] = {
 };
 
 /**
- * The same resolution at 60fps.
- *
- * LiveKit ships no preset above 30 (`h720fps30`, `h1080fps15`, `h1080fps30`)
- * and the instance imposes no framerate limit of its own, so the 60fps modes
- * are simply the stock resolutions with the framerate raised.
- * @param resolution Source resolution
- * @returns Resolution at 60fps
- */
-function at60(resolution: VideoResolution): VideoResolution {
-  return { ...resolution, frameRate: 60 };
-}
-
-/**
- * Publishing options for a screen share at a given framerate.
+ * Publishing options for a screen share at a given resolution.
  *
  * LiveKit's h1080fps30 preset caps the stream at roughly 2.5 Mbps. 1080p
  * screen content cannot hold 30fps within that, so the encoder trades frames
  * away and settles around 10-12fps even on a connection with plenty of
  * headroom. Give it room, and tell it to protect the framerate rather than the
- * resolution -- which is also what makes 60fps meaningful rather than a label.
- * @param frameRate Target framerate
+ * resolution.
+ *
+ * The ceiling is keyed on resolution, not framerate -- both presets run at
+ * 30fps (see {@link ScreenShareQualityName}), so a framerate key would have
+ * given 720p and 1080p the same budget, which defeats the point of offering
+ * a "lighter" preset at all.
+ * @param resolution Target resolution, or undefined to use the 720p ceiling
  * @returns Publish options
  */
-function screenShareEncoding(frameRate: number) {
+function screenShareEncoding(resolution: VideoResolution | undefined) {
   return {
-    // Twice the frames need roughly half again the bitrate. This is a
-    // ceiling, not a target -- a hardware H.26x encoder settles well under
-    // it, so the extra headroom just leaves it room to breathe rather than
-    // forcing it there. 60fps at 6 Mbps would just be 30fps with extra steps.
-    maxBitrate: frameRate > 30 ? 9_000_000 : 6_000_000,
-    maxFramerate: frameRate,
+    // 1080p needs roughly twice the pixels of 720p, so it gets roughly twice
+    // the bitrate ceiling. This is a ceiling, not a target -- a hardware
+    // H.26x encoder settles well under it, so the extra headroom just leaves
+    // it room to breathe rather than forcing it there.
+    maxBitrate: resolution && resolution.height > 720 ? 8_000_000 : 4_000_000,
+    maxFramerate: resolution?.frameRate ?? 30,
     priority: "high" as const,
   };
+}
+
+/**
+ * The scalar to hand `scaleResolutionDownBy` so a captured frame fits
+ * *inside* the target resolution rather than filling it.
+ *
+ * `scaleResolutionDownBy` is one scalar applied to both axes, so it has to
+ * come from whichever axis overflows the target more. Keying it off height
+ * alone (the previous behaviour) is exactly the bug this fixes: a 21:9
+ * capture scaled by its height-only ratio still has a too-wide result, e.g.
+ * a 3440x1440 capture targeting 1920x1080 scaled by height (1440/1080 =
+ * 1.333) lands at 2580x1080 -- 1.8x the pixels a correct fit-inside 1920x804
+ * would carry, through the same bitrate ceiling.
+ *
+ * Missing `getSettings()` dimensions degrade to a factor of 1 (publish as
+ * captured), the existing safe direction. The result is never allowed below
+ * 1 -- `RTCRtpSender.setParameters` throws a `RangeError` for anything under
+ * 1.0, and a captured frame already smaller than the target is as good as
+ * it gets.
+ *
+ * The raw fractional factor is returned deliberately unquantized. Chromium's
+ * `AlignmentAdjuster` reads the encoder's requested resolution alignment and
+ * crops the source so the scaled output lands aligned; snapping the factor
+ * by hand here to force even output dimensions would give up real
+ * resolution for an arbitrary aspect ratio (a 3440x1440 source would need
+ * ~1892x792, about 4% less linear resolution) to solve a problem the
+ * browser already handles.
+ * @param captured The capturer's actual output dimensions (from
+ * `getSettings()`), which may be larger or smaller than the target
+ * @param target The resolution the user actually chose
+ * @returns The scalar to assign to `RTCRtpEncodingParameters.scaleResolutionDownBy`
+ */
+function screenShareScaleFactor(
+  captured: { width?: number; height?: number },
+  target: VideoResolution,
+): number {
+  return Math.max(
+    1,
+    captured.width && target.width ? captured.width / target.width : 1,
+    captured.height && target.height ? captured.height / target.height : 1,
+  );
 }
 
 /** One `mediaCapabilities.encodingInfo` probe's outcome, kept for logging. */
@@ -271,7 +305,14 @@ async function screenShareCodec(
       ),
     );
 
-    const bitrate = screenShareEncoding(frameRate).maxBitrate;
+    // Built from the already-defaulted width/height/frameRate locals, not
+    // the raw (possibly undefined) `resolution` param, so the bitrate probed
+    // here always matches the resolution actually probed above.
+    const bitrate = screenShareEncoding({
+      width,
+      height,
+      frameRate,
+    }).maxBitrate;
 
     const probe = (contentType: string): Promise<CodecProbe> =>
       mediaCapabilities
@@ -394,12 +435,11 @@ export function getScreenShareCodecDecision() {
 async function screenSharePublishOptions(
   resolution: VideoResolution | undefined,
 ): Promise<TrackPublishOptions> {
-  const frameRate = resolution?.frameRate || 30;
   const videoCodec = await screenShareCodec(resolution);
   const decision = getScreenShareCodecDecision();
 
   return {
-    screenShareEncoding: screenShareEncoding(frameRate),
+    screenShareEncoding: screenShareEncoding(resolution),
     videoCodec,
     // vp8 and h264 are the only codecs LiveKit accepts as a backup. Reaching
     // for h264 just because it's "probably hardware" was the exact mistake
@@ -843,8 +883,44 @@ class Voice {
 
       this.#setVideo(room.localParticipant.isCameraEnabled);
     } catch (e) {
-      this.onErr(e);
+      this.#onCameraErr(e);
     }
+  }
+
+  /**
+   * Surface a camera acquisition failure.
+   *
+   * `onErr`'s `NotAllowedError`/`AbortError` exclusion does not apply here.
+   * That exclusion exists so dismissing the *screen-share* picker doesn't
+   * raise an error modal (see `toggleScreenshare`'s catch), but those same
+   * names are exactly what a denied camera permission or an aborted
+   * `getUserMedia` request produce -- which is why enabling the camera used
+   * to silently do nothing with no error at all: `onErr` was throwing the
+   * one error a permission denial produces.
+   * @param e Whatever `setCameraEnabled` rejected with
+   */
+  #onCameraErr(e: unknown) {
+    const name = (e as Error)?.name;
+    console.warn("[rtc] camera acquisition failed", e);
+
+    let message: string | undefined;
+    switch (name) {
+      case "NotAllowedError":
+        message = "Camera permission was denied.";
+        break;
+      case "NotFoundError":
+        message = "No camera was found.";
+        break;
+      case "NotReadableError":
+        message =
+          "The camera could not be started -- it may already be in use by another application.";
+        break;
+    }
+
+    this.openModal({
+      type: "error2",
+      error: message ? new Error(message) : e,
+    });
   }
 
   /**
@@ -863,7 +939,7 @@ class Voice {
   #screenShareQuality(): ScreenShareQualityName {
     const saved = this.#settings.screenShareQuality;
     // Only offer back a quality this instance actually enables, so a saved
-    // 1080p60 does not survive the video limit being lowered.
+    // "high" does not survive the video limit being lowered.
     return saved && this.getEnabledScreenShareQualities()[saved]
       ? saved
       : "low";
@@ -882,12 +958,6 @@ class Voice {
         fullName: `720p 30FPS`,
         contentHint: "motion",
       },
-      low60: {
-        name: "low60",
-        resolution: at60(ScreenSharePresets.h720fps30.resolution),
-        fullName: `720p 60FPS`,
-        contentHint: "motion",
-      },
     };
 
     const limit = this.limits().video_resolution;
@@ -904,13 +974,6 @@ class Voice {
         contentHint: "motion",
       };
 
-      qualities.high60 = {
-        name: "high60",
-        resolution: at60(ScreenSharePresets.h1080fps30.resolution),
-        fullName: `1080p 60FPS`,
-        contentHint: "motion",
-      };
-
       // The upstream "Source 5FPS" option lived here. It is deliberately gone:
       // it shares this 1080p-capable branch, so raising an instance's
       // video_resolution limit silently added a 5 fps mode that is easy to
@@ -918,6 +981,27 @@ class Voice {
     }
 
     return qualities;
+  }
+
+  /**
+   * The offered qualities as `{ name, fullName }` pairs, for the two modals
+   * that let the user pick one (the native screen picker and the "always
+   * ask" settings dialog).
+   *
+   * Walks {@link ScreenShareQualityNames} rather than
+   * `Object.keys(qualities)`: that keeps the list typed as
+   * `ScreenShareQualityName` end to end (no `as ScreenShareQualityName` cast
+   * at the call site) and keeps the order the one declared here rather than
+   * object key insertion order.
+   */
+  #screenShareQualityOptions(): {
+    name: ScreenShareQualityName;
+    fullName: string;
+  }[] {
+    const qualities = this.getEnabledScreenShareQualities();
+    return ScreenShareQualityNames.filter((name) => qualities[name]).map(
+      (name) => ({ name, fullName: qualities[name]!.fullName }),
+    );
   }
 
   /**
@@ -974,17 +1058,15 @@ class Voice {
               screenPickerAudio = audio;
             },
             sources: sources,
-            qualities: Object.keys(qualities).map((k) => {
-              const v = qualities[k as ScreenShareQualityName]!;
-              return { name: k, fullName: v.fullName };
-            }),
+            qualities: this.#screenShareQualityOptions(),
           });
         });
       }
 
       try {
         // The picker can still change this, but capturing at the saved quality
-        // means a 60fps share starts at 60 rather than being raised into it.
+        // avoids capturing at one resolution/bitrate and then immediately
+        // re-publishing at another once the dialog resolves.
         const startingQuality =
           qualities[this.#screenShareQuality()] ?? qualities.low!;
 
@@ -1036,42 +1118,39 @@ class Voice {
               screenPickerAudio || false,
             );
           } else if (this.#settings.screenShareQualityAsk) {
-            if (Object.keys(qualities).length > 1) {
-              localTrack.pauseUpstream();
-              screenAudioTrack?.pauseUpstream();
-              this.openModal({
-                onCancel: async () => {
-                  cancelled = true;
-                  await room.localParticipant.setScreenShareEnabled(false);
-                  this.#setScreenshare(
-                    room.localParticipant.isScreenShareEnabled,
-                  );
-                },
-                type: "screen_share_settings",
-                trackReference: {
-                  participant: room.localParticipant,
-                  publication: localTrack,
-                  source: Track.Source.ScreenShare,
-                },
-                qualities: Object.keys(qualities).map((k) => {
-                  const v = qualities[k as ScreenShareQualityName]!;
-                  return { name: k, fullName: v.fullName };
-                }),
-                audio: !!screenAudioTrack,
-                callback: async (qualityName, audio) => {
-                  callback(qualityName, audio);
-                  localTrack.resumeUpstream();
-                  if (audio) {
-                    screenAudioTrack?.resumeUpstream();
-                  }
-                },
-              });
-            } else {
-              callback(
-                this.#screenShareQuality(),
-                this.#settings.screenShareAudio,
-              );
-            }
+            // No longer gated on there being more than one quality to choose
+            // from: even with a single preset (an instance whose
+            // video_resolution limit sits below 1080p) this dialog is still
+            // the only place to toggle share audio at share time and to set
+            // "Don't ask me again" -- losing it there would silently remove
+            // both. Form2.ButtonGroup renders fine with one pre-selected
+            // button.
+            localTrack.pauseUpstream();
+            screenAudioTrack?.pauseUpstream();
+            this.openModal({
+              onCancel: async () => {
+                cancelled = true;
+                await room.localParticipant.setScreenShareEnabled(false);
+                this.#setScreenshare(
+                  room.localParticipant.isScreenShareEnabled,
+                );
+              },
+              type: "screen_share_settings",
+              trackReference: {
+                participant: room.localParticipant,
+                publication: localTrack,
+                source: Track.Source.ScreenShare,
+              },
+              qualities: this.#screenShareQualityOptions(),
+              audio: !!screenAudioTrack,
+              callback: async (qualityName, audio) => {
+                callback(qualityName, audio);
+                localTrack.resumeUpstream();
+                if (audio) {
+                  screenAudioTrack?.resumeUpstream();
+                }
+              },
+            });
           } else {
             // "Always ask" off and no native picker: nothing used to apply the
             // saved quality or honour the audio preference at all.
@@ -1083,7 +1162,13 @@ class Voice {
         }
       } catch (e) {
         if (cancelled) return;
-        this.onErr(e);
+        // NotAllowedError is the spec cancel; Firefox/Safari answer a
+        // dismissed picker with AbortError. Neither is worth an error modal
+        // here -- but this exclusion is scoped to the screen-share path via
+        // `ignoreNames`, not baked into `onErr` itself, precisely so
+        // `toggleCamera` (which shares `onErr`) still surfaces the same
+        // error names when they mean a denied camera permission instead.
+        this.onErr(e, ["NotAllowedError", "AbortError"]);
       }
     }
   }
@@ -1101,9 +1186,9 @@ class Voice {
    *
    * Publish options are fixed when the track goes up, from the saved quality,
    * while the "always ask" dialog only re-applied capture constraints. The two
-   * could therefore disagree: picking 60fps on top of a saved 30fps default
-   * left `maxFramerate: 30` on the sender, so the share stayed pinned at 30 no
-   * matter how many frames the capturer produced.
+   * could therefore disagree: switching quality mid-share left the sender's
+   * old `maxBitrate`/`maxFramerate` in place, so the change never actually
+   * reached the encoder.
    *
    * Also owns `scaleResolutionDownBy`: capture no longer asks for a
    * resolution (see `toggleScreenshare`/`#recoverScreenShare`), so the
@@ -1116,6 +1201,12 @@ class Voice {
    * is only ever called from `#applyShareChoice`, which re-reads the live
    * track's settings every time it runs) recomputes it against the new
    * target instead of the one the share started with.
+   *
+   * The `maxFramerate` half is currently a no-op: both presets run at 30fps
+   * (see `ScreenShareQualityName`), so this only ever writes the value that
+   * was already there. Kept anyway -- it is three lines and it is the
+   * mechanism that would make a mid-share framerate change take effect if a
+   * differing-framerate preset is ever reintroduced.
    * @param localTrack Screen share publication
    * @param resolution Resolution/framerate the user actually chose
    */
@@ -1126,25 +1217,24 @@ class Voice {
     const sender = localTrack.videoTrack?.sender;
     if (!sender?.getParameters) return;
 
+    // The capturer's actual output, now that capture no longer requests a
+    // resolution -- may be larger (a 4K monitor, or a 21:9 ultrawide) or
+    // smaller (a small window) than what was asked for.
+    const captured = localTrack.videoTrack?.mediaStreamTrack.getSettings();
+    const scaleResolutionDownBy = screenShareScaleFactor(
+      captured ?? {},
+      resolution,
+    );
+
+    console.info(
+      `[rtc] screen share encoder limits: captured ${captured?.width ?? "?"}x${captured?.height ?? "?"} -> target ${resolution.width}x${resolution.height} (scaleResolutionDownBy ${scaleResolutionDownBy.toFixed(3)})`,
+    );
+
     try {
       const params = sender.getParameters();
       if (!params.encodings?.length) return;
 
-      const { maxBitrate, maxFramerate } = screenShareEncoding(
-        resolution.frameRate ?? 30,
-      );
-
-      // The capturer's actual output, now that capture no longer requests a
-      // resolution -- may be larger (a 4K monitor) or smaller (a small
-      // window) than what was asked for.
-      const capturedHeight =
-        localTrack.videoTrack?.mediaStreamTrack.getSettings().height;
-      // Never upscale: a captured frame smaller than the target quality is
-      // already as good as it gets.
-      const scaleResolutionDownBy =
-        capturedHeight && resolution.height
-          ? Math.max(1, capturedHeight / resolution.height)
-          : 1;
+      const { maxBitrate, maxFramerate } = screenShareEncoding(resolution);
 
       let changed = false;
 
@@ -1175,7 +1265,12 @@ class Voice {
       if (changed) await sender.setParameters(params);
     } catch (err) {
       // Not fatal: the share is up, it is just capped where it was published.
-      console.warn("[rtc] could not update screen share encoder limits", err);
+      // The factor is included so a `setParameters` rejection (e.g. a value
+      // under 1.0, which is a RangeError) is diagnosable from the log alone.
+      console.warn(
+        `[rtc] could not update screen share encoder limits (scaleResolutionDownBy ${scaleResolutionDownBy.toFixed(3)})`,
+        err,
+      );
     }
   }
 
@@ -1195,7 +1290,10 @@ class Voice {
 
     await localTrack.videoTrack.mediaStreamTrack.applyConstraints({
       // `ideal` as well as `max`: asking only for a ceiling lets the source
-      // stay wherever it started, which is how a 60fps pick used to deliver 30.
+      // stay wherever it started rather than being pinned down to it, which
+      // matters when `setNextScreenShareFrameRate` only covered the initial
+      // `getDisplayMedia` and a mid-share quality change needs to actually
+      // move the source's framerate too.
       //
       // Deliberately no `width`/`height` here any more: constraining capture
       // resolution forced a full-frame libyuv rescale on Chromium's capture
@@ -1566,12 +1664,23 @@ class Voice {
     return !!this.channel()?.havePermission("Speak");
   }
 
-  private onErr(e: unknown) {
-    // NotAllowedError is the spec cancel; Firefox/Safari answer a dismissed
-    // picker with AbortError. Neither is worth an error modal.
+  /**
+   * Show the generic error modal for an unexpected failure.
+   *
+   * `ignoreNames` lets one specific call site (the screen-share picker, see
+   * `toggleScreenshare`) suppress cancel-shaped `DOMException`s without
+   * doing that for every other caller. It used to be a blanket exclusion
+   * for `NotAllowedError`/`AbortError` on every call to this method, which
+   * meant `toggleCamera` -- sharing this same handler -- silently ate a
+   * denied camera permission (`NotAllowedError` is exactly what that
+   * produces) with no error shown at all.
+   * @param e Whatever was caught
+   * @param ignoreNames Error `.name` values to swallow instead of showing a modal
+   */
+  private onErr(e: unknown, ignoreNames: string[] = []) {
     const name = (e as Error)?.name;
-    if (name !== "NotAllowedError" && name !== "AbortError")
-      this.openModal({ type: "error2", error: e });
+    if (name && ignoreNames.includes(name)) return;
+    this.openModal({ type: "error2", error: e });
   }
 }
 
