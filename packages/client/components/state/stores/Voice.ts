@@ -14,25 +14,41 @@ const NoiseSuppresionStates: NoiseSuppresionState[] = [
 ];
 
 /**
- * Possible screen share qualities. Low is 720p@30fps and high is 1080p@30fps.
+ * Possible screen share qualities. Low is 720p@30fps, high is 1080p@30fps,
+ * and high60 is 1080p@60fps.
  *
  * The upstream "text" mode (source resolution at 5 fps) is removed: it only
  * appeared on instances whose video_resolution limit allows 1080p, and it is
  * far too easy to select by accident and then assume the client is broken.
  *
- * There used to be `low60`/`high60` variants of both presets. They are gone:
- * Chromium's desktop-capture governor caps a 1440p-class source around 28 fps
- * regardless of the target framerate requested, so a 60fps option promised
- * something the capture pipeline could never deliver.
+ * 60fps presets used to exist at both 720p and 1080p, then were removed
+ * entirely: Chromium's desktop-capture governor caps a 1440p-class source
+ * around 28 fps regardless of the target framerate requested, so neither
+ * preset could actually deliver 60fps through that path.
+ *
+ * `high60` is back because a native GPU capture path (Windows, window shares
+ * only, shipped from `for-desktop`) does not go through that governor and can
+ * genuinely reach 60fps there. The option is offered on every platform
+ * regardless, deliberately, not gated on that capability -- on any other path
+ * it just raises the bitrate ceiling (see `screenShareEncoding` in
+ * `rtc/state.tsx`) with no extra frames to show for it, which is what the
+ * weak-link warning there exists to catch. `low60` (720p60) is not coming
+ * back alongside it: there was no native-capture motivation for it, only
+ * 1080p needed the extra detail at 60fps, so `clean()` below still migrates
+ * a saved "low60" to "low".
  */
-export type ScreenShareQualityName = "low" | "high";
+export type ScreenShareQualityName = "low" | "high" | "high60";
 
 /**
- * Array of available screen share quality names.
+ * Array of available screen share quality names, ordered low to high --
+ * `#screenShareQuality()` in `rtc/state.tsx` walks backward through this
+ * order to find the closest enabled quality to a saved one that is no
+ * longer offered.
  */
 export const ScreenShareQualityNames: ScreenShareQualityName[] = [
   "low",
   "high",
+  "high60",
 ];
 
 export interface TypeVoice {
@@ -170,14 +186,19 @@ export class Voice extends AbstractStore<"voice", TypeVoice> {
       data.autoGainControl = input.autoGainControl;
     }
 
-    // migrate legacy 60fps presets to their remaining 30fps equivalent --
-    // ScreenShareQualityNames.includes below is a hard drop, not a remap, so
-    // without this a saved "high60" would fall through to the "low" default,
-    // demoting a 1080p user to 720p.
+    // "low60" is a legacy 720p60 preset that stays gone -- this feature only
+    // reintroduces 1080p60, not 720p60 (see ScreenShareQualityName) -- so a
+    // saved "low60" still needs remapping to "low", its nearest surviving
+    // equivalent.
+    //
+    // "high60" is deliberately NOT remapped here any more: it is a real,
+    // currently-enabled quality name again, so it now falls through to the
+    // ScreenShareQualityNames.includes branch below like any other valid
+    // value. Remapping it to "high" would silently strip a saved 1080p60
+    // choice down to 1080p30 on every load -- exactly the bug this migration
+    // existed to work around back when "high60" was not a real option.
     if ((input.screenShareQuality as unknown) === "low60") {
       data.screenShareQuality = "low";
-    } else if ((input.screenShareQuality as unknown) === "high60") {
-      data.screenShareQuality = "high";
     } else if (
       input.screenShareQuality &&
       ScreenShareQualityNames.includes(input.screenShareQuality)

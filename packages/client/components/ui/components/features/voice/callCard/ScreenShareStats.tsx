@@ -3,6 +3,7 @@ import { createSignal, For, onCleanup, Show } from "solid-js";
 import type { TrackReference } from "solid-livekit-components";
 
 import { isLocal } from "@livekit/components-core";
+import { isScreenShareLinkWeak } from "@revolt/rtc";
 import { styled } from "styled-system/jsx";
 
 /**
@@ -149,6 +150,12 @@ export function ScreenShareStats(props: {
       return frameRateConstraint?.max ?? frameRateConstraint?.ideal;
     })();
 
+    // The encoder's actual bitrate ceiling in force, for the "Weak link" row
+    // below -- read the same way as targetFrameRate above, straight off the
+    // sender's own parameters rather than re-derived from the quality name.
+    const maxBitrate: number | undefined =
+      sender.getParameters().encodings?.[0]?.maxBitrate;
+
     // Where the time went while quality was limited -- `cpu` here means the
     // encoder could not keep up, `bandwidth` means the network could not.
     const durations = outbound.qualityLimitationDurations ?? {};
@@ -224,6 +231,25 @@ export function ScreenShareStats(props: {
         label: "Link capacity",
         value: candidatePair?.availableOutgoingBitrate
           ? formatBitrate(candidatePair.availableOutgoingBitrate)
+          : NA,
+      },
+      {
+        // Same check as the one-time weak-link warning in rtc/state.tsx
+        // (see isScreenShareLinkWeak), kept visible here for as long as the
+        // share runs rather than shown once and then gone. Reads only stats
+        // already sampled above -- the bitrate ceiling from the sender's own
+        // parameters (the actual ceiling in force, not just what the current
+        // ScreenShareQualityName implies), "Link capacity", and the
+        // bandwidth-limited share of "Limited for".
+        label: "Weak link",
+        value: maxBitrate
+          ? isScreenShareLinkWeak(
+              maxBitrate,
+              candidatePair?.availableOutgoingBitrate,
+              durations.bandwidth,
+            )
+            ? "yes"
+            : "no"
           : NA,
       },
       {
