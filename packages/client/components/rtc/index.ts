@@ -1,24 +1,13 @@
-import {
-  setNextScreenShareFrameRate,
-  takeNextScreenShareFrameRate,
-} from "./screenShareCapture";
+import { takeNextScreenShareFrameRate } from "./screenShareCapture";
 import { getVirtmic } from "./virtualMic";
 
-export {
-  getMicPublication,
-  isSoundboardPublication,
-  SOUNDBOARD_TRACK_NAME,
-  useIsMicMuted,
-} from "./soundboard";
-export type { SoundboardSound } from "./soundboard";
+export { isSoundboardPublication, useIsMicMuted } from "./soundboard";
 export { useSoundboardLibrary } from "./soundboardLibrary";
-export type { SoundboardEntry, SoundboardLibrary } from "./soundboardLibrary";
-export { registerSpeakingMeter, useIsSpeakingFast } from "./speaking";
-export { getScreenShareCodecDecision, useVoice, VoiceContext } from "./state";
-export { setNextScreenShareFrameRate };
+export type { SoundboardEntry } from "./soundboardLibrary";
+export { useIsSpeakingFast } from "./speaking";
+export { useVoice, VoiceContext } from "./state";
 
 export { InRoom } from "./components/InRoom";
-export { RoomAudioManager } from "./components/RoomAudioManager";
 export { stoatSinkName } from "./virtualMic";
 
 const originalMediaCall = navigator.mediaDevices.getDisplayMedia;

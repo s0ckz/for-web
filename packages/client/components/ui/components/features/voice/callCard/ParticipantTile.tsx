@@ -92,10 +92,17 @@ export function ParticipantTile(props: TileProps) {
 
   /**
    * Drive the actual LiveKit subscription from that choice, so declining to
-   * watch genuinely stops the server sending video rather than just hiding it.
+   * watch a screen share genuinely stops the server sending video rather than
+   * just hiding it. Cameras have no equivalent "watch" concept -- there is
+   * nothing to opt out of -- so isWatching() always evaluates true for them
+   * and they subscribe unconditionally as soon as their tile renders.
+   *
+   * The room connects with autoSubscribe: false, so every remote track needs
+   * an explicit setSubscribed call somewhere, and this effect is it for both
+   * kinds: VideoTrack's own subscription management is turned off below.
    */
   createEffect(() => {
-    if (!isScreenShare() || isSelf()) return;
+    if (isSelf()) return;
     const publication = track.publication as RemoteTrackPublication | undefined;
     if (typeof publication?.setSubscribed !== "function") return;
     try {
@@ -106,17 +113,16 @@ export function ParticipantTile(props: TileProps) {
   });
 
   /**
-   * Subscribing is asynchronous, so there is a window after clicking "watch"
-   * where the publication exists but carries no media. Rendering the video
-   * element then leaves an empty, collapsed tile -- so wait for the track.
+   * Subscribing is asynchronous, so there is a window -- after clicking
+   * "watch" for a screen share, or immediately on mount for a camera, since
+   * that one subscribes unconditionally -- where the publication exists but
+   * carries no media yet. Rendering the video element then leaves an empty,
+   * collapsed tile, so wait for the actual track before treating it as ready;
+   * until then the tile shows its "Connecting…" placeholder instead.
    */
   const [trackReady, setTrackReady] = createSignal(false);
 
   createEffect(() => {
-    if (!isScreenShare()) {
-      setTrackReady(true);
-      return;
-    }
     if (!isWatching()) {
       setTrackReady(false);
       return;
@@ -267,9 +273,10 @@ export function ParticipantTile(props: TileProps) {
                 overflow: "hidden",
               }}
               trackRef={track as TrackReference}
-              // We drive setSubscribed ourselves from the watch choice above;
-              // letting VideoTrack manage it unsubscribes 3s after the element
-              // is hidden and then fights us over it.
+              // We drive setSubscribed ourselves for both cameras and screen
+              // shares (see the effect above); letting VideoTrack manage it
+              // unsubscribes 3s after the element is hidden and then fights
+              // us over it.
               manageSubscription={false}
               ref={videoRef}
               on:resize={() => {
