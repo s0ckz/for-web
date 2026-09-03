@@ -89,10 +89,26 @@ const SCREEN_SHARE_AUDIO: ScreenShareCaptureOptions["audio"] = {
  * The ceiling used to be keyed on resolution alone, justified by both presets
  * running at 30fps -- that premise is gone now that 1080p60 ("high60", see
  * {@link ScreenShareQualityName}) exists, so framerate is now a second factor.
- * 1080p60 gets 12 Mbps: 1.5x the 1080p30 ceiling, not 2x, because H.26x
+ * 1080p60 gets 9 Mbps: 1.5x the 1080p30 ceiling, not 2x, because H.26x
  * inter-frame coding gets cheaper per frame as the temporal distance between
  * frames shrinks -- doubling the frame rate does not double the bits needed
  * to hold the same perceptual quality.
+ *
+ * 1080p30 itself was lowered from 8 Mbps to 6 Mbps after a real uplink
+ * measured at 7.78 Mbps kept tripping publisher reconnects on it: asking the
+ * encoder for more than the link can sustain does not degrade gracefully
+ * here, LiveKit tears the publish down and republishes it, which is a
+ * visible stop/start for every viewer. 6 Mbps now fits comfortably under
+ * that link.
+ *
+ * high60's 9 Mbps is deliberately *not* brought down to fit that same link --
+ * it is the ungated top preset offered everywhere, and sizing it to one
+ * user's uplink would degrade it for everyone with more headroom. That
+ * preset staying above a marginal link is expected and left to {@link
+ * Voice.#watchForWeakLink}'s advisory warning; what makes overshooting it
+ * survivable rather than a repeated visible stop/start is the rest of this
+ * PR -- re-applying encoder limits and re-arming the ended listener after a
+ * republish (see the `localTrackPublished` handler in `connect()`).
  * @param resolution Target resolution, or undefined to use the 720p ceiling
  * @returns Publish options
  */
@@ -104,9 +120,9 @@ function screenShareEncoding(resolution: VideoResolution | undefined) {
   if (height <= 720) {
     maxBitrate = 4_000_000;
   } else if (frameRate > 30) {
-    maxBitrate = 12_000_000;
+    maxBitrate = 9_000_000;
   } else {
-    maxBitrate = 8_000_000;
+    maxBitrate = 6_000_000;
   }
 
   return {
@@ -579,6 +595,19 @@ class Voice {
   #recoveryAttempts: number[] = [];
   #recovering = false;
 
+  /**
+   * The publication {@link #armScreenShareEnded} last attached its "ended"
+   * listener to, so it can tell a publication it has already armed apart
+   * from a genuinely new one. A full reconnect's `republishAllTracks`
+   * discards the old `LocalTrackPublication` and fires `localTrackPublished`
+   * for a fresh one, which also routes through `#armScreenShareEnded` -- and
+   * `toggleScreenshare`/`#recoverScreenShare` call it directly on that same
+   * fresh publication too. Without this guard both call paths would attach
+   * their own "ended" listener to the one live publication, so a single
+   * capture death would run two recovery cycles instead of one.
+   */
+  #armedShareEndedPublication?: LocalTrackPublication;
+
   constructor(
     voiceSettings: VoiceSettings,
     modals: ModalController,
@@ -776,6 +805,55 @@ class Voice {
     room.addListener("disconnected", () => this.#setState("DISCONNECTED"));
 
     room.addListener("localTrackPublished", (pub) => {
+      if (pub.source === Track.Source.ScreenShare) {
+        // LiveKit's `republishAllTracks` (run on a full reconnect via
+        // `handleSignalRestarted`) unpublishes and republishes the screen
+        // share, creating a brand new `LocalTrackPublication` backed by a
+        // fresh sender configured only from `pub.options` -- so
+        // `scaleResolutionDownBy` is back to 1 (full capture size, e.g. a
+        // 3440x1440 ultrawide going out uncapped) and the old publication's
+        // "ended" listener is orphaned on an object nothing will ever touch
+        // again. Both need to be redone on the new publication, and this is
+        // the only hook that runs on that path -- nothing else observes a
+        // signal-restart republish.
+        //
+        // This also fires on two other, harmless paths:
+        //  - The *initial* publish from `toggleScreenshare`, which arms the
+        //    listener itself once `setScreenShareEnabled` resolves
+        //    (`#armScreenShareEnded` is idempotent per publication, so
+        //    re-arming here first is a no-op) and applies the chosen
+        //    quality afterwards. `#lastShareChoice` is only ever written by
+        //    `#applyShareChoice`, so it is still unset here and there is
+        //    nothing yet to re-apply.
+        //  - `#recoverScreenShare`'s own republish, where `#lastShareChoice`
+        //    *is* already set, to the choice recovery is restoring -- so
+        //    this runs early and redundantly, moments before
+        //    `#recoverScreenShare` calls `#applyShareChoice` with that same
+        //    choice. Both compute the same scale factor from the same live
+        //    track, so the duplicate work is harmless.
+        this.#armScreenShareEnded(room, pub);
+
+        const choice = this.#lastShareChoice;
+        if (choice) {
+          // Same fallback `#applyShareChoice` uses: `choice.qualityName` was
+          // valid when the share started, but the enabled set is a function
+          // of `this.limits()` and could theoretically have shrunk since.
+          // Warn rather than silently skipping if even "low" -- which
+          // `getEnabledScreenShareQualities` always enables -- comes back
+          // missing, since that would mean this PR's whole fix quietly did
+          // not run.
+          const qualities = this.getEnabledScreenShareQualities();
+          const quality = qualities[choice.qualityName] || qualities.low!;
+          if (quality) {
+            void this.#applyEncoderLimits(pub, quality.resolution);
+          } else {
+            console.warn(
+              "[rtc] no screen share quality available to re-apply encoder limits after republish",
+            );
+          }
+        }
+      }
+
       if (
         pub.audioTrack &&
         pub.audioTrack.source === Track.Source.Microphone &&
@@ -862,6 +940,7 @@ class Voice {
 
       this.#lastShareChoice = undefined;
       this.#recoveryAttempts = [];
+      this.#armedShareEndedPublication = undefined;
 
       room.removeAllListeners();
       room.disconnect();
@@ -1112,6 +1191,7 @@ class Voice {
       // Deliberately stopping means there is nothing left to recover.
       this.#lastShareChoice = undefined;
       this.#recoveryAttempts = [];
+      this.#armedShareEndedPublication = undefined;
 
       await room.localParticipant.setScreenShareEnabled(false);
 
@@ -1286,16 +1366,22 @@ class Voice {
    * instead -- on the encoder, where a hardware H.26x makes it nearly free,
    * rather than as a libyuv rescale on Chromium's throttled capture thread.
    * This runs on every call, not just at publish, and is read fresh each
-   * time rather than cached, precisely so a mid-share quality change (this
-   * is only ever called from `#applyShareChoice`, which re-reads the live
-   * track's settings every time it runs) recomputes it against the new
-   * target instead of the one the share started with.
+   * time rather than cached, precisely so a mid-share quality change (via
+   * `#applyShareChoice`, which re-reads the live track's settings every time
+   * it runs) recomputes it against the new target instead of the one the
+   * share started with.
    *
-   * The `maxFramerate` half is currently a no-op: both presets run at 30fps
-   * (see `ScreenShareQualityName`), so this only ever writes the value that
-   * was already there. Kept anyway -- it is three lines and it is the
-   * mechanism that would make a mid-share framerate change take effect if a
-   * differing-framerate preset is ever reintroduced.
+   * `#applyShareChoice` is no longer the only caller: the `localTrackPublished`
+   * handler in `connect()` also calls this directly, without going through
+   * `#applyShareChoice`, to re-apply the last chosen quality after LiveKit
+   * republishes the share on a full reconnect -- see that handler for why.
+   *
+   * The `maxFramerate` half used to be a no-op: every preset ran at 30fps, so
+   * this only ever wrote back the value that was already there. That premise
+   * is gone now that `high60` exists (see `ScreenShareQualityName`) --
+   * switching into or out of it mid-share genuinely changes the encoder's
+   * framerate ceiling, which is exactly the mechanism this was kept around
+   * for.
    * @param localTrack Screen share publication
    * @param resolution Resolution/framerate the user actually chose
    */
@@ -1554,8 +1640,16 @@ class Voice {
    * is destroyed and recreated -- which is what a game does when it switches
    * to fullscreen -- and LiveKit then unpublishes the track. The share is
    * fine, the capture handle is not, so try to pick the window back up.
+   *
+   * Idempotent per publication object -- see
+   * {@link #armedShareEndedPublication} for why that matters. Callers do not
+   * need to check first; calling this again on the same live publication is
+   * a no-op.
    */
   #armScreenShareEnded(room: Room, localTrack: LocalTrackPublication) {
+    if (this.#armedShareEndedPublication === localTrack) return;
+    this.#armedShareEndedPublication = localTrack;
+
     localTrack.on("ended", () => {
       this.#onScreenShareEnded(room);
     });
@@ -1577,8 +1671,23 @@ class Voice {
 
     if (await this.#recoverScreenShare(room)) return;
 
-    // No bridge, nothing to recover, or recovery failed: stop as before.
-    this.toggleScreenshare();
+    // No bridge, nothing to recover, or recovery failed: stop as before --
+    // but only if there is still something to stop. `toggleScreenshare` is a
+    // toggle, and by the time we get here `screenshare()` can already be
+    // false: capture dies, this handler starts `#recoverScreenShare`, which
+    // blocks in `await reacquire()` for as long as it takes the window to
+    // come back (main waits up to a few minutes, see that method's comment)
+    // -- and the user can click stop while that is in flight, which runs
+    // `toggleScreenshare`'s own stop branch and sets `screenshare()` false
+    // right then. When `reacquire()` later resolves to `false` (or recovery
+    // fails some other way) and control lands back here, calling
+    // `toggleScreenshare()` unconditionally would find `screenshare()`
+    // already false and take the *other* branch -- starting a brand-new
+    // share and popping the picker, with no user action, right after the
+    // user asked to stop.
+    if (this.screenshare()) {
+      this.toggleScreenshare();
+    }
   }
 
   /**
@@ -1612,6 +1721,13 @@ class Voice {
       // Main waits (up to a few minutes) for the window to come back; a
       // minimised window cannot be captured, so this can take a while.
       if (!(await reacquire())) return false;
+
+      // The entry guard above only checked `screenshare()` before this long
+      // wait started -- the user can click stop while it was in flight,
+      // which runs independently of `#recovering` and sets `screenshare()`
+      // false right away. Bail here rather than republishing a share the
+      // user just asked to end.
+      if (!this.screenshare()) return false;
 
       // LiveKit unpublishes a track that ended, but it does so asynchronously
       // and we may well get here first. setScreenShareEnabled(true) reuses any
