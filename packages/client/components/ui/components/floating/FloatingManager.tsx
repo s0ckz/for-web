@@ -20,6 +20,7 @@ import { FloatingElement, floatingElements } from "../../directives";
 
 import { dismissFloatingElements } from ".";
 import { AutoComplete } from "./AutoComplete";
+import { usePortalMount } from "./portalMount";
 import { TooltipBase } from "./Tooltip";
 import { UserCard } from "./UserCard";
 
@@ -27,6 +28,8 @@ import { UserCard } from "./UserCard";
  * Render the actual floating elements
  */
 export function FloatingManager() {
+  const mount = usePortalMount();
+
   let mouseX = 0,
     mouseY = 0;
 
@@ -55,7 +58,10 @@ export function FloatingManager() {
   }
 
   return (
-    <Portal mount={document.getElementById("floating")!}>
+    // usePortalMount()'s accessor is reactive, and Portal already relocates
+    // its content in place when the mount target changes - no extra keying
+    // required, see the comment on usePortalMount for why.
+    <Portal mount={mount() ?? undefined}>
       <For each={floatingElements()}>
         {(element) => (
           <Presence>

@@ -5,6 +5,8 @@ import { Motion, Presence } from "solid-motionone";
 
 import { styled } from "styled-system/jsx";
 
+import { usePortalMount } from "../floating/portalMount";
+
 import { Button } from "./Button";
 import { typography } from "./Text";
 
@@ -38,8 +40,13 @@ type Props = DialogProps & {
  * @specification https://m3.material.io/components/dialogs
  */
 export function Dialog(props: Props) {
+  const mount = usePortalMount();
+
   return (
-    <Portal mount={document.getElementById("floating")!}>
+    // usePortalMount()'s accessor is reactive, and Portal already relocates
+    // its content in place when the mount target changes - no extra keying
+    // required, see the comment on usePortalMount for why.
+    <Portal mount={mount() ?? undefined}>
       <Dialog.Scrim
         show={props.show}
         onClick={props.onClose}

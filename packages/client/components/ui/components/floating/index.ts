@@ -1,4 +1,5 @@
 export { FloatingManager } from "./FloatingManager";
+export { usePortalMount } from "./portalMount";
 export { Tooltip } from "./Tooltip";
 export { UserCard } from "./UserCard";
 
