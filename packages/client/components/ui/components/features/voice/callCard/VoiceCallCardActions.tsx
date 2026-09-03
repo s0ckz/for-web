@@ -4,6 +4,7 @@ import { Show } from "solid-js";
 import { useLingui } from "@lingui/solid/macro";
 import { styled } from "styled-system/jsx";
 
+import { ScreenShareContextMenu } from "@revolt/app";
 import { useInstance } from "@revolt/instance";
 import { useVoice } from "@revolt/rtc";
 import { useState } from "@revolt/state";
@@ -117,6 +118,15 @@ export function VoiceCallCardActions(props: { size: "xs" | "sm" }) {
                 : t`Share screen`
               : t`Coming soon! 👀`,
           },
+          // Right-click only, and only while actually sharing -- left-click
+          // above stays a plain stop/start toggle either way. `undefined`
+          // rather than always providing the menu: `floating`'s directive
+          // only attaches a "contextmenu" listener at all when this is
+          // truthy, so with nothing to share yet a right-click still falls
+          // through to the browser's own menu instead of opening an empty one.
+          contextMenu: voice.screenshare()
+            ? () => <ScreenShareContextMenu />
+            : undefined,
         }}
         isDisabled={!limits().video}
       >
