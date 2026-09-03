@@ -19,8 +19,18 @@ export function ScreenShareSettingsModal(
   // saved quality can be "high" while this instance's video_resolution
   // limit only offers "low", which used to leave the button group's value
   // matching no button.
+  //
+  // `props.initialQualityName` -- what this share actually started with --
+  // takes priority over the saved default when given. Editing a share
+  // already running has to seed from that, not the saved setting: the two
+  // can disagree (a desktop-picker choice made at share start, or an
+  // earlier edit), and seeding from the saved default here would silently
+  // revert the live share back to it the moment "Save" is pressed without
+  // touching anything.
   const initialQualityName =
-    props.qualities.find((q) => q.name === voice.screenShareQuality)?.name ??
+    props.qualities.find(
+      (q) => q.name === (props.initialQualityName ?? voice.screenShareQuality),
+    )?.name ??
     props.qualities[0]?.name ??
     "low";
 
@@ -28,9 +38,10 @@ export function ScreenShareSettingsModal(
     qualityName: createFormControl<ScreenShareQualityName>(initialQualityName, {
       required: true,
     }),
-    audio: createFormControl(props.audio && voice.screenShareAudio, {
-      disabled: !props.audio,
-    }),
+    audio: createFormControl(
+      props.audio && (props.initialAudio ?? voice.screenShareAudio),
+      { disabled: !props.audio },
+    ),
     dontAsk: createFormControl(false),
   });
 
@@ -62,7 +73,9 @@ export function ScreenShareSettingsModal(
       actions={[
         { text: <Trans>Cancel</Trans> },
         {
-          text: <Trans>Go</Trans>,
+          // "Go" reads like starting a share, which this isn't when editing
+          // one already running.
+          text: props.liveEdit ? <Trans>Save</Trans> : <Trans>Go</Trans>,
           onClick: () => {
             onSubmit();
             return false;
@@ -95,9 +108,14 @@ export function ScreenShareSettingsModal(
               <Trans>Share audio</Trans>
             </Form2.Checkbox>
           </Show>
-          <Form2.Checkbox control={group.controls.dontAsk}>
-            <Trans>Don't ask me again</Trans>
-          </Form2.Checkbox>
+          {/* Writes global "always ask at share start" settings (see
+              onSubmit) -- only offered at share start, not while editing a
+              share already running. */}
+          <Show when={!props.liveEdit}>
+            <Form2.Checkbox control={group.controls.dontAsk}>
+              <Trans>Don't ask me again</Trans>
+            </Form2.Checkbox>
+          </Show>
           <Show when={!props.audio}>
             <small>
               <Trans>Audio disabled by browser</Trans>

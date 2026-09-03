@@ -328,6 +328,26 @@ export type Modals =
       trackReference: TrackReference;
       qualities: { name: ScreenShareQualityName; fullName: string }[];
       audio: boolean;
+      /**
+       * Preselect a quality/audio pair other than the saved default.
+       *
+       * The saved default is exactly right at share start (the only case
+       * that omits these), but wrong for editing a share already running --
+       * that needs to seed from what *this* share actually started with
+       * (`Voice#lastShareChoice`), which can disagree with the saved
+       * default (e.g. a desktop-picker choice made at share start, or an
+       * earlier edit).
+       */
+      initialQualityName?: ScreenShareQualityName;
+      initialAudio?: boolean;
+      /**
+       * Hide "Don't ask me again" and relabel the confirm action for
+       * editing a share already running, rather than starting one.
+       * "Don't ask me again" writes global "always ask at share start"
+       * settings -- offering it from a live-edit menu would be a
+       * surprising side effect unrelated to what was just edited.
+       */
+      liveEdit?: boolean;
       callback: (qualityName: ScreenShareQualityName, audio: boolean) => void;
       onCancel: () => void;
     }

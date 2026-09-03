@@ -15,6 +15,7 @@ import {
 } from "solid-livekit-components";
 
 import {
+  LocalTrack,
   LocalTrackPublication,
   Room,
   ScreenShareCaptureOptions,
@@ -1425,6 +1426,118 @@ class Voice {
   }
 
   /**
+   * Public entry point for changing quality/audio on a screen share that is
+   * already running, with no stop/start cycle.
+   *
+   * This is a thin wrapper: `#applyShareChoice` already does the actual work
+   * (`applyConstraints({ frameRate })`, `contentHint`, and the live
+   * `sender.setParameters` in `#applyEncoderLimits`) and is written to be
+   * safely re-run mid-share -- it just had no public entry point before this.
+   * `announce = false` because this is not a new share, so there is nothing
+   * to play the "stream started" sound for.
+   *
+   * No-ops if there is no live screen-share publication, so callers (the
+   * context menu, the settings modal's callback) do not need to re-check
+   * `screenshare()` themselves. Also no-ops while a source change
+   * (`changeScreenShareSource`) is in flight: that call's own teardown and
+   * republish would otherwise race this one over the same publication.
+   * @param qualityName Chosen quality
+   * @param audio Whether the share's audio should be kept -- can only
+   * unpublish, never add audio to a share that started without it
+   */
+  async changeScreenShareQuality(
+    qualityName: ScreenShareQualityName,
+    audio: boolean,
+  ) {
+    const room = this.room();
+    if (!room || this.#recovering) {
+      console.warn(
+        "[rtc] changeScreenShareQuality: ignored (not connected, or a source change is in progress)",
+      );
+      return;
+    }
+
+    const localTrack = room.localParticipant.getTrackPublication(
+      Track.Source.ScreenShare,
+    );
+    if (!localTrack) {
+      console.warn("[rtc] changeScreenShareQuality: no live screen share");
+      return;
+    }
+
+    await this.#applyShareChoice(room, localTrack, qualityName, audio, false);
+  }
+
+  /**
+   * Open the same "Screen Share Settings" dialog offered when a share
+   * starts, but for one that is already running.
+   *
+   * `ScreenShareSettings.tsx` needed no behaviour changes to support this,
+   * only two additions: it already takes a live `TrackReference` and
+   * renders a running preview from it, but it used to seed its initial
+   * quality/audio from the *saved default* and always offered "Don't ask me
+   * again" -- both right at share start, both wrong here. `#lastShareChoice`
+   * -- what this share actually started with -- can disagree with the saved
+   * default (a desktop-picker choice made at share start, or an earlier
+   * edit), and "Don't ask me again" writes that saved default globally,
+   * which a live edit has no business doing as a side effect. `initialXxx`
+   * and `liveEdit` below are exactly those two additions.
+   *
+   * The `audio` flag mirrors `toggleScreenshare`'s own use of this modal --
+   * whether there is a `ScreenShareAudio` publication to offer turning off,
+   * since turning it *on* after the fact isn't possible (see
+   * `changeScreenShareQuality`'s doc comment).
+   *
+   * No-ops when not sharing (or while a source change is in flight, which
+   * would otherwise show a preview of a publication about to be torn down),
+   * so the "Change quality" context menu item does not need to guard the
+   * call itself.
+   */
+  openScreenShareQualitySettings() {
+    const room = this.room();
+    if (!room || this.#recovering) {
+      console.warn(
+        "[rtc] openScreenShareQualitySettings: ignored (not connected, or a source change is in progress)",
+      );
+      return;
+    }
+
+    const localTrack = room.localParticipant.getTrackPublication(
+      Track.Source.ScreenShare,
+    );
+    if (!localTrack) {
+      console.warn(
+        "[rtc] openScreenShareQualitySettings: no live screen share",
+      );
+      return;
+    }
+
+    const screenAudioTrack = room.localParticipant.getTrackPublication(
+      Track.Source.ScreenShareAudio,
+    );
+
+    this.openModal({
+      type: "screen_share_settings",
+      trackReference: {
+        participant: room.localParticipant,
+        publication: localTrack,
+        source: Track.Source.ScreenShare,
+      },
+      qualities: this.#screenShareQualityOptions(),
+      audio: !!screenAudioTrack,
+      initialQualityName: this.#lastShareChoice?.qualityName,
+      initialAudio: this.#lastShareChoice?.audio,
+      liveEdit: true,
+      // Nothing was paused/unpublished to open this dialog (unlike the
+      // first-share flow in toggleScreenshare), so dismissing it undoes
+      // nothing -- the share just keeps running as it was.
+      onCancel: () => {},
+      callback: (qualityName, audio) =>
+        this.changeScreenShareQuality(qualityName, audio),
+    });
+  }
+
+  /**
    * Self-healing check: a few seconds after publishing, sample the sender's
    * actual encoder once. If we picked h264/h265 because the probe said it
    * was hardware, but the browser handed us a software encoder anyway (a
@@ -1562,6 +1675,19 @@ class Voice {
   }
 
   async #onScreenShareEnded(room: Room) {
+    // A manual operation (changeScreenShareSource) or an automatic recovery
+    // (#recoverScreenShare) is already handling this share's lifecycle.
+    // Falling through to the cleanup below anyway would race whichever one
+    // is running -- most visibly, on Windows, for-desktop's native capture
+    // path stops the *old* capture the instant a new display-media request
+    // opens the picker (see changeScreenShareSource's doc comment), so this
+    // can fire for the old publication while its replacement is still being
+    // acquired. Bailing here leaves the in-flight operation to do its own
+    // cleanup instead of this falling through to toggleScreenshare()'s stop
+    // branch underneath it -- which, unlike a real deliberate stop, would
+    // wipe #lastShareChoice and #recoveryAttempts out from under it.
+    if (this.#recovering) return;
+
     // LiveKit only unpublishes the video half, and the audio track would keep
     // playing into the call on its own.
     const oldAudioTrack = room.localParticipant.getTrackPublication(
@@ -1675,6 +1801,252 @@ class Voice {
       return false;
     } finally {
       this.#recovering = false;
+    }
+  }
+
+  /**
+   * Change which window/screen is being shared, mid-share.
+   *
+   * There is no swap-source API on top of WebRTC/`getDisplayMedia` -- the
+   * source is fixed for the life of the capture -- so this is still a
+   * stop/start cycle under the hood, but ordered *acquire, then swap*:
+   * request the replacement capture first, and only tear down the running
+   * share once that succeeds. This is deliberately not the same order as
+   * `#recoverScreenShare` (which tears down first, because the old capture
+   * is already dead by the time it runs). Acquiring first buys two things a
+   * teardown-first ordering cannot:
+   *
+   * - **Cancel-safety.** `setScreenShareEnabled(true)` merely unmutes an
+   *   existing publication rather than asking `getDisplayMedia` again (see
+   *   `LocalParticipant.setTrackEnabled` in livekit-client), so a
+   *   teardown-first ordering has to tear down before it can even ask for a
+   *   replacement -- and a cancelled or failed pick then leaves nothing
+   *   running. Acquiring via `createScreenTracks` first (the same
+   *   `LocalParticipant` method `setScreenShareEnabled(true)` calls
+   *   internally) means a cancelled pick leaves the running share untouched.
+   * - **Activation.** `getDisplayMedia` needs to run inside the same
+   *   transient-activation window as the click that triggered this. A
+   *   teardown first -- `setScreenShareEnabled(false)` can mean a full SDP
+   *   renegotiation round trip (`unpublishTrack` -> `engine.negotiate()`),
+   *   or waiting out an in-progress republish (`setTrackEnabled` opens with
+   *   `await this.republishPromise`) -- risks that window lapsing before the
+   *   replacement is even requested.
+   *
+   * This does NOT close the viewer-visible gap, though: on Windows,
+   * for-desktop's native capture path stops the *old* capture the instant a
+   * new display-media request arrives -- before the user has even picked
+   * anything (see `for-desktop/src/native/window.ts`'s `stopScreenCapture()`
+   * call on request) -- so the old share still ends early there regardless
+   * of the ordering here. Closing that needs a for-desktop change and is out
+   * of scope for this PR; acquiring first still wins on cancel-safety and
+   * activation, which is what it is for.
+   *
+   * Deliberately does not go through `toggleScreenshare()`: its stop branch
+   * clears `#lastShareChoice` and `#recoveryAttempts`, and this needs to
+   * read `#lastShareChoice` for the republish below. Reusing it, rather
+   * than the saved default quality `toggleScreenshare` starts a *fresh*
+   * share with, is what keeps a quality change made earlier in this same
+   * share from being silently reverted by switching sources afterwards.
+   * `announce = false` for the same reason as recovery: from the sharer's
+   * perspective this never stopped, so no stream-start sound either.
+   *
+   * Viewers do see a brief unpublish/republish once teardown happens --
+   * unavoidable, and exactly what an automatic recovery already looks like
+   * today, which is what the tile's `FOCUS_GRACE_MS` pin-retention already
+   * tolerates.
+   *
+   * Reuses the `#recovering` flag rather than a separate one: this and
+   * `#recoverScreenShare` are both "tear down and republish the same share"
+   * operations on the same publication, and letting both run at once would
+   * have them race over it. It is also what makes `#onScreenShareEnded`
+   * ignore the old publication's "ended" firing mid-acquire (see its own
+   * doc comment). The flag is cleared as soon as the acquire/teardown/
+   * publish sequence resolves, before arming the new publication's own
+   * "ended" listener or applying the saved quality to it, so a death of the
+   * new capture during that tail is handled as a normal recovery rather
+   * than silently ignored by this method still holding the flag.
+   */
+  async changeScreenShareSource() {
+    const room = this.room();
+    if (!room || !this.screenshare() || this.#recovering) {
+      console.warn(
+        "[rtc] changeScreenShareSource: ignored (not sharing, or a source change is already in progress)",
+      );
+      return;
+    }
+
+    // Nothing to preserve quality/audio from -- should not happen while
+    // screenshare() is true, but this is a manual, user-triggered action
+    // rather than a best-effort recovery, so bail rather than guess.
+    const choice = this.#lastShareChoice;
+    if (!choice) {
+      console.warn(
+        "[rtc] changeScreenShareSource: no remembered share choice to reuse",
+      );
+      return;
+    }
+
+    this.#recovering = true;
+
+    // Set by the desktop picker's onCancel below. Only meaningful while
+    // acquiring (see the catch): a dismissed picker there means nothing was
+    // ever touched, as opposed to a genuine failure.
+    let cancelled = false;
+    // Whether the running share has actually been torn down yet. Only once
+    // this flips does a failure mean "share ended", rather than "nothing
+    // happened" -- acquiring runs first and touches nothing.
+    let torndown = false;
+
+    let localTrack: LocalTrackPublication | undefined;
+    let codecDecision: ReturnType<typeof getScreenShareCodecDecision>;
+    let screenPickerQualityName: ScreenShareQualityName | undefined;
+    let screenPickerAudio: boolean | undefined;
+
+    try {
+      // Same desktop-picker dance as toggleScreenshare's start branch:
+      // registered before acquiring, since acquiring is what triggers it. On
+      // plain web this is skipped and createScreenTracks below falls through
+      // to the browser's own getDisplayMedia picker instead.
+      if (window.native && window.native.onceScreenPicker) {
+        window.native.onceScreenPicker((sources) => {
+          this.openModal({
+            type: "screen_share_picker",
+            onCancel: () => {
+              cancelled = true;
+              window.native.screenPickerCallback(-1, false);
+            },
+            callback: (idx, qualityName, audio) => {
+              window.native.screenPickerCallback(idx, audio);
+              screenPickerQualityName = qualityName;
+              screenPickerAudio = audio;
+            },
+            sources,
+            qualities: this.#screenShareQualityOptions(),
+          });
+        });
+      }
+
+      const qualities = this.getEnabledScreenShareQualities();
+      const startingQuality = qualities[choice.qualityName] ?? qualities.low!;
+
+      // Acquire the replacement FIRST -- see the doc comment above for why
+      // this has to come before touching the running share at all.
+      let newTracks: LocalTrack[];
+      setNextScreenShareFrameRate(startingQuality.resolution.frameRate ?? 30);
+      try {
+        newTracks = await room.localParticipant.createScreenTracks({
+          audio: SCREEN_SHARE_AUDIO,
+        });
+      } finally {
+        setNextScreenShareFrameRate(undefined);
+      }
+
+      // Only now touch the running share. It may already be half gone
+      // regardless of anything we do here -- see the doc comment's note
+      // about for-desktop's native path -- so this is best-effort cleanup of
+      // the old publication, not a precondition for the acquire above.
+      torndown = true;
+      if (room.localParticipant.getTrackPublication(Track.Source.ScreenShare)) {
+        try {
+          await room.localParticipant.setScreenShareEnabled(false);
+        } catch {
+          /* already unpublished */
+        }
+      }
+
+      const finalQualityName = screenPickerQualityName ?? choice.qualityName;
+      const finalQuality = qualities[finalQualityName] ?? startingQuality;
+
+      // Same "capture the codec decision before publishOptions before
+      // anything else can probe a different resolution" shape as
+      // toggleScreenshare/#recoverScreenShare.
+      const publishOptions = await screenSharePublishOptions(
+        finalQuality.resolution,
+      );
+      codecDecision = getScreenShareCodecDecision();
+
+      // Mirrors LocalParticipant.setTrackEnabled's own screen-share publish
+      // loop: publish every acquired track (video, and audio if requested
+      // and granted) with the same options, and take the first result as the
+      // video publication -- createScreenTracks always returns [video,
+      // audio?] in that order, and Promise.all preserves input order in its
+      // results, exactly the assumption setTrackEnabled itself makes.
+      try {
+        const publishedTracks = await Promise.all(
+          newTracks.map((track) =>
+            room.localParticipant.publishTrack(track, publishOptions),
+          ),
+        );
+        localTrack = publishedTracks[0];
+      } catch (e) {
+        newTracks.forEach((track) => track.stop());
+        throw e;
+      }
+    } catch (e) {
+      if (cancelled) {
+        // Not a failure -- the user backed out of the picker. Logged at
+        // info rather than warn so a routine "never mind" does not read
+        // like something went wrong.
+        console.info("[rtc] changeScreenShareSource: picker cancelled", {
+          torndown,
+        });
+      } else {
+        // Same exclusion as toggleScreenshare's catch: a dismissed picker on
+        // plain web rejects with NotAllowedError/AbortError, and the desktop
+        // picker's cancel path rejects with something else again (handled
+        // just above) -- neither is worth an error modal.
+        this.onErr(e, ["NotAllowedError", "AbortError"]);
+        console.warn("[rtc] changeScreenShareSource failed", { torndown }, e);
+      }
+    } finally {
+      this.#recovering = false;
+    }
+
+    if (!localTrack) {
+      if (torndown) {
+        // Committed (the old capture is gone) but nothing replaced it --
+        // match toggleScreenshare's own deliberate-stop bookkeeping and
+        // sound rather than leaving a stale choice and recovery budget
+        // around, or no audible sign that the share actually ended.
+        this.#lastShareChoice = undefined;
+        this.#recoveryAttempts = [];
+        this.sound.playSound("streamEnd");
+      }
+      // Otherwise: acquiring failed or was cancelled before anything was
+      // touched, so the running share is exactly as it was -- nothing left
+      // to reconcile.
+      this.#setScreenshare(room.localParticipant.isScreenShareEnabled);
+      return;
+    }
+
+    this.#setScreenshare(room.localParticipant.isScreenShareEnabled);
+    this.#armScreenShareEnded(room, localTrack);
+    this.#watchForSoftwareFallback(localTrack, codecDecision);
+
+    // A freshly picked window starts with a clean slate: the previous
+    // source's recovery budget has nothing to do with how healthy this new
+    // one is, and inheriting it could refuse to recover a perfectly fine
+    // window because a *different* one died twice a minute ago.
+    this.#recoveryAttempts = [];
+
+    try {
+      await this.#applyShareChoice(
+        room,
+        localTrack,
+        screenPickerQualityName ?? choice.qualityName,
+        screenPickerAudio ?? choice.audio,
+        false,
+      );
+    } catch (e) {
+      // The share itself is up either way -- #applyEncoderLimits inside
+      // #applyShareChoice already treats itself as best-effort, so this only
+      // catches the narrower applyConstraints() call at its start, which
+      // isn't wrapped there. Not fatal: worst case the replacement stays at
+      // its capture defaults instead of the chosen quality.
+      console.warn(
+        "[rtc] changeScreenShareSource: failed to apply saved quality to the replacement",
+        e,
+      );
     }
   }
 
