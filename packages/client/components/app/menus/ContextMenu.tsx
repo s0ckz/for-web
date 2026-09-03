@@ -13,7 +13,7 @@ import { Motion, Presence } from "solid-motionone";
 import { autoUpdate, offset, shift } from "@floating-ui/dom";
 import { styled } from "styled-system/jsx";
 
-import { iconSize, symbolSize, Text } from "@revolt/ui";
+import { iconSize, symbolSize, Text, usePortalMount } from "@revolt/ui";
 
 import MdChevronRight from "@material-design-icons/svg/outlined/chevron_right.svg?component-solid";
 
@@ -162,6 +162,8 @@ export function ContextMenuSubMenu(
     onClick?: () => void;
   },
 ) {
+  const mount = usePortalMount();
+
   const [anchor, setAnchor] = createSignal<HTMLDivElement>();
   const [ref, setRef] = createSignal<HTMLDivElement>();
 
@@ -204,7 +206,12 @@ export function ContextMenuSubMenu(
       >
         {local.buttonContent}
       </ContextMenuButton>
-      <Portal mount={document.getElementById("floating")!}>
+      {/*
+        usePortalMount()'s accessor is reactive, and Portal already relocates
+        its content in place when the mount target changes - no extra keying
+        required, see the comment on usePortalMount for why.
+      */}
+      <Portal mount={mount() ?? undefined}>
         <Presence>
           <Show when={isShowing()}>
             <Motion
