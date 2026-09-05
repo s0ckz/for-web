@@ -15,6 +15,7 @@ import {
 } from "solid-livekit-components";
 
 import {
+  AudioPresets,
   LocalTrack,
   LocalTrackPublication,
   Room,
@@ -76,6 +77,17 @@ const SCREEN_SHARE_AUDIO: ScreenShareCaptureOptions["audio"] = {
   noiseSuppression: false,
   voiceIsolation: false,
   restrictOwnAudio: true,
+  // Advisory, not `exact`: a plain value can never fail the capture, it just
+  // asks getUserMedia to prefer a 2-channel source when the device offers
+  // one. Without this, `forceStereo: true` below is an assertion over an
+  // unknown source -- if the capture happens to come back mono (e.g. a
+  // single-app/window share), we would tell the SFU stereo arrived and spend
+  // the stereo bitrate budget on two channels of duplicated content. With it,
+  // the capture is genuinely stereo when the device allows it, and
+  // `getSettings().channelCount` (and therefore `isStereoInput`) would be 2
+  // on its own -- forceStereo becomes belt-and-braces rather than the only
+  // thing making the SDP say stereo.
+  channelCount: 2,
 };
 
 /**
@@ -493,6 +505,70 @@ async function screenSharePublishOptions(
     // no explicitly regardless of which codec was picked.
     simulcast: false,
     degradationPreference: "maintain-framerate",
+    // The fields below are meant for the *audio* half of the share, but
+    // LocalParticipant's setTrackEnabled loop calls
+    // publishTrack(track, publishOptions) once per acquired track using this
+    // same `opts` object, so the screen-share *video* track's TrackInfo goes
+    // up with `stereo: true`, `disableDtx: true` and `audioFeatures:
+    // [TF_NO_DTX]` too -- fields that mean nothing for video. That is inert,
+    // not a bug: nothing client-side reads those fields back off a video
+    // publication, so it costs nothing beyond a few unused bytes in the
+    // signalling message. Left unset, the audio track fell through to
+    // livekit-client's generic defaults (audioPreset: music, dtx: true,
+    // forceStereo: false) -- tuned for a mic, not for a desktop mixer feeding
+    // continuous game/app audio.
+    //
+    // These are publish-time options: LocalParticipant snapshots them onto
+    // `publication.options` and reuses that snapshot on every future
+    // `republishAllTracks` pass. Unlike video's `scaleResolutionDownBy`, they
+    // need no re-apply in the `localTrackPublished` handler -- that asymmetry
+    // is deliberate, not an oversight, so don't "fix" it by adding one.
+    //
+    // forceStereo and audioPreset are one decision, not two. LocalParticipant
+    // computes `isStereo = opts.forceStereo ?? isStereoInput`, and `??` does
+    // not fall through on `false` -- so without an explicit `true` here,
+    // stereo *capture* was always negotiated as mono, and the SDP never
+    // carried `stereo=1`/`sprop-stereo=1` for the desktop app's stereo mixer
+    // output. Turning stereo on without also raising the bitrate would be a
+    // regression on its own: 48 kbps split across two channels is worse than
+    // 48 kbps mono, hence the bump to the stereo preset alongside it.
+    forceStereo: true,
+    // 64 kbps, not the 128 kbps "high quality" stereo preset: the reported
+    // problem is artefacts, not fidelity, and RED (below) roughly doubles
+    // bytes on the wire. The real question is how much this adds versus
+    // before, not what share of the video ceiling it is -- that ceiling is
+    // a cap the encoder rarely reaches, not actual throughput, so comparing
+    // audio to it overstates how small the change is. Mono audio already
+    // carried RED (see below), so the prior real cost was ~48 kbps + RED ≈
+    // 96 kbps; stereo at this preset + RED ≈ 128 kbps. The delta this change
+    // actually adds is +32 kbps, and audio already carries
+    // `networkPriority: 'high'`, so that delta is what could matter on a
+    // marginal link, not a percentage of a video number that was never
+    // comparable to begin with.
+    audioPreset: AudioPresets.musicStereo,
+    // The only field here that plausibly explains "robotic". DTX is a speech
+    // optimisation: the encoder's own VAD decides a frame is silence and
+    // gates transmission off, and the decoder fills the gap with synthesized
+    // comfort noise. On continuous game/desktop audio the VAD misfires on
+    // quiet passages and music tails, and gating on and off is heard as
+    // warbling and hollow. It buys nothing here -- a screen share worth
+    // publishing audio for is rarely truly silent.
+    dtx: false,
+    // RED was already on: it's livekit-client's own `publishDefaults.red`,
+    // so this line changes nothing about today's behaviour by itself. What
+    // it guards against is LocalParticipant's "disable dtx/red for stereo
+    // unless set explicitly" branch, which never fired before this change
+    // because `isStereo` was always false -- now that `forceStereo` makes it
+    // true, that branch would silently turn RED back off unless we pin it
+    // here explicitly. Forward redundancy is what protects the "all viewers
+    // degrade at once" case on a marginal uplink, and pinning it means it
+    // cannot flip off as a side effect of `forceStereo` changing above.
+    //
+    // DTX is different: `dtx: false` above only stops *us* from asking for
+    // it. Whether it was ever actually active depended on the SFU's own
+    // answer setting `usedtx=1` -- there is no client-side SDP munging for
+    // this in the codebase, so the request is the only lever we have.
+    red: true,
   };
 }
 
