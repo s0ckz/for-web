@@ -187,8 +187,8 @@ export function floating(element: HTMLElement, accessor: Accessor<Props>) {
           onCleanup(() => {
             element.removeEventListener("mouseenter", onMouseEnter);
             element.removeEventListener("mouseleave", onMouseLeave);
-            element.addEventListener("touchstart", onTouch);
-            element.addEventListener("touchend", onTouch);
+            element.removeEventListener("touchstart", onTouch);
+            element.removeEventListener("touchend", onTouch);
           });
         }
       },
@@ -200,28 +200,42 @@ export function floating(element: HTMLElement, accessor: Accessor<Props>) {
       () => accessor().contextMenu,
       (contextMenu) => {
         if (contextMenu) {
-          if (
-            (accessor().contextMenuHandler ?? "contextmenu") ===
-              "contextmenu" &&
-            isIOSTouch
-          ) {
+          // Captured once for this effect run instead of re-read from
+          // `accessor()` (or the setup-time `config`) in the cleanup below.
+          // Not a bug fix -- `use()` in solid-js/web calls this directive
+          // via `untrack(() => fn(element, arg))`, so `accessor()` is an
+          // untracked one-shot snapshot for the directive's whole
+          // lifetime, and every current call site passes a static string
+          // literal anyway, so cleanup already always saw the same value
+          // the listener was registered under. This just hardens against a
+          // future call site that reads a genuinely reactive value here
+          // (through some path other than `accessor()`), where relying on
+          // that re-read in cleanup instead of a captured value really
+          // would remove the wrong event name and leave the real listener
+          // attached.
+          const handler = accessor().contextMenuHandler ?? "contextmenu";
+
+          if (handler === "contextmenu" && isIOSTouch) {
             element.addEventListener("long-press", onContextMenu);
           } else {
-            element.addEventListener(
-              accessor().contextMenuHandler ?? "contextmenu",
-              onContextMenu,
-            );
+            element.addEventListener(handler, onContextMenu);
           }
 
           onCleanup(() => {
             if (isIOSTouch) {
               element.removeEventListener("long-press", onContextMenu);
             }
-            element.removeEventListener(
-              config.contextMenuHandler ?? "contextmenu",
-              onContextMenu,
-            );
+            element.removeEventListener(handler, onContextMenu);
           });
+        } else {
+          // The menu can go from configured to `undefined` while it's still
+          // showing (e.g. a share ends -- browser "Stop sharing" bar, the
+          // shared window closing, `#onScreenShareEnded` -- while its menu
+          // is open) without any click ever landing to close it. Without
+          // this, `show` keeps the stale captured menu and `FloatingManager`
+          // renders it forever, since nothing else reacts to `contextMenu`
+          // going falsy.
+          setShow(undefined);
         }
       },
     ),
