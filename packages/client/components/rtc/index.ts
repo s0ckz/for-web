@@ -1,6 +1,7 @@
 import { takeNextScreenShareFrameRate } from "./screenShareCapture";
 import { getVirtmic } from "./virtualMic";
 
+export type { SurfaceRisk } from "./screenShareSurface";
 export { isSoundboardPublication, useIsMicMuted } from "./soundboard";
 export { useSoundboardLibrary } from "./soundboardLibrary";
 export type { SoundboardEntry } from "./soundboardLibrary";

@@ -11,6 +11,18 @@ type Props = {
   indeterminate?: boolean;
   class?: string;
   onChange?: (event: { currentTarget: { checked: boolean } }) => void;
+  /**
+   * Associates this checkbox with an element describing it (e.g. a warning
+   * rendered above it) for screen readers.
+   *
+   * The spread below puts the attribute on the `<mdui-checkbox>` custom
+   * element itself. Whether assistive tech then associates it with the
+   * native input mdui renders inside its shadow root is **unverified** --
+   * mdui@2.1.3's checkbox source never mentions `aria-describedby`, so it
+   * is not explicitly forwarded. Worth confirming with an actual screen
+   * reader before relying on it; it costs nothing if it turns out inert.
+   */
+  "aria-describedby"?: string;
 };
 
 /**
