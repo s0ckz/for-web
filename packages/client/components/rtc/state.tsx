@@ -46,6 +46,10 @@ import { InRoom } from "./components/InRoom";
 import { RoomAudioManager } from "./components/RoomAudioManager";
 import { setNextScreenShareFrameRate } from "./screenShareCapture";
 import {
+  browserCaptureOptions,
+  classifyCapturedSurface,
+} from "./screenShareSurface";
+import {
   getMicPublication,
   hasSoundboardPublication,
   isSoundboardPublication,
@@ -1336,6 +1340,14 @@ class Voice {
             true,
             {
               audio: SCREEN_SHARE_AUDIO,
+              // Browser-only (returns `{}` on desktop, leaving this
+              // byte-identical to before): see screenShareSurface.ts for
+              // why `video.displaySurface` and `systemAudio` live here
+              // rather than in the getDisplayMedia wrapper in index.ts.
+              ...browserCaptureOptions({
+                screenShareQualityAsk: this.#settings.screenShareQualityAsk,
+                screenShareAudio: this.#settings.screenShareAudio,
+              }),
             },
             publishOptions,
           );
@@ -1345,6 +1357,13 @@ class Voice {
 
         const screenAudioTrack = room.localParticipant.getTrackPublication(
           Track.Source.ScreenShareAudio,
+        );
+
+        // `risk === "none"` on desktop unconditionally -- see
+        // classifyCapturedSurface's doc comment.
+        const { displaySurface, risk: surfaceRisk } = classifyCapturedSurface(
+          localTrack?.videoTrack?.mediaStreamTrack,
+          !!screenAudioTrack,
         );
 
         this.#setScreenshare(room.localParticipant.isScreenShareEnabled);
@@ -1363,7 +1382,18 @@ class Voice {
               screenPickerQualityName || "low",
               screenPickerAudio || false,
             );
-          } else if (this.#settings.screenShareQualityAsk) {
+          } else if (
+            this.#settings.screenShareQualityAsk ||
+            surfaceRisk === "leak"
+          ) {
+            // "Don't ask me about quality" (screenShareQualityAsk === false)
+            // is not consent to broadcast every sound on the machine -- a
+            // confirmed `"leak"` forces this dialog open regardless. Those
+            // users (who skip this dialog by choice, and would otherwise
+            // silently get `screenShareAudio`'s saved default applied via
+            // the `else` branch below) are exactly who this needs to
+            // reach.
+            //
             // No longer gated on there being more than one quality to choose
             // from: even with a single preset (an instance whose
             // video_resolution limit sits below 1080p) this dialog is still
@@ -1371,8 +1401,25 @@ class Voice {
             // "Don't ask me again" -- losing it there would silently remove
             // both. Form2.ButtonGroup renders fine with one pre-selected
             // button.
-            localTrack.pauseUpstream();
-            screenAudioTrack?.pauseUpstream();
+            //
+            // Concurrent, not sequential, and audio first: video and audio
+            // are separate LocalTrack objects with their own
+            // pauseUpstreamLock mutex (livekit-client's
+            // LocalTrack.pauseUpstream/LocalTrackPublication.pauseUpstream),
+            // so they never contended -- awaiting video before starting
+            // audio's call only delayed audio, which is the actual leak
+            // vector, for no benefit. Promise.allSettled so a thrown
+            // DeviceUnsupportedError from either (pauseUpstream flips
+            // `_isUpstreamPaused` to true before it can throw) cannot skip
+            // the other's call or escape into this method's catch. This
+            // still runs after publish -- audio was already live for a few
+            // tens of ms before this point regardless, and closing that
+            // window fully needs the deferred acquire-then-publish
+            // restructure, not this.
+            await Promise.allSettled([
+              screenAudioTrack?.pauseUpstream(),
+              localTrack.pauseUpstream(),
+            ]);
             this.openModal({
               onCancel: async () => {
                 cancelled = true;
@@ -1389,6 +1436,8 @@ class Voice {
               },
               qualities: this.#screenShareQualityOptions(),
               audio: !!screenAudioTrack,
+              surfaceRisk,
+              displaySurface,
               callback: async (qualityName, audio) => {
                 callback(qualityName, audio);
                 localTrack.resumeUpstream();
@@ -2128,6 +2177,12 @@ class Voice {
       try {
         newTracks = await room.localParticipant.createScreenTracks({
           audio: SCREEN_SHARE_AUDIO,
+          // Browser-only (returns `{}` on desktop): see toggleScreenshare's
+          // matching call and screenShareSurface.ts.
+          ...browserCaptureOptions({
+            screenShareQualityAsk: this.#settings.screenShareQualityAsk,
+            screenShareAudio: this.#settings.screenShareAudio,
+          }),
         });
       } finally {
         setNextScreenShareFrameRate(undefined);
@@ -2220,6 +2275,89 @@ class Voice {
     // one is, and inheriting it could refuse to recover a perfectly fine
     // window because a *different* one died twice a minute ago.
     this.#recoveryAttempts = [];
+
+    const screenAudioTrack = room.localParticipant.getTrackPublication(
+      Track.Source.ScreenShareAudio,
+    );
+
+    // Same classification as toggleScreenshare's start branch -- a source
+    // change lands on whatever surface the browser's picker was pointed at
+    // exactly like the initial share does. This is what closes the
+    // one-menu-item leak: "change source" -> Entire Screen -> tick Chrome's
+    // system-audio box -- without it, that path re-applied the previous
+    // share's audio choice to a completely different surface with no
+    // classification and not even the console.info. `risk === "none"` on
+    // desktop unconditionally -- see classifyCapturedSurface's doc comment.
+    const { displaySurface, risk: surfaceRisk } = classifyCapturedSurface(
+      localTrack.videoTrack?.mediaStreamTrack,
+      !!screenAudioTrack,
+    );
+
+    if (surfaceRisk === "leak") {
+      // Forcing the same interactive dialog toggleScreenshare uses, but
+      // with different cancel semantics: by this point `torndown` is
+      // already `true`, so there is no previous capture left to fall back
+      // to. "Cancel" here therefore means what it means for any other
+      // deliberate stop -- end the share -- rather than inventing a
+      // "revert to the window that no longer exists" this dialog has no
+      // way to deliver. (A "caution" classification is left to log only,
+      // same as the initial-share branch above: forcing this dialog on
+      // every merely-provisional case would make "change source" as
+      // interruptive as starting a share from scratch, for a risk level
+      // that may turn out to be nothing -- see the open question in
+      // screenShareSurface.ts.)
+      //
+      // Audio paused first, both awaited via allSettled -- see the matching
+      // comment on the initial-share branch above for why.
+      await Promise.allSettled([
+        screenAudioTrack?.pauseUpstream(),
+        localTrack.pauseUpstream(),
+      ]);
+
+      await new Promise<void>((resolve) => {
+        this.openModal({
+          type: "screen_share_settings",
+          trackReference: {
+            participant: room.localParticipant,
+            publication: localTrack,
+            source: Track.Source.ScreenShare,
+          },
+          qualities: this.#screenShareQualityOptions(),
+          audio: !!screenAudioTrack,
+          initialQualityName: screenPickerQualityName ?? choice.qualityName,
+          initialAudio: screenPickerAudio ?? choice.audio,
+          liveEdit: true,
+          surfaceRisk,
+          displaySurface,
+          onCancel: async () => {
+            await room.localParticipant.setScreenShareEnabled(false);
+            this.#setScreenshare(room.localParticipant.isScreenShareEnabled);
+            this.#lastShareChoice = undefined;
+            this.#recoveryAttempts = [];
+            this.sound.playSound("streamEnd");
+            resolve();
+          },
+          callback: async (qualityName, audio) => {
+            localTrack.resumeUpstream();
+            if (audio) {
+              screenAudioTrack?.resumeUpstream();
+            }
+            try {
+              await this.#applyShareChoice(
+                room,
+                localTrack,
+                qualityName,
+                audio,
+                false,
+              );
+            } finally {
+              resolve();
+            }
+          },
+        });
+      });
+      return;
+    }
 
     try {
       await this.#applyShareChoice(

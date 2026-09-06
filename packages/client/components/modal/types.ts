@@ -23,6 +23,7 @@ import {
 
 import type { SettingsConfigurations } from "@revolt/app";
 import { CategoryData } from "@revolt/app/menus/CategoryContextMenu";
+import type { SurfaceRisk } from "@revolt/rtc";
 import { ScreenShareQualityName } from "@revolt/state/stores/Voice";
 
 import type { ChangelogResponse } from "./modals/Changelog";
@@ -348,6 +349,20 @@ export type Modals =
        * surprising side effect unrelated to what was just edited.
        */
       liveEdit?: boolean;
+      /**
+       * How risky the captured surface is, from `classifyCapturedSurface`
+       * (`@revolt/rtc`). Undefined for callers that have not classified a
+       * surface (e.g. desktop, or a caller that predates this). Drives
+       * whether the audio checkbox is seeded on and whether a warning is
+       * shown above it.
+       */
+      surfaceRisk?: SurfaceRisk;
+      /**
+       * The `MediaStreamTrack.getSettings().displaySurface` value the
+       * capture reported, if any, so the warning copy can be surface-aware
+       * (e.g. distinguishing "window" from "unknown").
+       */
+      displaySurface?: string;
       callback: (qualityName: ScreenShareQualityName, audio: boolean) => void;
       onCancel: () => void;
     }

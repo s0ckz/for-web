@@ -1,12 +1,13 @@
 import { Trans, useLingui } from "@lingui/solid/macro";
 import { createFormControl, createFormGroup } from "solid-forms";
+import { styled } from "styled-system/jsx";
 
 import { useState } from "@revolt/state";
 import { ScreenShareQualityName } from "@revolt/state/stores/Voice";
 import { Column, Dialog, DialogProps, Form2 } from "@revolt/ui";
 import { VideoTrack } from "solid-livekit-components";
 
-import { Show } from "solid-js";
+import { Show, createUniqueId } from "solid-js";
 import { Modals } from "../types";
 
 export function ScreenShareSettingsModal(
@@ -34,14 +35,29 @@ export function ScreenShareSettingsModal(
     props.qualities[0]?.name ??
     "low";
 
+  // A confirmed `"leak"` (the whole machine's audio) starts this checkbox
+  // unticked regardless of the saved default or a live-edit's current
+  // value -- the user can still turn it on, but the *default* stops being
+  // "yes, broadcast everything". Anything short of that (no risk, or the
+  // merely provisional `"caution"`) keeps the existing seeding behaviour.
+  const initialAudioValue =
+    props.surfaceRisk === "leak"
+      ? false
+      : (props.initialAudio ?? voice.screenShareAudio);
+
+  // Only actually referenced (via `aria-describedby` below) while the
+  // warning is shown, but it costs nothing to always have one ready.
+  const warningId = createUniqueId();
+  const hasWarning = () =>
+    props.surfaceRisk === "leak" || props.surfaceRisk === "caution";
+
   const group = createFormGroup({
     qualityName: createFormControl<ScreenShareQualityName>(initialQualityName, {
       required: true,
     }),
-    audio: createFormControl(
-      props.audio && (props.initialAudio ?? voice.screenShareAudio),
-      { disabled: !props.audio },
-    ),
+    audio: createFormControl(props.audio && initialAudioValue, {
+      disabled: !props.audio,
+    }),
     dontAsk: createFormControl(false),
   });
 
@@ -103,8 +119,56 @@ export function ScreenShareSettingsModal(
               };
             })}
           />
+          {/* This browser cannot isolate the captured audio to just this
+              screen/window (no web API exposes per-application capture or
+              exclusion) -- so a `"leak"` or `"caution"` classification gets
+              a warning here rather than a silent default. `"leak"` is a
+              confirmed whole-machine capture (a monitor share with an
+              audio track); `"caution"` covers everything less certain
+              (a window share, or an unrecognised surface) -- see
+              screenShareSurface.ts's risk table for why those are kept
+              apart rather than both leaking or both warning.
+
+              `role="alert"` for `"leak"` (an assertive interruption fits a
+              confirmed whole-machine capture); `role="status"` for the
+              merely provisional `"caution"`, which does not warrant
+              interrupting. Nothing else in this repo uses `role="alert"`
+              today -- this is the first, deliberately, for a warning that
+              is the worst place to be color-only. `aria-describedby` on
+              the audio checkbox below associates it with whichever of
+              these is showing. */}
+          <Show
+            when={
+              props.surfaceRisk === "leak" || props.surfaceRisk === "caution"
+            }
+          >
+            <Warning
+              risk={props.surfaceRisk!}
+              id={warningId}
+              role={props.surfaceRisk === "leak" ? "alert" : "status"}
+            >
+              <Show
+                when={props.surfaceRisk === "leak"}
+                fallback={
+                  <Trans>
+                    This may include audio from other apps on your device, not
+                    just this screen.
+                  </Trans>
+                }
+              >
+                <Trans>
+                  This shares everything you can hear, including other calls.
+                  Leave audio off to share silently, or use the desktop app to
+                  share a single app's audio.
+                </Trans>
+              </Show>
+            </Warning>
+          </Show>
           <Show when={props.audio}>
-            <Form2.Checkbox control={group.controls.audio}>
+            <Form2.Checkbox
+              control={group.controls.audio}
+              aria-describedby={hasWarning() ? warningId : undefined}
+            >
               <Trans>Share audio</Trans>
             </Form2.Checkbox>
           </Show>
@@ -118,7 +182,12 @@ export function ScreenShareSettingsModal(
           </Show>
           <Show when={!props.audio}>
             <small>
-              <Trans>Audio disabled by browser</Trans>
+              <Show
+                when={props.displaySurface === "window"}
+                fallback={<Trans>Audio disabled by browser</Trans>}
+              >
+                <Trans>This share did not include audio</Trans>
+              </Show>
             </small>
           </Show>
         </Column>
@@ -126,3 +195,29 @@ export function ScreenShareSettingsModal(
     </Dialog>
   );
 }
+
+// `"leak"` reuses the error palette (a confirmed whole-machine capture);
+// `"caution"` reuses the tertiary palette (everything less certain -- see
+// screenShareSurface.ts's risk table). Local to this file, following
+// ScreenSharePicker.tsx's convention, rather than a new shared component
+// for a single use.
+const Warning = styled("div", {
+  base: {
+    padding: "var(--gap-md)",
+    borderRadius: "var(--borderRadius-sm)",
+    fontSize: "0.875rem",
+  },
+  variants: {
+    risk: {
+      leak: {
+        color: "var(--md-sys-color-error)",
+        background: "var(--md-sys-color-error-container)",
+      },
+      caution: {
+        color: "var(--md-sys-color-tertiary)",
+        background: "var(--md-sys-color-tertiary-container)",
+      },
+      none: {},
+    },
+  },
+});
