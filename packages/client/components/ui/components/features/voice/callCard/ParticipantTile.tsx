@@ -1,4 +1,12 @@
-import { createEffect, createSignal, onCleanup, Show } from "solid-js";
+import {
+  createContext,
+  createEffect,
+  createSignal,
+  onCleanup,
+  Show,
+  useContext,
+} from "solid-js";
+import { Portal } from "solid-js/web";
 import {
   TrackReference,
   useEnsureParticipant,
@@ -76,6 +84,20 @@ function OwnScreenShareOverlay(props: {
 }
 
 /**
+ * Where the currently-focused tile portals itself to -- see this file's own
+ * `Portal` usage below and `VoiceCallCardActiveRoom.tsx`'s `Call` doc comment
+ * for why it cannot just stay a plain descendant of `Grid`. Provided (as a
+ * plain function, not a signal -- see that same file's `Participants` for
+ * why) by `VoiceCallCardActiveRoom.tsx`, which owns `FocusOverlay`; defined
+ * here rather than there only to avoid a circular import, since
+ * `VoiceCallCardActiveRoom.tsx` already imports from this file, not the
+ * other way around.
+ */
+export const focusOverlayContext = createContext<
+  () => HTMLDivElement | undefined
+>(() => undefined);
+
+/**
  * Individual participant tile.
  *
  * Takes no props: `VoiceCallCardActiveRoom` renders every tile -- focused or
@@ -93,6 +115,7 @@ export function ParticipantTile() {
   const participant = useEnsureParticipant();
   const track = useTrackRefContext();
   const user = useUser(participant.identity);
+  const overlay = useContext(focusOverlayContext);
 
   /** Whether this is the currently-focused (pinned) tile. */
   const isFocused = () => voice.isFocus(track);
@@ -175,20 +198,39 @@ export function ParticipantTile() {
    * mounted underneath the floating pill), so that is one fewer case this
    * cleanup needs to cover, not an additional one.
    */
+  // The most recent (non-self) publication this effect has driven, kept
+  // outside the effect so the real-unmount cleanup below can still reach it
+  // without re-reading `trackPublication()` -- which, by the time cleanup
+  // runs on an actual unmount, may already be gone.
+  let lastPublication: RemoteTrackPublication | undefined;
+
   createEffect(() => {
     if (isSelf()) return;
     const publication = trackPublication() as
       | RemoteTrackPublication
       | undefined;
     if (typeof publication?.setSubscribed !== "function") return;
+    lastPublication = publication;
     try {
       publication.setSubscribed(isWatching());
     } catch {
       /* publication went away */
     }
-    onCleanup(() => {
-      if (!isSelf() && publication?.isDesired) publication.setSubscribed(false);
-    });
+  });
+
+  // Registered once, at component scope -- not with the `onCleanup` that
+  // used to live *inside* the effect above, which fired on every re-run of
+  // that effect (i.e. every time `isSelf()`, `trackPublication()` or
+  // `isWatching()` changed for any reason), not only on unmount. Since this
+  // effect also runs whenever `isWatching()` changes, an unrelated
+  // user-store update that ticks a signal it happens to read (`isSelf()`
+  // included) was enough to un-desire and immediately re-desire the
+  // subscription -- an SFU round trip and a decoder teardown/rebuild, and a
+  // "Connecting…" flash, per share, for no reason connected to watching or
+  // not. This only ever runs on a genuine unmount now.
+  onCleanup(() => {
+    if (!isSelf() && lastPublication?.isDesired)
+      lastPublication.setSubscribed(false);
   });
 
   /**
@@ -317,11 +359,13 @@ export function ParticipantTile() {
    *
    * `calc(100% - var(--vc-strip-h, 0px))` -- rather than a plain `100%` -- is
    * the one adjustment this needed for that overlay: this tile's containing
-   * block is now `Call` itself (see the `focus` variant), which is the whole
-   * card, not just the area above the strip the way the old `FocusBox`
-   * wrapper was. Subtracting `--vc-strip-h` (set by `VoiceCallCardActiveRoom`
-   * to the same value `Grid` sizes the strip to) recovers that same "height
-   * available above the strip" reference.
+   * block, while focused, is `FocusOverlay` (see this file's `Portal` usage
+   * and `VoiceCallCardActiveRoom.tsx`'s `Call` doc comment) -- sized to
+   * exactly `Call`'s box via `inset: 0`, so for sizing purposes the two are
+   * interchangeable -- the whole card, not just the area above the strip the
+   * way the old `FocusBox` wrapper was. Subtracting `--vc-strip-h` (set by
+   * `VoiceCallCardActiveRoom` to the same value `Grid` sizes the strip to)
+   * recovers that same "height available above the strip" reference.
    *
    * Always returned as an inline style while focused, including the
    * no-video-yet case that used to be left to the `{ video: false, focus:
@@ -349,8 +393,22 @@ export function ParticipantTile() {
       : { height: available };
   };
 
-  return (
-    <Show when={!isScreenShare() || !isRemoteScreenShareMuted()}>
+  /**
+   * Everything actually shown once this tile is not hidden entirely (see the
+   * outer `<Show>` it is rendered through, below) -- a genuine component,
+   * not an inline expression, specifically so it mounts exactly once per
+   * activation of that outer `<Show>`, the same reasoning
+   * `OwnScreenShareOverlay`'s own doc comment above gives for the same
+   * pattern. That guarantee is what lets `tileMarkup` inside it be a plain
+   * `const`: `isFocused()` toggling which of the two inner `<Show>` branches
+   * is active (bare here vs. `Portal`ed to `FocusOverlay`, see that
+   * component's doc comment in `VoiceCallCardActiveRoom.tsx`) must move
+   * *this same element* between the two, not recreate it, or every
+   * focus/unfocus would tear down and rebuild the `<video>` inside it --
+   * exactly the remount `557d0a5b`'s single `TrackLoop` exists to prevent.
+   */
+  function TileBody() {
+    const tileMarkup = (
       <div
         ref={tileRef}
         class={
@@ -538,6 +596,28 @@ export function ParticipantTile() {
           </Overlay>
         </Show>
       </div>
+    );
+
+    return (
+      // `fallback` (unfocused, the common case) renders `tileMarkup` right
+      // here, in `TrackLoop`'s normal position inside `Grid` -- unchanged
+      // from before this file grew a `Portal`. Only the currently-focused
+      // tile takes the `Portal` branch, moving the exact same node out to
+      // `FocusOverlay` (a sibling of `Grid`, both direct children of `Call`)
+      // so its `position: absolute` resolves against `Call` instead of
+      // `Grid` -- see `Call`'s doc comment in `VoiceCallCardActiveRoom.tsx`
+      // for why `Grid` cannot be that reference. `overlay()` is guaranteed
+      // assigned by the time this ever reads `true`: see
+      // `focusOverlayContext`'s doc comment for why.
+      <Show when={isFocused()} fallback={tileMarkup}>
+        <Portal mount={overlay()}>{tileMarkup}</Portal>
+      </Show>
+    );
+  }
+
+  return (
+    <Show when={!isScreenShare() || !isRemoteScreenShareMuted()}>
+      <TileBody />
     </Show>
   );
 }
@@ -588,10 +668,15 @@ export const tile = cva({
     // itself out of the strip's normal flex flow and lay itself over the
     // whole card instead of relying on a separate wrapper element to do
     // that -- hence `position: absolute` here rather than in a parent.
-    // `Call` (the nearest positioned ancestor) is where `top`/`left`/`right`
-    // resolve against; the actual height comes from `getHeight()`'s inline
-    // style (aspect-ratio-aware) or, when that has nothing to say yet, the
-    // `{ video: false, focus: true }` compound variant below.
+    // `top`/`left`/`right` resolve against whatever this element's
+    // containing block currently is: `FocusOverlay` while this tile is
+    // portaled there (the focused case, `Call`'s own doc comment explains
+    // why it cannot simply be `Grid`), the parent it happens to render under
+    // inline otherwise -- irrelevant, since `position: absolute` only takes
+    // effect together with `focus: true`, and this file only ever portals
+    // while `focus` is true. The actual height comes from `getHeight()`'s
+    // inline style (aspect-ratio-aware) or, when that has nothing to say
+    // yet, the `{ video: false, focus: true }` compound variant below.
     focus: {
       true: {
         position: "absolute",
@@ -600,6 +685,12 @@ export const tile = cva({
         right: 0,
         width: "auto",
         maxWidth: "none",
+        // `FocusOverlay` is `pointer-events: none` so it does not steal
+        // clicks meant for `Grid` while empty -- and `pointer-events`
+        // inherits, so this tile (the one thing ever portaled into it) has
+        // to explicitly opt back in or it would render but never receive a
+        // click, including the click that is supposed to unfocus it.
+        pointerEvents: "auto",
       },
     },
     video: {
