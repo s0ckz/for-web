@@ -1,9 +1,10 @@
-import { createSignal, For, onCleanup, Show } from "solid-js";
+import { createSignal, onCleanup, Show } from "solid-js";
 
 import type { TrackReference } from "solid-livekit-components";
 
 import { isLocal } from "@livekit/components-core";
 import { isScreenShareLinkWeak } from "@revolt/rtc";
+import { Key } from "@solid-primitives/keyed";
 import { type TrackPublication, Track } from "livekit-client";
 import { styled } from "styled-system/jsx";
 
@@ -750,6 +751,15 @@ export function ScreenShareStats(props: {
   };
 
   const sample = async () => {
+    // The panel keeps sampling on a 1s timer for as long as it is mounted,
+    // regardless of tab visibility -- `getStats()` on a hidden tab is pure
+    // waste, nobody is reading these numbers. This is about the *sampling*
+    // work only, not the underlying media subscription: unlike the sampling
+    // loop, the tracks themselves must keep decoding while hidden (no
+    // adaptiveStream/visibility-based pausing -- see ParticipantTile.tsx),
+    // so this early return must never be reused for anything beyond stats.
+    if (document.hidden) return;
+
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const track = props.trackRef.publication?.track as any;
     const audioPub = props.trackRef.participant.getTrackPublication(
@@ -826,14 +836,22 @@ export function ScreenShareStats(props: {
         </Buttons>
       </Header>
       <Grid>
-        <For each={rows()}>
+        {/*
+         * Keyed by label rather than plain `<For>`: `sample()` replaces the
+         * whole `rows` array with brand-new row objects every tick, so a
+         * plain `<For>` (which reconciles by reference) would tear down and
+         * rebuild every `<Label>`/`<Value>` pair once a second even though
+         * almost none of them actually changed. `<Key>` diffs by `label`
+         * instead, so only rows whose *value* actually changed re-render.
+         */}
+        <Key each={rows()} by="label">
           {(row) => (
             <>
-              <Label>{row.label}</Label>
-              <Value>{row.value}</Value>
+              <Label>{row().label}</Label>
+              <Value>{row().value}</Value>
             </>
           )}
-        </For>
+        </Key>
       </Grid>
     </Panel>
   );

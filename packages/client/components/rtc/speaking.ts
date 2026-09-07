@@ -16,7 +16,7 @@ import { Participant } from "livekit-client";
  */
 
 /** How often every registered meter is sampled */
-const POLL_MS = 50;
+const POLL_MS = 100;
 
 /** RMS level above which we call it speech */
 const SPEAKING_DBFS = -40;

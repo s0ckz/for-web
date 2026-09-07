@@ -17,6 +17,7 @@ import { useUser } from "@revolt/markdown/users";
 import { useIsMicMuted, useIsSpeakingFast, useVoice } from "@revolt/rtc";
 import { useState } from "@revolt/state";
 import { Avatar } from "@revolt/ui/components/design";
+import { fullscreenElement } from "@revolt/ui/components/floating";
 import { Row } from "@revolt/ui/components/layout";
 import { OverflowingText } from "@revolt/ui/components/utils";
 import { Symbol } from "@revolt/ui/components/utils/Symbol";
@@ -25,22 +26,30 @@ import { VoiceStatefulUserIcons } from "../VoiceStatefulUserIcons";
 
 import { ScreenShareStats } from "./ScreenShareStats";
 
-type TileProps = {
-  focus?: boolean;
-};
-
 /** How long the pointer must be still before fullscreen chrome fades out */
 const IDLE_TIMEOUT = 2500;
 
 /**
- * Individual participant tile
+ * Individual participant tile.
+ *
+ * Takes no props: `VoiceCallCardActiveRoom` renders every tile -- focused or
+ * not -- through one `TrackLoop`, so this reads its own focus state
+ * (`isFocused` below) from `voice.isFocus(track)` instead of a `focus` prop.
+ * That is what lets focus move between tiles without unmounting either one --
+ * a prop can only change on an element that is already there; the whole
+ * reason this used to need two separate `TrackLoop`s (and remounted a tile on
+ * every focus change) was that a `focus` prop had nowhere to be read from
+ * until the element existed.
  */
-export function ParticipantTile(props: TileProps) {
+export function ParticipantTile() {
   const voice = useVoice();
   const state = useState();
   const participant = useEnsureParticipant();
   const track = useTrackRefContext();
   const user = useUser(participant.identity);
+
+  /** Whether this is the currently-focused (pinned) tile. */
+  const isFocused = () => voice.isFocus(track);
 
   let videoRef: HTMLVideoElement | undefined;
   let tileRef: HTMLDivElement | undefined;
@@ -51,7 +60,6 @@ export function ParticipantTile(props: TileProps) {
   }>({ height: 0, width: 0 });
 
   const [showStats, setShowStats] = createSignal(false);
-  const [isFullscreen, setFullscreen] = createSignal(false);
   const [pointerIdle, setPointerIdle] = createSignal(false);
 
   const isMuted = useIsMicMuted(participant);
@@ -90,15 +98,16 @@ export function ParticipantTile(props: TileProps) {
     isSelf() ||
     state.voice.getScreenShareWatching(participant.identity);
 
-  // The publication read reactively, rather than `track.publication`'s
-  // one-time snapshot from context: a subscribe/unsubscribe cycle or a
-  // reconnect can hand the participant a new `TrackPublication` instance
-  // for the same source, and the effect below needs to see that to drive
-  // (and clean up after) the *current* one.
-  const { publication: trackPublication } = useMediaTrackBySourceOrName({
-    participant,
-    source: track.source,
-  });
+  // The publication (and, below, the track) read reactively, rather than
+  // `track.publication`'s one-time snapshot from context: a
+  // subscribe/unsubscribe cycle or a reconnect can hand the participant a
+  // new `TrackPublication` instance for the same source, and the effects
+  // below need to see that to drive (and clean up after) the *current* one.
+  const { publication: trackPublication, track: mediaTrack } =
+    useMediaTrackBySourceOrName({
+      participant,
+      source: track.source,
+    });
 
   /**
    * Drive the actual LiveKit subscription from that choice, so declining to
@@ -111,10 +120,14 @@ export function ParticipantTile(props: TileProps) {
    * an explicit setSubscribed call somewhere, and this effect is it for both
    * kinds: VideoTrack's own subscription management is turned off below.
    *
-   * Unmounting this tile (a PiP/float swap, a channel change) must not leave
-   * a share subscribed and decoding with nothing on screen watching it, so
-   * the cleanup below un-desires it again -- unless it was never this
-   * effect's to manage (self) or something else already dropped it.
+   * Unmounting this tile -- a channel change, or simply dropping out of
+   * `gridTracks()` (see `VoiceCallCardActiveRoom.tsx`) -- must not leave a
+   * share subscribed and decoding with nothing on screen watching it, so the
+   * cleanup below un-desires it again -- unless it was never this effect's
+   * to manage (self) or something else already dropped it. A PiP/float swap
+   * no longer unmounts this tile at all (`VoiceCallCardActiveRoom` stays
+   * mounted underneath the floating pill), so that is one fewer case this
+   * cleanup needs to cover, not an additional one.
    */
   createEffect(() => {
     if (isSelf()) return;
@@ -139,8 +152,20 @@ export function ParticipantTile(props: TileProps) {
    * `UpdateTrackSettings` sent for an already-subscribed track (see
    * `RemoteTrackPublication.emitTrackUpdate`/`isManualOperationAllowed` in
    * livekit-client), it never touches `disabled`/`isEnabled`. The strip/focus
-   * split reuses the existing focus concept (`props.focus`, set only by
-   * `FocusedParticipant`) -- no viewport or visibility detection.
+   * split reuses the existing focus concept (`isFocused()`, above -- reading
+   * `voice.isFocus(track)` directly rather than a `focus` prop, since every
+   * tile is now rendered through the same `TrackLoop` regardless of focus;
+   * see this component's own doc comment) -- no viewport or visibility
+   * detection.
+   *
+   * This must stay reactive to `isFocused()` specifically, not read it once:
+   * unlike the old `focus` prop -- which could only ever be `true` on a tile
+   * `FocusedParticipant` chose to mount and never changed again for that
+   * tile's lifetime, since a *different* focused participant meant a
+   * *different* tile being mounted elsewhere -- `isFocused()` can now flip on
+   * an already-mounted tile (that is the whole point of the single-`TrackLoop`
+   * change), and this effect has to re-fire and re-ask the SFU when it does,
+   * not just capture whatever it was worth when the tile first appeared.
    *
    * vp9-only: h264/h265 screen shares (the common case -- see
    * `screenSharePublishOptions` in `rtc/state.tsx`) are unaffected, because
@@ -167,7 +192,7 @@ export function ParticipantTile(props: TileProps) {
     if (publication.mimeType?.toLowerCase() !== "video/vp9") return;
     if (!isWatching()) return;
     try {
-      publication.setVideoFPS(props.focus ? 0 : 15);
+      publication.setVideoFPS(isFocused() ? 0 : 15);
     } catch {
       /* publication went away */
     }
@@ -180,30 +205,17 @@ export function ParticipantTile(props: TileProps) {
    * carries no media yet. Rendering the video element then leaves an empty,
    * collapsed tile, so wait for the actual track before treating it as ready;
    * until then the tile shows its "Connecting…" placeholder instead.
+   *
+   * `mediaTrack` (from the same `useMediaTrackBySourceOrName` call as
+   * `trackPublication` above) is already a reactive read of the current
+   * publication's track, kept in sync by that hook's own `trackObserver`
+   * subscription -- so this just needs to read it, not poll for it. This
+   * used to re-check on a 200ms `setInterval` instead, because the hook's
+   * effects did not reliably re-track their dependencies; that has since
+   * been fixed (see the hook's own history), so the poll was pure waste on
+   * top of a value already updating itself.
    */
-  const [trackReady, setTrackReady] = createSignal(false);
-
-  createEffect(() => {
-    if (!isWatching()) {
-      setTrackReady(false);
-      return;
-    }
-
-    const hasTrack = () => {
-      const publication = track.publication as
-        | RemoteTrackPublication
-        | undefined;
-      const ready = !!publication?.track;
-      setTrackReady(ready);
-      return ready;
-    };
-
-    if (hasTrack()) return;
-    const poll = setInterval(() => {
-      if (hasTrack()) clearInterval(poll);
-    }, 200);
-    onCleanup(() => clearInterval(poll));
-  });
+  const trackReady = () => isWatching() && !!mediaTrack();
 
   /** Whether an actual video surface is on screen, as opposed to a placeholder */
   const showingVideo = () =>
@@ -222,13 +234,13 @@ export function ParticipantTile(props: TileProps) {
 
   // -- fullscreen ---------------------------------------------------------
 
-  const onFullscreenChange = () =>
-    setFullscreen(document.fullscreenElement === tileRef);
-
-  document.addEventListener("fullscreenchange", onFullscreenChange);
-  onCleanup(() =>
-    document.removeEventListener("fullscreenchange", onFullscreenChange),
-  );
+  // Reads the shared `fullscreenElement()` signal (`portalMount.ts`) instead
+  // of attaching a per-tile `document` `fullscreenchange` listener -- one
+  // document-level listener for the whole app already tracks this centrally,
+  // so N tiles no longer each need their own. `tileRef` is a plain (non-
+  // reactive) local, same as `toggleFullscreen` below already reads it: by
+  // the time this is ever called, the tile has mounted and `tileRef` is set.
+  const isFullscreen = () => fullscreenElement() === tileRef;
 
   const toggleFullscreen = (e: MouseEvent) => {
     e.stopPropagation();
@@ -252,15 +264,43 @@ export function ParticipantTile(props: TileProps) {
 
   const chromeHidden = () => isFullscreen() && pointerIdle();
 
+  /**
+   * Inline height for the focused tile, on top of the `focus` cva variant
+   * below (which positions it as an overlay spanning `Call`'s full width,
+   * from its top down to `var(--vc-strip-h)`).
+   *
+   * `calc(100% - var(--vc-strip-h, 0px))` -- rather than a plain `100%` -- is
+   * the one adjustment this needed for that overlay: this tile's containing
+   * block is now `Call` itself (see the `focus` variant), which is the whole
+   * card, not just the area above the strip the way the old `FocusBox`
+   * wrapper was. Subtracting `--vc-strip-h` (set by `VoiceCallCardActiveRoom`
+   * to the same value `Grid` sizes the strip to) recovers that same "height
+   * available above the strip" reference.
+   *
+   * Always returned as an inline style while focused, including the
+   * no-video-yet case that used to be left to the `{ video: false, focus:
+   * true }` compound variant's own `height: 100%` -- `Grid`'s `focus: true`
+   * variant also puts `height: 100%` on *every* `.vc_tile` descendant
+   * (sizing ordinary strip tiles against the strip's own height, which is
+   * correct for them), and a stylesheet rule targeting `.vc_tile` beats a
+   * single utility class on specificity alone regardless of source order.
+   * For every other tile that is "100% of Grid" (correct); for this
+   * absolutely-positioned one it would resolve against `Call` instead
+   * (`position: absolute` changes what "100%" means) and ignore the strip
+   * reservation entirely. Only an inline style -- which always outranks any
+   * stylesheet rule -- reliably wins that fight.
+   */
   const getHeight = () => {
     if (isFullscreen()) return { width: "100%", height: "100%" };
-    if (!props.focus || videoDims().height == 0) return {};
-    // Calculate the aspect ratio
-    const ratio = videoDims().width / videoDims().height;
+    if (!isFocused()) return {};
 
+    const available = "calc(100% - var(--vc-strip-h, 0px))";
+    if (videoDims().height == 0) return { height: available };
+
+    const ratio = videoDims().width / videoDims().height;
     return ratio > 1
-      ? { height: `min(var(--vc-w) / ${ratio}, 100%)` }
-      : { height: "100%" };
+      ? { height: `min(var(--vc-w) / ${ratio}, ${available})` }
+      : { height: available };
   };
 
   return (
@@ -272,7 +312,7 @@ export function ParticipantTile(props: TileProps) {
             speaking: !isScreenShare() && isSpeaking(),
             video: showingVideo(),
             fullscreen: voice.fullscreen(),
-            ...props,
+            focus: isFocused(),
           }) + (isScreenShare() ? " vc_tile group" : " vc_tile")
         }
         onClick={() => voice.toggleFocus(track)}
@@ -449,7 +489,12 @@ export const tile = cva({
   base: {
     display: "grid",
     aspectRatio: "16/9",
-    transition: "all .3s ease, width 0s, height 0s",
+    // Only the outline (the speaking ring) actually needs to animate.
+    // `transition: all` was making every property change on this element --
+    // including layout-affecting ones like `width`/`height` on focus/strip
+    // changes, and anything the browser recomputes on a video frame update --
+    // pay for a transition it never asked for, once per tile per frame.
+    transition: "outline-color .3s ease, width 0s, height 0s",
     borderRadius: "var(--borderRadius-lg)",
     width: "var(--vc-tile-width)",
     maxWidth: "calc(var(--vc-h) * 16 / 9)",
@@ -481,8 +526,21 @@ export const tile = cva({
         outlineColor: "var(--md-sys-color-primary)",
       },
     },
+    // The focused tile is rendered by the same `TrackLoop` as the strip (see
+    // `VoiceCallCardActiveRoom.tsx`'s `visibleTracks`), so it needs to pull
+    // itself out of the strip's normal flex flow and lay itself over the
+    // whole card instead of relying on a separate wrapper element to do
+    // that -- hence `position: absolute` here rather than in a parent.
+    // `Call` (the nearest positioned ancestor) is where `top`/`left`/`right`
+    // resolve against; the actual height comes from `getHeight()`'s inline
+    // style (aspect-ratio-aware) or, when that has nothing to say yet, the
+    // `{ video: false, focus: true }` compound variant below.
     focus: {
       true: {
+        position: "absolute",
+        top: 0,
+        left: 0,
+        right: 0,
         width: "auto",
         maxWidth: "none",
       },
@@ -498,10 +556,13 @@ export const tile = cva({
   },
   compoundVariants: [
     {
+      // `height` itself is set inline by `getHeight()` (see its doc comment
+      // for why that has to be inline rather than a class here) -- this
+      // compound variant only still needs to contribute `maxHeight`, which
+      // `Grid`'s own `.vc_tile` rule never touches.
       video: [false],
       focus: [true],
       css: {
-        height: "100%",
         maxHeight: "calc(var(--vc-w) * 9 / 16)",
       },
     },
