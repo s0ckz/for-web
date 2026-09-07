@@ -297,6 +297,32 @@ export function ParticipantTile(props: TileProps) {
           />
         </Show>
 
+        {/*
+         * Recovery giving up is not the same as the share ending -- the
+         * capture is just parked and retrying (see Voice#scheduleReacquireRetry).
+         * Only shown on the sharer's own tile: everyone else just keeps
+         * seeing the frozen last frame, which is the point.
+         *
+         * `role="status"` (implicit `aria-live="polite"` +
+         * `aria-atomic="true"`) so a screen reader actually announces this
+         * to the sharer instead of it being silently visual-only -- same
+         * non-interrupting choice ScreenShareSettings.tsx makes for its
+         * "caution" notice, since a share that is quietly retrying in the
+         * background is not worth an assertive `role="alert"` interruption.
+         */}
+        <Show
+          when={
+            isScreenShare() &&
+            isSelf() &&
+            voice.screenShareState() === "reacquiring"
+          }
+        >
+          <ReacquiringNotice role="status">
+            <Symbol size={16}>sync_problem</Symbol>
+            Trying to reconnect your screen share…
+          </ReacquiringNotice>
+        </Show>
+
         <Show when={isScreenShare() && isWatching() && !chromeHidden()}>
           <Controls onClick={(e) => e.stopPropagation()}>
             <ControlButton
@@ -513,6 +539,27 @@ const Controls = styled("div", {
     opacity: 0,
     transition: "var(--transitions-fast) opacity",
     _groupHover: { opacity: 1 },
+  },
+});
+
+const ReacquiringNotice = styled("div", {
+  base: {
+    gridArea: "1/1",
+    alignSelf: "start",
+    justifySelf: "start",
+    margin: "var(--gap-md)",
+    zIndex: 9,
+
+    display: "flex",
+    alignItems: "center",
+    gap: "var(--gap-xs)",
+    padding: "var(--gap-xs) var(--gap-sm)",
+    borderRadius: "var(--borderRadius-md)",
+    background: "#000000aa",
+    color: "#fff",
+    fontSize: "0.75rem",
+
+    pointerEvents: "none",
   },
 });
 
