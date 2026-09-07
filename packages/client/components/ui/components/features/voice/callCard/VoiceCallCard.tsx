@@ -1,8 +1,6 @@
 import {
   JSX,
-  Match,
   Show,
-  Switch,
   createContext,
   createEffect,
   createSignal,
@@ -178,19 +176,29 @@ export function VoiceCallCardContext(props: { children: JSX.Element }) {
           onPointerDown={mouseDown}
           fullscreen={voice.fullscreen()}
         >
-          <Switch>
-            <Match when={mode() && inCall()}>
-              <VoiceCallCardPiP />
-            </Match>
-            <Match when={channel()}>
-              <VoiceCallCard
-                channel={channel()!}
-                inCall={inCall()}
-                showCard={voice.showCard(channel()!)}
-                fullscreen={voice.fullscreen()}
-              />
-            </Match>
-          </Switch>
+          {/*
+           * `VoiceCallCard` (and, inside it, `VoiceCallCardActiveRoom`'s
+           * whole participant grid) used to be swapped out via `<Switch>`
+           * for `VoiceCallCardPiP` whenever the card was dragged into its
+           * floating pill -- destroying and rebuilding every tile (and its
+           * `<video>` element) on each drag/undrag. It now stays mounted the
+           * whole time `channel()` is set, and is just hidden with CSS
+           * (`pip`, below) while the pill is showing; `VoiceCallCardPiP`
+           * itself is cheap (no per-tile grid) and stays conditionally
+           * mounted as before.
+           */}
+          <Show when={channel()}>
+            <VoiceCallCard
+              channel={channel()!}
+              inCall={inCall()}
+              showCard={voice.showCard(channel()!)}
+              fullscreen={voice.fullscreen()}
+              pip={!!mode() && inCall()}
+            />
+          </Show>
+          <Show when={mode() && inCall()}>
+            <VoiceCallCardPiP />
+          </Show>
         </Float>
       </Portal>
     </callCardContext.Provider>
@@ -253,12 +261,23 @@ export function VoiceChannelCallCardMount(props: {
   // it. Only publish when something actually moved.
   let lastKey = "";
 
+  // `getBoundingClientRect()` forces a synchronous layout, so it must only
+  // ever run from the resize observer below (an actual size/position
+  // change), not from `updateInfo` itself -- `updateInfo` also re-runs on
+  // every reactive change unrelated to layout (`voice.channel()`,
+  // `state.appDrawer()`, `props.expanded`), and re-measuring on each of
+  // those would force a reflow on renders that never moved anything. Cached
+  // here instead, and `undefined` until the observer's first callback --
+  // which fires once immediately on `observe()` -- has measured it.
+  let lastRect: DOMRect | undefined;
+
   function updateInfo() {
     const vc = voice.channel();
     const drawer = state.appDrawer()?.state;
     const expanded = props.expanded;
     const elsewhere = !!vc && vc.id !== props.channel.id;
-    const pos = ref!.getBoundingClientRect();
+    const pos = lastRect;
+    if (!pos) return;
 
     const key = elsewhere
       ? "elsewhere"
@@ -292,7 +311,10 @@ export function VoiceChannelCallCardMount(props: {
     const target = ref?.parentElement;
     if (!target) return;
 
-    createResizeObserver(target, updateInfo);
+    createResizeObserver(target, () => {
+      lastRect = ref!.getBoundingClientRect();
+      updateInfo();
+    });
   });
   onCleanup(() => {
     setInfo();
@@ -308,16 +330,25 @@ export function VoiceChannelCallCardMount(props: {
 
 /**
  * Call card
+ *
+ * `pip` is true while the floating pill (`VoiceCallCardPiP`) is showing on
+ * top of this card instead. It used to mean this component simply was not
+ * rendered at all (see the `<Switch>` this replaced in
+ * `VoiceCallCardContext`) -- now it stays mounted underneath and is just
+ * hidden with CSS, so `VoiceCallCardActiveRoom`'s participant grid does not
+ * get destroyed and rebuilt every time the card is dragged into or out of
+ * its pill.
  */
 function VoiceCallCard(props: {
   channel: Channel;
   inCall: boolean;
   showCard: boolean;
   fullscreen: boolean;
+  pip: boolean;
 }) {
   return (
     <Show when={props.showCard}>
-      <Base fullscreen={props.fullscreen}>
+      <Base fullscreen={props.fullscreen} pip={props.pip}>
         <Card active={props.inCall} fullscreen={props.fullscreen}>
           <Show
             when={props.inCall}
@@ -354,6 +385,18 @@ const Base = styled("div", {
         top: 0,
         height: "100%",
         padding: 0,
+      },
+    },
+    // Hides the card while `VoiceCallCardPiP` shows on top of it, without
+    // unmounting it (see the doc comment on `VoiceCallCard` above).
+    // `visibility: hidden` rather than `display: none` so it stays a real
+    // laid-out box (`VoiceCallCardActiveRoom`'s resize observer keeps
+    // measuring it) and drops out of the tab order/accessibility tree,
+    // unlike `opacity: 0`.
+    pip: {
+      true: {
+        visibility: "hidden",
+        pointerEvents: "none",
       },
     },
   },

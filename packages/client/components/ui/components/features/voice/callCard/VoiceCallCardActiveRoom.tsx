@@ -193,6 +193,31 @@ function Participants() {
   });
 
   /**
+   * Everything that actually gets a tile: `gridTracks()` (the strip, or the
+   * whole grid when nothing is focused) plus the focused track itself,
+   * unconditionally -- a pinned stream stays visible even if its camera is
+   * off and `showNonVideoParticipants` would otherwise have filtered it out,
+   * same as before this was a single loop.
+   *
+   * This single list feeds one `TrackLoop` for both the focus tile and the
+   * strip (see `Grid` below) instead of two separate ones. That is the whole
+   * point: `gridTracks()` above already excludes whichever track is
+   * currently focused, so as focus moves from one participant to another,
+   * both of them stay members of *this* combined list the entire time --
+   * only their position in it (and, correspondingly, `ParticipantTile`'s own
+   * `voice.isFocus(track)` read) changes. Solid's keyed `<For>` underneath
+   * `TrackLoop` reorders the existing DOM nodes for that, rather than
+   * unmounting the old focus tile and mounting a fresh one -- which is
+   * exactly the destroy/rebuild (and torn-down `<video>` element) this
+   * refactor exists to stop. Placed first, matching where the old, separate
+   * focus `TrackLoop` used to sit in the DOM/tab order.
+   */
+  const visibleTracks = createMemo(() => {
+    const focusTrack = voice.focusTrack();
+    return focusTrack ? [focusTrack, ...gridTracks()] : gridTracks();
+  });
+
+  /**
    * Column count that makes the tiles as large as the card allows.
    *
    * Every tile is 16/9, so a candidate column count is worth exactly the tile
@@ -261,6 +286,18 @@ function Participants() {
     return `max(${TILE_MIN_WIDTH}px, calc(min((100% - ${colGaps}px) / ${cols}, (var(--vc-h, 100vh) - ${rowGaps}px) / ${rows} * 16 / 9) - 1px))`;
   };
 
+  /**
+   * Height reserved for the strip when something is focused, exposed as
+   * `--vc-strip-h` on `Call` so the focused tile (an absolutely-positioned
+   * overlay over the whole of `Call`, not a sibling of the strip anymore --
+   * see `ParticipantTile.tsx`'s `focus` variant) knows how much room to leave
+   * below it. Mirrors `Grid`'s own `focus`/`show` variants below exactly, so
+   * the overlay's bottom edge always lines up with the strip's actual top
+   * edge instead of drifting out of sync with it.
+   */
+  const stripHeight = () =>
+    voice.showBar() ? `max(20%, ${TILE_MIN_FOCUS_HEIGHT})` : "0px";
+
   // Give a pinned stream that disappears a chance to come back before letting
   // go of it; see FOCUS_GRACE_MS.
   let focusGrace: ReturnType<typeof setTimeout> | undefined;
@@ -305,31 +342,33 @@ function Participants() {
   });
 
   return (
-    <Call ref={callRef} class={focused() ? "" : scrollableStyles()}>
+    <Call
+      ref={callRef}
+      focus={focused()}
+      class={focused() ? "" : scrollableStyles()}
+      style={{ "--vc-strip-h": stripHeight() }}
+    >
       <InRoom>
-        <FocusedParticipant />
         <Show when={focused()}>
           <ShowBarButtonHolder>
-            <div style={{ "margin-bottom": "10px" }}>
-              <IconButton
-                size="xs"
-                variant={"tonal"}
-                onPress={() => voice.toggleShowBar()}
-                use:floating={{
-                  tooltip: {
-                    placement: "top",
-                    content: voice.showBar() ? t`Hide Others` : t`Show Others`,
-                  },
-                }}
+            <IconButton
+              size="xs"
+              variant={"tonal"}
+              onPress={() => voice.toggleShowBar()}
+              use:floating={{
+                tooltip: {
+                  placement: "top",
+                  content: voice.showBar() ? t`Hide Others` : t`Show Others`,
+                },
+              }}
+            >
+              <Show
+                when={voice.showBar()}
+                fallback={<Symbol>keyboard_arrow_up</Symbol>}
               >
-                <Show
-                  when={voice.showBar()}
-                  fallback={<Symbol>keyboard_arrow_up</Symbol>}
-                >
-                  <Symbol>keyboard_arrow_down</Symbol>
-                </Show>
-              </IconButton>
-            </div>
+                <Symbol>keyboard_arrow_down</Symbol>
+              </Show>
+            </IconButton>
           </ShowBarButtonHolder>
         </Show>
         <Grid
@@ -338,7 +377,18 @@ function Participants() {
           class={focused() ? scrollableStyles({ direction: "x" }) : ""}
           style={{ "--vc-tile-width": tileWidth() }}
         >
-          <TrackLoop tracks={gridTracks}>{() => <ParticipantTile />}</TrackLoop>
+          {/*
+           * One loop for both the focus tile and the strip -- see
+           * `visibleTracks` above for why -- rather than the two separate
+           * `TrackLoop`s (one keyed to just the focused track, one to
+           * `gridTracks()`) this used to be. `ParticipantTile` positions
+           * itself via `voice.isFocus(track)` when it is the focused one
+           * (see its `focus` variant), so nothing else here needs to know
+           * which array position that is.
+           */}
+          <TrackLoop tracks={visibleTracks}>
+            {() => <ParticipantTile />}
+          </TrackLoop>
           <For each={Array(testTrackCount)}>
             {() => (
               <div
@@ -349,22 +399,6 @@ function Participants() {
         </Grid>
       </InRoom>
     </Call>
-  );
-}
-
-function FocusedParticipant() {
-  const voice = useVoice();
-
-  return (
-    <Show when={voice.focusTrack()}>
-      <TrackLoop tracks={() => [voice.focusTrack()!]}>
-        {() => (
-          <FocusBox>
-            <ParticipantTile focus />
-          </FocusBox>
-        )}
-      </TrackLoop>
-    </Show>
   );
 }
 
@@ -423,16 +457,41 @@ const VoiceCallControlHolder = styled("div", {
   },
 });
 
+// Floats the "show/hide others" toggle just above the strip's top edge,
+// centered. Positioned against `Call` (not a flex sibling between the old
+// `FocusBox` and `Grid` anymore -- there is no `FocusBox`; see `Call`'s own
+// doc comment) using the same `--vc-strip-h` the focused tile overlay sizes
+// itself against, so the two always agree on where the strip actually
+// starts. The `+ 10px` reproduces the old layout's gap between the button
+// and the strip.
 const ShowBarButtonHolder = styled("div", {
   base: {
-    height: "0px",
-    alignSelf: "center",
-    overflow: "visible",
-    display: "flex",
-    flexDirection: "column-reverse",
+    position: "absolute",
+    left: "50%",
+    bottom: "calc(var(--vc-strip-h, 0px) + 10px)",
+    transform: "translateX(-50%)",
+    zIndex: 9,
   },
 });
 
+/**
+ * Positioning context for the focused tile's overlay (see `ParticipantTile`'s
+ * `focus` variant) and for `ShowBarButtonHolder` above -- both position
+ * themselves against this element via `position: absolute`, which is why
+ * this stays `position: relative` and why nothing between them and this
+ * (`InRoom`, `Grid`) may introduce a positioning context of its own.
+ *
+ * There used to be a `FocusBox` here too: a flex sibling, ahead of `Grid` in
+ * the flex column below, whose `flex-grow: 1` pushed `Grid` down to the
+ * bottom and gave the focused tile a home to center itself in. It is gone
+ * now that the focused tile is rendered by the same `TrackLoop` as the strip
+ * (see `visibleTracks`) and instead overlays this element directly. `Grid`
+ * is this component's only flex child left when focused, so `justifyContent:
+ * "flex-end"` (below, gated on `focus` the same way `FocusBox` used to be
+ * conditionally rendered) takes over pinning it to the bottom edge; it is a
+ * no-op when unfocused, where `Grid`'s own `minHeight: "100%"` already fills
+ * this box with nothing left over to justify.
+ */
 const Call = styled("div", {
   base: {
     position: "relative",
@@ -441,6 +500,13 @@ const Call = styled("div", {
     gap: "var(--gap-sm)",
     flexGrow: 1,
     minHeight: 0,
+  },
+  variants: {
+    focus: {
+      true: {
+        justifyContent: "flex-end",
+      },
+    },
   },
 });
 
@@ -460,7 +526,6 @@ const Grid = styled("div", {
         flexDirection: "column",
         height: `max(20%, ${TILE_MIN_FOCUS_HEIGHT})`,
         minHeight: 0,
-        transition: "height .3s ease",
 
         "& .vc_tile": {
           width: "auto",
@@ -473,16 +538,5 @@ const Grid = styled("div", {
         height: 0,
       },
     },
-  },
-});
-
-const FocusBox = styled("div", {
-  base: {
-    height: 0,
-    flexGrow: 1,
-    display: "flex",
-    flexDirection: "column",
-    justifyContent: "center",
-    margin: "0 auto",
   },
 });

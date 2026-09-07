@@ -27,10 +27,18 @@ const REPLACED_ELEMENT_TAGS = new Set([
  * module-import time: this module is re-exported through the `@revolt/ui`
  * barrel, so evaluating `document` eagerly here would throw for any
  * consumer that imports the barrel outside a DOM environment.
+ *
+ * Exported (read-only, via the accessor only -- `setFullscreenElement` stays
+ * private to this module's own `fullscreenchange` listener below) so other
+ * consumers that just need to know *whether* something is fullscreen --
+ * `ParticipantTile`'s own per-tile fullscreen state, for one -- can read the
+ * same signal instead of attaching a redundant `document` listener of their
+ * own.
  */
-const [fullscreenElement, setFullscreenElement] = createSignal<Element | null>(
-  typeof document === "undefined" ? null : document.fullscreenElement,
-);
+export const [fullscreenElement, setFullscreenElement] =
+  createSignal<Element | null>(
+    typeof document === "undefined" ? null : document.fullscreenElement,
+  );
 
 // A single listener for the lifetime of the page, attached unconditionally
 // at module scope - deliberately not refcounted per consumer and not tied

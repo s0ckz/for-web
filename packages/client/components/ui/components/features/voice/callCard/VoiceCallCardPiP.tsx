@@ -124,6 +124,20 @@ function MiniVideoTile() {
   );
 }
 
+/**
+ * While this is showing, `VoiceCallCardActiveRoom` -- specifically the
+ * `ParticipantTile` for this same focused track -- can be mounted
+ * underneath it too (see `VoiceCallCard.tsx`'s `pip` prop): it is now kept
+ * mounted and just hidden with CSS across the pill/full-card switch, rather
+ * than unmounted, so its own `<VideoTrack>` for this track can still be
+ * attached at the same time as this one. That is not a bug to route around:
+ * `useMediaTrackBySourceOrName` (the hook both `VideoTrack` instances use)
+ * calls `track.attach(el)`/`track.detach(el)` with *its own* element each
+ * time, and `livekit-client`'s `Track` tracks attached elements per-call in
+ * a set rather than assuming exactly one -- so two independent `VideoTrack`s
+ * attaching the same track is an explicitly supported, ordinary case, not
+ * a shared/exclusive resource the two could fight over.
+ */
 function MiniVideo() {
   const track = useTrackRefContext();
 

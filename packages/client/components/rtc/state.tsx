@@ -3,6 +3,7 @@ import {
   batch,
   createContext,
   createEffect,
+  createRoot,
   createSignal,
   JSX,
   Setter,
@@ -18,6 +19,7 @@ import {
   AudioPresets,
   LocalTrack,
   LocalTrackPublication,
+  LocalVideoTrack,
   Room,
   ScreenShareCaptureOptions,
   ScreenSharePresets,
@@ -48,6 +50,7 @@ import { setNextScreenShareFrameRate } from "./screenShareCapture";
 import {
   browserCaptureOptions,
   classifyCapturedSurface,
+  isNativeDesktop,
 } from "./screenShareSurface";
 import {
   getMicPublication,
@@ -147,8 +150,37 @@ function screenShareEncoding(resolution: VideoResolution | undefined) {
     // well under it, so the extra headroom just leaves it room to breathe
     // rather than forcing it there.
     maxBitrate,
-    maxFramerate: frameRate,
+    // Deliberately above the source's own cap (`frameRate`, applied via
+    // `applyConstraints` in #applyShareChoice/#recoverScreenShare), not equal
+    // to it. The source is the real limiter; this is a second, independent
+    // cap sitting right on top of it. Frame capture timestamps jitter by a
+    // few ms even when the source is healthy, so a frame delivered fractionally
+    // early for its nominal slot reads to the encoder's rate limiter as
+    // arriving "too soon" -- and at an equal ceiling that frame gets dropped
+    // instead of encoded, silently shaving achieved fps below what the source
+    // is actually producing. +5fps of headroom absorbs that jitter without
+    // giving the encoder room to run away: the source cap still does the
+    // actual limiting.
+    //
+    // On for-desktop's native generator track, `applyConstraints` is not a
+    // real track constraint at all -- the injected page patch
+    // (appAudioPatch.ts) overrides `generator.applyConstraints` to read the
+    // requested `frameRate` and forward it to the native capturer via
+    // `screenCaptureBridge.setFps()` (IPC to `setLiveFps` in
+    // screenCapture.ts), then resolves immediately without the browser ever
+    // seeing a constraint on the (fake) track. That native capturer is the
+    // actual source-side limiter there, playing the same role Chromium's own
+    // track constraint plays on the browser capture path -- so this encoder
+    // ceiling needs the same headroom above it either way.
+    maxFramerate: frameRate + 5,
     priority: "high" as const,
+    // For consistency with `priority` above; LiveKit already derives
+    // `networkPriority` from `priority` when it applies encoding parameters
+    // to the sender, so this has no practical effect of its own today. Kept
+    // explicit anyway so this object states its own priority intent fully
+    // rather than relying on that LiveKit-internal derivation to keep doing
+    // it.
+    networkPriority: "high" as const,
   };
 }
 
@@ -287,13 +319,22 @@ function isHardware(probe: CodecProbe): boolean {
  * default: Chromium applies per-profile min/max resolution filtering, so
  * e.g. 1080p60 HEVC can be genuinely absent on hardware that has 720p30
  * HEVC. Every probe is wrapped in one shared {@link
- * SCREEN_SHARE_CODEC_PROBE_TIMEOUT_MS} timeout (`Promise.all` inside a
- * single race, so the wall-clock cost is one probe's worth, not four) --
+ * SCREEN_SHARE_CODEC_PROBE_TIMEOUT_MS} timeout (`Promise.all` raced against
+ * it, so the wall-clock cost of waiting is one probe's worth, not four) --
  * a slow first `encodingInfo` call on a cold GPU process must not stall the
- * share starting. If `mediaCapabilities.encodingInfo` is missing, any probe
- * rejects, or the timeout fires, this returns "vp9" for *this* call only
- * and writes nothing to the cache, so the next attempt retries from
- * scratch.
+ * share starting. If `mediaCapabilities.encodingInfo` is missing or any
+ * probe rejects outright, this returns "vp9" for *this* call only and
+ * writes nothing to the cache, so the next attempt retries from scratch.
+ *
+ * A bare timeout is different: the four `encodingInfo` calls are not
+ * cancelled by losing the race, only abandoned by *this* call -- they keep
+ * running, and whichever one of them resolves the batch still computes and
+ * caches the real decision when it eventually lands, exactly as if it had
+ * won the race. So only the very first share of a cold session (the one
+ * that hits a cold GPU process) actually pays the probe latency; by the
+ * time a second share asks for the same key, the backgrounded probe has
+ * usually already finished and cached the answer, however late it was too
+ * late for the *first* share to use.
  *
  * AV1 is deliberately never probed: LiveKit treats it as SVC and forces
  * L1T3, which non-Intel hardware cannot do, so it would quietly land on
@@ -320,155 +361,173 @@ async function screenShareCodec(
   const inFlight = screenShareCodecInFlight.get(key);
   if (inFlight) return inFlight;
 
-  const promise = (async (): Promise<VideoCodec> => {
-    // Typed as non-optional in lib.dom.d.ts, but not every Chromium build
-    // actually implements `encodingInfo` -- check before using it rather
-    // than trust the type.
-    const mediaCapabilities: MediaCapabilities | undefined =
-      navigator.mediaCapabilities;
+  // Typed as non-optional in lib.dom.d.ts, but not every Chromium build
+  // actually implements `encodingInfo` -- check before using it rather
+  // than trust the type.
+  const mediaCapabilities: MediaCapabilities | undefined =
+    navigator.mediaCapabilities;
 
-    if (
-      typeof RTCRtpSender === "undefined" ||
-      !mediaCapabilities?.encodingInfo
-    ) {
-      // Same reasoning as the timeout path below: record it so a stale
-      // `cbpHardware` from an earlier share cannot leak into the backup
-      // codec choice, but do not cache it.
-      lastScreenShareCodecDecision = {
-        key,
-        codec: "vp9",
-        reason:
-          "mediaCapabilities.encodingInfo unavailable; cannot verify hardware",
-        probes: [],
-        cbpHardware: false,
-        at: Date.now(),
-      };
-      return "vp9";
-    }
-
-    const negotiable = new Set(
-      (RTCRtpSender.getCapabilities?.("video")?.codecs ?? []).map((codec) =>
-        codec.mimeType.toLowerCase(),
-      ),
-    );
-
-    // Built from the already-defaulted width/height/frameRate locals, not
-    // the raw (possibly undefined) `resolution` param, so the bitrate probed
-    // here always matches the resolution actually probed above.
-    const bitrate = screenShareEncoding({
-      width,
-      height,
-      frameRate,
-    }).maxBitrate;
-
-    const probe = (contentType: string): Promise<CodecProbe> =>
-      mediaCapabilities
-        .encodingInfo({
-          type: "webrtc",
-          video: {
-            contentType,
-            width,
-            height,
-            framerate: frameRate,
-            bitrate,
-            scalabilityMode: "L1T1",
-          },
-        })
-        .then((info) => ({
-          contentType,
-          supported: info.supported,
-          powerEfficient: info.powerEfficient,
-        }));
-
-    let probes: CodecProbe[] | undefined;
-    try {
-      probes = await Promise.race([
-        Promise.all([
-          probe(H265_CONTENT_TYPE),
-          probe(H264_CBP_CONTENT_TYPE),
-          probe(H264_MAIN_CONTENT_TYPE),
-          probe(H264_HIGH_CONTENT_TYPE),
-        ]),
-        new Promise<undefined>((resolve) =>
-          setTimeout(
-            () => resolve(undefined),
-            SCREEN_SHARE_CODEC_PROBE_TIMEOUT_MS,
-          ),
-        ),
-      ]);
-    } catch {
-      probes = undefined;
-    }
-
-    if (!probes) {
-      console.info(
-        `[rtc] screen share codec probe for ${key} timed out or failed, using vp9 for this share only`,
-      );
-      // Record it as the last decision without caching it. Skipping this
-      // would leave `lastScreenShareCodecDecision` pointing at some earlier
-      // share's result, and `screenSharePublishOptions` reads `cbpHardware`
-      // off it -- so a stale `true` would pick an h264 backup codec on the
-      // strength of a probe that never ran for this configuration.
-      lastScreenShareCodecDecision = {
-        key,
-        codec: "vp9",
-        reason: "probe timed out or failed; not cached, will retry next share",
-        probes: [],
-        cbpHardware: false,
-        at: Date.now(),
-      };
-      return "vp9";
-    }
-
-    const [h265, h264Cbp, h264Main, h264High] = probes;
-
-    let codec: VideoCodec;
-    let reason: string;
-
-    if (negotiable.has("video/h265") && isHardware(h265)) {
-      codec = "h265";
-      reason = "hardware h265 available and negotiable";
-    } else if (negotiable.has("video/h264") && isHardware(h264Cbp)) {
-      codec = "h264";
-      reason = "hardware h264 available at constrained baseline";
-    } else if (isHardware(h264Main) || isHardware(h264High)) {
-      codec = "vp9";
-      reason =
-        "hardware h264 exists here but only for main/high, which the SFU will not negotiate -- falling back to vp9";
-    } else {
-      codec = "vp9";
-      reason = "no hardware h265/h264 found, falling back to vp9";
-    }
-
-    const decision: ScreenShareCodecDecision = {
+  if (typeof RTCRtpSender === "undefined" || !mediaCapabilities?.encodingInfo) {
+    // Same reasoning as the rejection path below: record it so a stale
+    // `cbpHardware` from an earlier share cannot leak into the backup
+    // codec choice, but do not cache it. Nothing to probe here, so there is
+    // no in-flight work to hand later callers either.
+    lastScreenShareCodecDecision = {
       key,
-      codec,
-      reason,
-      probes,
-      cbpHardware: isHardware(h264Cbp),
+      codec: "vp9",
+      reason:
+        "mediaCapabilities.encodingInfo unavailable; cannot verify hardware",
+      probes: [],
+      cbpHardware: false,
       at: Date.now(),
     };
-
-    console.info(
-      `[rtc] screen share codec for ${key}: ${codec} (${reason})`,
-      probes.map(
-        (p) =>
-          `${p.contentType} supported=${p.supported} powerEfficient=${p.powerEfficient}`,
-      ),
-    );
-
-    screenShareCodecDecisions.set(key, decision);
-    lastScreenShareCodecDecision = decision;
-
-    return codec;
-  })();
-
-  screenShareCodecInFlight.set(key, promise);
-  try {
-    return await promise;
-  } finally {
-    screenShareCodecInFlight.delete(key);
+    return "vp9";
   }
+
+  const negotiable = new Set(
+    (RTCRtpSender.getCapabilities?.("video")?.codecs ?? []).map((codec) =>
+      codec.mimeType.toLowerCase(),
+    ),
+  );
+
+  // Built from the already-defaulted width/height/frameRate locals, not
+  // the raw (possibly undefined) `resolution` param, so the bitrate probed
+  // here always matches the resolution actually probed above.
+  const bitrate = screenShareEncoding({
+    width,
+    height,
+    frameRate,
+  }).maxBitrate;
+
+  const probe = (contentType: string): Promise<CodecProbe> =>
+    mediaCapabilities
+      .encodingInfo({
+        type: "webrtc",
+        video: {
+          contentType,
+          width,
+          height,
+          framerate: frameRate,
+          bitrate,
+          scalabilityMode: "L1T1",
+        },
+      })
+      .then((info) => ({
+        contentType,
+        supported: info.supported,
+        powerEfficient: info.powerEfficient,
+      }));
+
+  // The actual probe work, kept as its own promise rather than folded
+  // straight into the race below. This is what lets a probe that loses the
+  // race to the timeout keep going instead of being thrown away: this
+  // promise is never cancelled by anything, so whichever caller (this one,
+  // or a later one that joins it via `screenShareCodecInFlight`) is still
+  // around when it settles gets the real decision, and it is cached exactly
+  // once regardless of whether that happens before or after the timeout.
+  const probesPromise: Promise<VideoCodec> = Promise.all([
+    probe(H265_CONTENT_TYPE),
+    probe(H264_CBP_CONTENT_TYPE),
+    probe(H264_MAIN_CONTENT_TYPE),
+    probe(H264_HIGH_CONTENT_TYPE),
+  ]).then(
+    (probes) => {
+      const [h265, h264Cbp, h264Main, h264High] = probes;
+
+      let codec: VideoCodec;
+      let reason: string;
+
+      if (negotiable.has("video/h265") && isHardware(h265)) {
+        codec = "h265";
+        reason = "hardware h265 available and negotiable";
+      } else if (negotiable.has("video/h264") && isHardware(h264Cbp)) {
+        codec = "h264";
+        reason = "hardware h264 available at constrained baseline";
+      } else if (isHardware(h264Main) || isHardware(h264High)) {
+        codec = "vp9";
+        reason =
+          "hardware h264 exists here but only for main/high, which the SFU will not negotiate -- falling back to vp9";
+      } else {
+        codec = "vp9";
+        reason = "no hardware h265/h264 found, falling back to vp9";
+      }
+
+      const decision: ScreenShareCodecDecision = {
+        key,
+        codec,
+        reason,
+        probes,
+        cbpHardware: isHardware(h264Cbp),
+        at: Date.now(),
+      };
+
+      console.info(
+        `[rtc] screen share codec for ${key}: ${codec} (${reason})`,
+        probes.map(
+          (p) =>
+            `${p.contentType} supported=${p.supported} powerEfficient=${p.powerEfficient}`,
+        ),
+      );
+
+      screenShareCodecDecisions.set(key, decision);
+      lastScreenShareCodecDecision = decision;
+
+      return codec;
+    },
+    () => {
+      // A genuine rejection (not the timeout below, which never touches
+      // this promise) -- e.g. `encodingInfo` itself threw. Record it
+      // without caching, same as the missing-API branch above, so a
+      // transient failure cannot pin this key at vp9 forever.
+      lastScreenShareCodecDecision = {
+        key,
+        codec: "vp9",
+        reason: "probe rejected; not cached, will retry next share",
+        probes: [],
+        cbpHardware: false,
+        at: Date.now(),
+      };
+      return "vp9";
+    },
+  );
+
+  // Tracked under the real probe, not the race below -- and only cleared
+  // once the real probe settles. A concurrent call for this key, whether it
+  // arrives while we are still waiting on the timeout or only after we have
+  // already fallen back to vp9 here, joins this same probe instead of
+  // starting a second one.
+  screenShareCodecInFlight.set(key, probesPromise);
+  probesPromise.finally(() => screenShareCodecInFlight.delete(key));
+
+  const raced = await Promise.race([
+    probesPromise,
+    new Promise<"timeout">((resolve) =>
+      setTimeout(() => resolve("timeout"), SCREEN_SHARE_CODEC_PROBE_TIMEOUT_MS),
+    ),
+  ]);
+
+  if (raced !== "timeout") return raced;
+
+  console.info(
+    `[rtc] screen share codec probe for ${key} timed out, using vp9 for this share -- the probe keeps running in the background and will cache its result for the next share`,
+  );
+  // Record it as the last decision without caching it yet. Skipping this
+  // would leave `lastScreenShareCodecDecision` pointing at some earlier
+  // share's result, and `screenSharePublishOptions` reads `cbpHardware` off
+  // it -- so a stale `true` would pick an h264 backup codec on the strength
+  // of a probe that never actually finished for this configuration. Once
+  // `probesPromise` above does resolve, its own `.then` overwrites this with
+  // the real decision.
+  lastScreenShareCodecDecision = {
+    key,
+    codec: "vp9",
+    reason:
+      "probe timed out; not cached yet -- the backgrounded probe will cache its result once it resolves",
+    probes: [],
+    cbpHardware: false,
+    at: Date.now(),
+  };
+  return "vp9";
 }
 
 /**
@@ -597,6 +656,15 @@ const WEAK_LINK_CHECK_DELAY_MS = 5_000;
  * Exported so {@link ScreenShareStats} can show the same verdict as a
  * persistent row, computed from stats it already reads, without duplicating
  * the threshold logic.
+ *
+ * Gated on `document.visibilityState` and a higher bandwidth-limited
+ * threshold (2s, up from a hair-trigger 0.1s): a backgrounded/minimised
+ * sharer's encoder can look bandwidth-limited for reasons that have nothing
+ * to do with the actual link -- Chromium throttles a hidden tab's encode
+ * pace -- and that used to be enough on its own to pop the weak-link modal
+ * on a perfectly fine connection. Requiring the page to be visible when the
+ * sample is taken keeps this verdict about the link, not about whether the
+ * sharer alt-tabbed a moment ago.
  * @param maxBitrate The encoder's bitrate ceiling for the chosen quality
  * @param availableOutgoingBitrate `candidate-pair.availableOutgoingBitrate`, if reported
  * @param bandwidthLimitedSeconds `outbound-rtp.qualityLimitationDurations.bandwidth`, if reported
@@ -607,10 +675,12 @@ export function isScreenShareLinkWeak(
   availableOutgoingBitrate: number | undefined,
   bandwidthLimitedSeconds: number | undefined,
 ): boolean {
+  if (document.visibilityState !== "visible") return false;
+
   const belowCeiling =
     availableOutgoingBitrate !== undefined &&
     availableOutgoingBitrate < maxBitrate;
-  const bandwidthLimited = (bandwidthLimitedSeconds ?? 0) > 0.1;
+  const bandwidthLimited = (bandwidthLimitedSeconds ?? 0) > 2;
   return belowCeiling || bandwidthLimited;
 }
 
@@ -625,6 +695,18 @@ const MAX_RECOVERIES = 3;
 
 /** ... within this window, so a permanently broken capture cannot loop */
 const RECOVERY_WINDOW_MS = 60_000;
+
+/**
+ * Backoff schedule for {@link Voice.#scheduleReacquireRetry}: how long to
+ * wait before each retry once {@link Voice.#recoverScreenShare} has failed to
+ * bring a share back up. The last entry repeats for as long as the share
+ * stays down -- there is no give-up here, only the user stopping does.
+ */
+const REACQUIRE_BACKOFF_MS = [5_000, 15_000, 60_000];
+
+/** What a screen share was started with, remembered so a capture that dies
+ * can be recovered with the same quality/audio rather than the saved default. */
+type ShareChoice = { qualityName: ScreenShareQualityName; audio: boolean };
 
 class Voice {
   #settings: VoiceSettings;
@@ -649,6 +731,16 @@ class Voice {
   screenshare: Accessor<boolean>;
   #setScreenshare: Setter<boolean>;
 
+  /**
+   * Whether a live screen share's capture is currently down and being
+   * automatically retried (see {@link #scheduleReacquireRetry}). Distinct
+   * from {@link screenshare}, which stays `true` throughout -- from the
+   * sharer's perspective the share never stopped, this is just enough for
+   * their own tile to show an inline notice while it waits to come back.
+   */
+  screenShareState: Accessor<"idle" | "reacquiring">;
+  #setScreenShareState: Setter<"idle" | "reacquiring">;
+
   fullscreen: Accessor<boolean>;
   #setFullscreen: Setter<boolean>;
 
@@ -671,8 +763,17 @@ class Voice {
   private voiceProcessor?: VoiceProcessor;
   #localSpeakingMeter?: () => void;
 
+  /**
+   * Disposer for the `createRoot` that owns `vidTracks`'s `useTracks` call
+   * (see {@link connect}). `connect` runs outside any Solid render tree, so
+   * without an explicit root the effect and rxjs subscription `useTracks`
+   * creates would never be torn down -- rejoining a call would just keep
+   * stacking more of them. Cleared by {@link disconnect}.
+   */
+  #disposeVidTracks?: () => void;
+
   /** What the last successful share was started with, for recovery */
-  #lastShareChoice?: { qualityName: ScreenShareQualityName; audio: boolean };
+  #lastShareChoice?: ShareChoice;
   #recoveryAttempts: number[] = [];
   #recovering = false;
 
@@ -688,6 +789,33 @@ class Voice {
    * capture death would run two recovery cycles instead of one.
    */
   #armedShareEndedPublication?: LocalTrackPublication;
+
+  /**
+   * The `LocalVideoTrack` {@link #armScreenShareEnded} last attached its
+   * upstream-pause listener to (see that method). Unlike
+   * {@link #armedShareEndedPublication}, this is keyed on the *track*, not
+   * the publication: `republishAllTracks` wraps the same live
+   * `LocalVideoTrack` in a brand new `LocalTrackPublication` on a full
+   * reconnect (it does not restart screen-share tracks), so guarding on the
+   * publication alone would re-arm a second listener on the same track object
+   * and double-fire `resumeUpstream()` on every future mute.
+   */
+  #armedScreenShareUpstreamTrack?: LocalVideoTrack;
+
+  /** Pending {@link #scheduleReacquireRetry} timer, if a share is currently parked. */
+  #reacquireTimer?: ReturnType<typeof setTimeout>;
+  /** How far into {@link REACQUIRE_BACKOFF_MS} the next retry is. */
+  #reacquireBackoffStep = 0;
+
+  /**
+   * Whether the one silent re-acquire {@link #recoverScreenShareBrowser}
+   * is allowed has already been spent for the share currently running.
+   * Reset when a fresh share starts and when the current one stops -- see
+   * `toggleScreenshare`, `disconnect`, and `changeScreenShareSource` (a
+   * manually picked new source is "fresh" for this budget too, and backing
+   * all the way out of it is a real stop).
+   */
+  #browserReacquireAttempted = false;
 
   constructor(
     voiceSettings: VoiceSettings,
@@ -723,6 +851,12 @@ class Voice {
     const [screenshare, setScreenshare] = createSignal(false);
     this.screenshare = screenshare;
     this.#setScreenshare = setScreenshare;
+
+    const [screenShareState, setScreenShareState] = createSignal<
+      "idle" | "reacquiring"
+    >("idle");
+    this.screenShareState = screenShareState;
+    this.#setScreenShareState = setScreenShareState;
 
     const [fullscreen, setFullscreen] = createSignal(false);
     this.fullscreen = fullscreen;
@@ -825,6 +959,20 @@ class Voice {
     this.device.setWakeLocked();
 
     const room = new Room({
+      // livekit-client defaults this to false. It force-enables it at
+      // publish time whenever a track's resolved primary video codec
+      // differs from its backup codec (LocalParticipant.publish, "multi-codec
+      // simulcast requires dynacast") -- which `screenSharePublishOptions`
+      // above triggers for most screen shares (vp9/h264 primary against a
+      // vp8/h264 backup), but NOT when the primary codec itself resolves to
+      // plain vp8 (matches the vp8 backup, so the mismatch check is false),
+      // and NOT for camera publishes, which go through `setCameraEnabled`
+      // with livekit-client's own `publishDefaults` (videoCodec: 'vp8',
+      // backupCodec: true -> {codec: 'vp8'} -- same codec, same gap). Setting
+      // it explicitly here closes both gaps instead of relying on an
+      // incidental codec-mismatch side effect. Does NOT enable
+      // `adaptiveStream` -- that stays off; see the perf-plan decisions.
+      dynacast: true,
       audioCaptureDefaults: {
         deviceId: this.#settings.preferredAudioInputDevice,
         echoCancellation: this.#settings.echoCancellation,
@@ -845,13 +993,16 @@ class Voice {
       },
     });
 
-    this.vidTracks = useTracks(
-      [
-        { source: Track.Source.Camera, withPlaceholder: true },
-        { source: Track.Source.ScreenShare, withPlaceholder: false },
-      ],
-      { room, onlySubscribed: false },
-    );
+    createRoot((dispose) => {
+      this.#disposeVidTracks = dispose;
+      this.vidTracks = useTracks(
+        [
+          { source: Track.Source.Camera, withPlaceholder: true },
+          { source: Track.Source.ScreenShare, withPlaceholder: false },
+        ],
+        { room, onlySubscribed: false },
+      );
+    });
 
     batch(() => {
       this.#setRoom(room);
@@ -859,6 +1010,7 @@ class Voice {
       this.#setState("CONNECTING");
       this.#setVideo(false);
       this.#setScreenshare(false);
+      this.#setScreenShareState("idle");
       this.#setSoundboard(new SoundboardPlayer(room));
     });
 
@@ -884,6 +1036,20 @@ class Voice {
     });
 
     room.addListener("disconnected", () => this.#setState("DISCONNECTED"));
+
+    // A media/signal reconnect attempt in progress -- see RoomEvent.Reconnecting
+    // in livekit-client. Screen share recovery (#recoverScreenShare) is a
+    // separate concern (a dead capture, not a dead connection), so this only
+    // drives the existing RECONNECTING UI state.
+    room.addListener("reconnecting", () => {
+      console.warn("[rtc] room reconnecting");
+      this.#setState("RECONNECTING");
+    });
+
+    room.addListener("reconnected", () => {
+      console.info("[rtc] room reconnected");
+      this.#setState("CONNECTED");
+    });
 
     room.addListener("localTrackPublished", (pub) => {
       if (pub.source === Track.Source.ScreenShare) {
@@ -1022,9 +1188,15 @@ class Voice {
       this.#lastShareChoice = undefined;
       this.#recoveryAttempts = [];
       this.#armedShareEndedPublication = undefined;
+      this.#armedScreenShareUpstreamTrack = undefined;
+      this.#browserReacquireAttempted = false;
+      this.#stopReacquireBackoff();
 
       room.removeAllListeners();
       room.disconnect();
+
+      this.#disposeVidTracks?.();
+      this.#disposeVidTracks = undefined;
 
       batch(() => {
         this.#setState("READY");
@@ -1254,14 +1426,36 @@ class Voice {
   }
 
   /**
-   * Warm the codec probe for the currently configured quality without
-   * anyone waiting on it, so the first real `toggleScreenshare` call finds
-   * an already-cached decision instead of eating the probe's latency.
+   * Warm the codec probe for every enabled screen-share quality, not just
+   * the one currently configured, without anyone waiting on it -- so the
+   * first real `toggleScreenshare` call finds an already-cached decision no
+   * matter which quality it ends up publishing at, instead of eating the
+   * probe's latency for whichever one was not primed.
+   *
+   * Primed one quality at a time rather than all at once. `screenShareCodec`
+   * already fans a single quality's probe out to four parallel
+   * `encodingInfo` calls (see its doc comment); firing all enabled qualities
+   * (up to three -- low/high/high60) together would mean up to twelve
+   * simultaneous GPU capability queries the moment the room connects,
+   * stacked on top of everything else the client is doing at startup, for no
+   * wall-clock benefit since nothing here is awaited by a caller anyway.
+   * Sequencing keeps the burst to four probes in flight at a time.
+   * `screenShareCodec` caches each quality under its own resolution/
+   * framerate key, so nothing about the eventual cache depends on the order
+   * they were primed in -- only the first `toggleScreenshare` for a
+   * not-yet-primed quality still has to wait its turn.
    */
   #primeScreenShareCodec() {
-    const quality =
-      this.getEnabledScreenShareQualities()[this.#screenShareQuality()];
-    void screenShareCodec(quality?.resolution);
+    const qualities = this.getEnabledScreenShareQualities();
+    const resolutions = ScreenShareQualityNames.filter(
+      (name) => qualities[name],
+    ).map((name) => qualities[name]!.resolution);
+
+    void (async () => {
+      for (const resolution of resolutions) {
+        await screenShareCodec(resolution);
+      }
+    })();
   }
 
   async toggleScreenshare() {
@@ -1273,6 +1467,9 @@ class Voice {
       this.#lastShareChoice = undefined;
       this.#recoveryAttempts = [];
       this.#armedShareEndedPublication = undefined;
+      this.#armedScreenShareUpstreamTrack = undefined;
+      this.#browserReacquireAttempted = false;
+      this.#stopReacquireBackoff();
 
       await room.localParticipant.setScreenShareEnabled(false);
 
@@ -1596,11 +1793,12 @@ class Voice {
       // `getDisplayMedia` and a mid-share quality change needs to actually
       // move the source's framerate too.
       //
-      // Deliberately no `width`/`height` here any more: constraining capture
-      // resolution forced a full-frame libyuv rescale on Chromium's capture
-      // thread even when the source was already smaller, and Chromium's
-      // capture governor (`capture_period = max(2 x last_capture_duration,
-      // 1/target_fps)`) doubles the cost of anything that runs there.
+      // Still deliberately no `width`/`height` on the plain-browser path:
+      // constraining capture resolution there forces a full-frame libyuv
+      // rescale on Chromium's capture thread even when the source was
+      // already smaller, and Chromium's capture governor
+      // (`capture_period = max(2 x last_capture_duration, 1/target_fps)`)
+      // doubles the cost of anything that runs there.
       // `#applyEncoderLimits`'s `scaleResolutionDownBy` controls output
       // resolution on the encoder instead, where it's nearly free with
       // hardware H.26x.
@@ -1608,6 +1806,29 @@ class Voice {
         ideal: quality.resolution.frameRate,
         max: quality.resolution.frameRate,
       },
+      // On the desktop app only: `applyConstraints` here is not a real
+      // track constraint at all -- the injected page patch intercepts it on
+      // for-desktop's native generator track, reads `width`/`height` (same
+      // as it already does for `frameRate`, see `screenShareEncoding`'s doc
+      // comment) and forwards them over IPC to the native Windows capturer's
+      // `setTarget()`, which makes the GPU produce the preset resolution
+      // directly instead of capturing a fixed 1920x1080 box and leaning on
+      // `scaleResolutionDownBy` to shrink it per frame on the encoder queue.
+      // None of the browser cost above applies there -- the browser never
+      // sees a constraint on the (fake) track -- so this is gated on
+      // `isNativeDesktop()` rather than sent unconditionally.
+      ...(isNativeDesktop()
+        ? {
+            width: {
+              ideal: quality.resolution.width,
+              max: quality.resolution.width,
+            },
+            height: {
+              ideal: quality.resolution.height,
+              max: quality.resolution.height,
+            },
+          }
+        : {}),
     });
 
     localTrack.videoTrack.mediaStreamTrack.contentHint = quality.contentHint;
@@ -1872,28 +2093,66 @@ class Voice {
   }
 
   /**
-   * Watch a screen share publication for its capture ending.
+   * Watch a screen share publication for its capture ending, and for
+   * LiveKit's own mute-debounce trying to blank it out from under us.
    *
    * Windows' WGC capturer reports a permanent error when the captured window
    * is destroyed and recreated -- which is what a game does when it switches
    * to fullscreen -- and LiveKit then unpublishes the track. The share is
    * fine, the capture handle is not, so try to pick the window back up.
    *
+   * Separately: Chromium mutes a display track whenever the captured window
+   * stops producing frames (minimised, backgrounded, occluded), and
+   * livekit-client debounces that `mute` event for 5s before calling
+   * `pauseUpstream()` -- `replaceTrack(null)` on the sender, plus signalling
+   * the publication muted -- which blanks every viewer's tile even though the
+   * capture itself is still alive and will resume on its own. There is no
+   * supported way to stop LiveKit attaching that debounced handler in the
+   * first place (`LocalTrack`'s `mute`/`unmute` listeners are bound private
+   * methods, not something `removeEventListener` can target), so this
+   * neutralises the effect instead: as soon as the video track reports its
+   * upstream paused, immediately `resumeUpstream()` it. That call is a no-op
+   * once the sender is already un-paused (see `LocalTrack.resumeUpstream` --
+   * it only checks its own `_isUpstreamPaused` flag, never `isMuted`), so
+   * doing this unconditionally for every screen share is safe; the viewer
+   * keeps the frozen last frame instead of a blank tile until Chromium
+   * unmutes the track on its own.
+   *
    * Idempotent per publication object -- see
    * {@link #armedShareEndedPublication} for why that matters. Callers do not
    * need to check first; calling this again on the same live publication is
-   * a no-op.
+   * a no-op. The upstream-pause listener has its own, separate idempotency
+   * guard ({@link #armedScreenShareUpstreamTrack}): `republishAllTracks`
+   * reuses the same live `LocalVideoTrack` across a full reconnect's
+   * republish, wrapped in a new publication, so guarding on the publication
+   * alone would double-arm the track itself.
    */
   #armScreenShareEnded(room: Room, localTrack: LocalTrackPublication) {
-    if (this.#armedShareEndedPublication === localTrack) return;
-    this.#armedShareEndedPublication = localTrack;
+    if (this.#armedShareEndedPublication !== localTrack) {
+      this.#armedShareEndedPublication = localTrack;
 
-    localTrack.on("ended", () => {
-      this.#onScreenShareEnded(room);
-    });
+      localTrack.on("ended", () => {
+        this.#onScreenShareEnded(room, localTrack);
+      });
+    }
+
+    const videoTrack = localTrack.videoTrack;
+    if (videoTrack && videoTrack !== this.#armedScreenShareUpstreamTrack) {
+      this.#armedScreenShareUpstreamTrack = videoTrack;
+
+      videoTrack.on(TrackEvent.UpstreamPaused, () => {
+        console.info(
+          "[rtc] screen share upstream paused (LiveKit's mute debounce) -- resuming so viewers keep the last frame instead of a blank tile",
+        );
+        videoTrack.resumeUpstream();
+      });
+    }
   }
 
-  async #onScreenShareEnded(room: Room) {
+  async #onScreenShareEnded(
+    room: Room,
+    endedPublication: LocalTrackPublication,
+  ) {
     // A manual operation (changeScreenShareSource) or an automatic recovery
     // (#recoverScreenShare) is already handling this share's lifecycle.
     // Falling through to the cleanup below anyway would race whichever one
@@ -1920,40 +2179,97 @@ class Voice {
       }
     }
 
-    if (await this.#recoverScreenShare(room)) return;
-
-    // No bridge, nothing to recover, or recovery failed: stop as before --
-    // but only if there is still something to stop. `toggleScreenshare` is a
-    // toggle, and by the time we get here `screenshare()` can already be
-    // false: capture dies, this handler starts `#recoverScreenShare`, which
-    // blocks in `await reacquire()` for as long as it takes the window to
-    // come back (main waits up to a few minutes, see that method's comment)
-    // -- and the user can click stop while that is in flight, which runs
-    // `toggleScreenshare`'s own stop branch and sets `screenshare()` false
-    // right then. When `reacquire()` later resolves to `false` (or recovery
-    // fails some other way) and control lands back here, calling
-    // `toggleScreenshare()` unconditionally would find `screenshare()`
-    // already false and take the *other* branch -- starting a brand-new
-    // share and popping the picker, with no user action, right after the
-    // user asked to stop.
-    if (this.screenshare()) {
-      this.toggleScreenshare();
+    if (await this.#recoverScreenShare(room, endedPublication)) {
+      this.#stopReacquireBackoff();
+      return;
     }
+
+    // Recovery could not bring the share back up *right now*. That is not
+    // the same thing as the user stopping -- only a real stop (or a
+    // disconnect) should ever call `toggleScreenshare()` from here. Park
+    // instead and keep retrying with backoff; see #scheduleReacquireRetry.
+    //
+    // `screenshare()` is still checked, though: the user can click stop
+    // while recovery was in flight above, which runs independently of
+    // `#recovering` and sets `screenshare()` false right then -- and there is
+    // nothing left to park in that case.
+    if (this.screenshare()) {
+      this.#scheduleReacquireRetry(room);
+    }
+  }
+
+  /**
+   * Park a screen share whose capture is down and could not be brought back
+   * up on this attempt, and keep retrying {@link #recoverScreenShare} with
+   * backoff until it succeeds or the user explicitly stops.
+   *
+   * This is what keeps a recovery giving up from reading as the user
+   * stopping (see {@link #onScreenShareEnded}): `screenshare()`,
+   * `#lastShareChoice` and the recovery budget are all left untouched here,
+   * so the share stays "on" from the sharer's own perspective -- viewers just
+   * keep the frozen last frame -- while {@link screenShareState} flips to
+   * `"reacquiring"` for the sharer's own tile to show an inline notice (see
+   * `ParticipantTile`).
+   * @param room Room to retry the recovery against
+   */
+  #scheduleReacquireRetry(room: Room) {
+    this.#setScreenShareState("reacquiring");
+
+    const delay =
+      REACQUIRE_BACKOFF_MS[
+        Math.min(this.#reacquireBackoffStep, REACQUIRE_BACKOFF_MS.length - 1)
+      ];
+    this.#reacquireBackoffStep++;
+
+    clearTimeout(this.#reacquireTimer);
+    this.#reacquireTimer = setTimeout(async () => {
+      // The user stopped, or disconnected and reconnected to a different
+      // room, while this timer was pending.
+      if (!this.screenshare() || this.room() !== room) return;
+
+      if (await this.#recoverScreenShare(room)) {
+        this.#stopReacquireBackoff();
+        return;
+      }
+
+      if (this.screenshare()) {
+        this.#scheduleReacquireRetry(room);
+      }
+    }, delay);
+  }
+
+  /**
+   * Cancel any pending {@link #scheduleReacquireRetry} timer and reset its
+   * backoff. Called on a real user stop, on disconnect, and on a successful
+   * recovery -- the three ways a parked share stops being parked.
+   */
+  #stopReacquireBackoff() {
+    clearTimeout(this.#reacquireTimer);
+    this.#reacquireTimer = undefined;
+    this.#reacquireBackoffStep = 0;
+    this.#setScreenShareState("idle");
   }
 
   /**
    * Try to restart a screen share whose capture died underneath us.
    *
-   * Needs the desktop bridge: only the main process can find the window again
-   * and answer the next getDisplayMedia without showing the picker. On plain
-   * web this always returns false and the share simply ends.
+   * With the desktop bridge, the main process can find the window again and
+   * answer the next getDisplayMedia without showing the picker -- see the
+   * `window.native` branch below. On plain web there is no such bridge, so
+   * {@link #recoverScreenShareBrowser} handles the much narrower set of
+   * cases that need no picker at all.
    * @param room Room
+   * @param endedPublication The publication whose "ended" event triggered
+   * this call, if this is that first call. Absent on a backoff retry (see
+   * {@link #scheduleReacquireRetry}), since the dead publication is long
+   * gone by then -- only {@link #recoverScreenShareBrowser}'s "still live,
+   * just muted" check needs it.
    * @returns Whether the share is back up
    */
-  async #recoverScreenShare(room: Room): Promise<boolean> {
-    const reacquire = window.native?.reacquireScreenShare;
-    if (typeof reacquire !== "function") return false;
-
+  async #recoverScreenShare(
+    room: Room,
+    endedPublication?: LocalTrackPublication,
+  ): Promise<boolean> {
     const choice = this.#lastShareChoice;
     if (!choice || this.#recovering || !this.screenshare()) return false;
 
@@ -1962,10 +2278,16 @@ class Voice {
       (at) => now - at < RECOVERY_WINDOW_MS,
     );
     if (this.#recoveryAttempts.length >= MAX_RECOVERIES) {
-      console.warn("[rtc] screen share keeps dying, giving up on recovery");
+      console.warn(
+        "[rtc] screen share keeps dying, giving up on automatic recovery",
+      );
       return false;
     }
-    this.#recoveryAttempts.push(now);
+
+    const reacquire = window.native?.reacquireScreenShare;
+    if (typeof reacquire !== "function") {
+      return this.#recoverScreenShareBrowser(room, choice, endedPublication);
+    }
 
     this.#recovering = true;
     try {
@@ -2016,11 +2338,20 @@ class Voice {
           },
           publishOptions,
         );
+      } catch (err) {
+        // Only an attempt that actually reached setScreenShareEnabled(true)
+        // and failed counts against the recovery budget -- a `reacquire()`
+        // that never found the window back charged nothing either, above.
+        this.#recoveryAttempts.push(now);
+        throw err;
       } finally {
         setNextScreenShareFrameRate(undefined);
       }
 
-      if (!localTrack) return false;
+      if (!localTrack) {
+        this.#recoveryAttempts.push(now);
+        return false;
+      }
 
       this.#setScreenshare(room.localParticipant.isScreenShareEnabled);
       this.#armScreenShareEnded(room, localTrack);
@@ -2039,6 +2370,130 @@ class Voice {
       return true;
     } catch (err) {
       console.warn("[rtc] screen share recovery failed", err);
+      return false;
+    } finally {
+      this.#recovering = false;
+    }
+  }
+
+  /**
+   * Browser fallback for {@link #recoverScreenShare}: without the desktop
+   * bridge there is no way to silently find the captured window again, so
+   * this only covers the two cases that need no `getDisplayMedia` picker.
+   * @param room Room
+   * @param choice The remembered share choice to restore
+   * @param endedPublication The publication whose "ended" event triggered
+   * this recovery, if this is the first attempt (absent on a backoff retry)
+   * @returns Whether the share is back up
+   */
+  async #recoverScreenShareBrowser(
+    room: Room,
+    choice: ShareChoice,
+    endedPublication: LocalTrackPublication | undefined,
+  ): Promise<boolean> {
+    const readyState =
+      endedPublication?.videoTrack?.mediaStreamTrack.readyState;
+
+    // `readyState === "live"` alone is not enough to call this a success.
+    // By the time we get here, #onScreenShareEnded has already
+    // unconditionally unpublished the ScreenShareAudio track above, and
+    // `ended` fired on the video publication in the first place -- which
+    // livekit-client follows by unpublishing the video track too, just
+    // asynchronously (see the near-identical race called out where
+    // #recoverScreenShare's native branch checks
+    // `getTrackPublication(Track.Source.ScreenShare)` before republishing).
+    // A plain `getDisplayMedia` track's `readyState` is spec'd to already be
+    // "ended" by the time its `ended` event fires, which would make this
+    // branch dead in practice -- but that is not provable for every path
+    // into this handler (notably for-desktop's page patch synthesises
+    // `ended` on a `MediaStreamTrackGenerator`-backed track, a different
+    // object lifecycle), so do not trust `readyState` on its own. Confirm
+    // the publication itself is still actually live on the local
+    // participant -- same `trackSid`, still registered -- before reporting
+    // success. Otherwise fall through: the normal re-acquire path (or
+    // parking with backoff, if that has already been spent) picks it up,
+    // same as any other dead capture.
+    const stillPublished =
+      readyState === "live" &&
+      room.localParticipant.getTrackPublication(Track.Source.ScreenShare)
+        ?.trackSid === endedPublication?.trackSid;
+
+    if (stillPublished) {
+      // Not actually dead, just muted -- Chromium resumes producing frames
+      // on its own once the window is visible again, and
+      // #armScreenShareEnded's upstream-pause listener already keeps the
+      // viewer from going blank in the meantime. Nothing to do.
+      return true;
+    }
+
+    if (this.#browserReacquireAttempted) {
+      // Already spent the one silent re-acquire this share gets -- a second
+      // getDisplayMedia call would pop Chrome's picker again, which is not
+      // something to trigger with no user action behind it. Park instead
+      // (see #onScreenShareEnded) and keep waiting for the user to stop.
+      return false;
+    }
+    this.#browserReacquireAttempted = true;
+
+    this.#recovering = true;
+    try {
+      const quality = this.getEnabledScreenShareQualities()[choice.qualityName];
+      const publishOptions = await screenSharePublishOptions(
+        quality?.resolution,
+      );
+      const codecDecision = getScreenShareCodecDecision();
+
+      setNextScreenShareFrameRate(quality?.resolution.frameRate ?? 30);
+      let localTrack: LocalTrackPublication | undefined;
+      try {
+        localTrack = await room.localParticipant.setScreenShareEnabled(
+          true,
+          {
+            audio: SCREEN_SHARE_AUDIO,
+            // Same picker hints toggleScreenshare's own start branch uses --
+            // this attempt pops Chrome's picker too (see the "at most once"
+            // comment above), so it should look the same as any other.
+            ...browserCaptureOptions({
+              screenShareQualityAsk: this.#settings.screenShareQualityAsk,
+              screenShareAudio: this.#settings.screenShareAudio,
+            }),
+          },
+          publishOptions,
+        );
+      } catch (err) {
+        this.#recoveryAttempts.push(Date.now());
+        throw err;
+      } finally {
+        setNextScreenShareFrameRate(undefined);
+      }
+
+      // The picker was open for a while -- the user could have clicked stop
+      // in the meantime, independently of #recovering.
+      if (!this.screenshare()) return false;
+
+      if (!localTrack) {
+        this.#recoveryAttempts.push(Date.now());
+        return false;
+      }
+
+      this.#setScreenshare(room.localParticipant.isScreenShareEnabled);
+      this.#armScreenShareEnded(room, localTrack);
+      this.#watchForSoftwareFallback(localTrack, codecDecision);
+
+      await this.#applyShareChoice(
+        room,
+        localTrack,
+        choice.qualityName,
+        choice.audio,
+        false,
+      );
+
+      return true;
+    } catch (err) {
+      // NotAllowedError/AbortError here just means the picker was dismissed
+      // -- still a real attempt that reached setScreenShareEnabled(true) and
+      // failed, so it counts against the budget same as any other failure.
+      console.warn("[rtc] browser screen share recovery failed", err);
       return false;
     } finally {
       this.#recovering = false;
@@ -2252,11 +2707,16 @@ class Voice {
     if (!localTrack) {
       if (torndown) {
         // Committed (the old capture is gone) but nothing replaced it --
-        // match toggleScreenshare's own deliberate-stop bookkeeping and
-        // sound rather than leaving a stale choice and recovery budget
-        // around, or no audible sign that the share actually ended.
+        // match toggleScreenshare's own deliberate-stop bookkeeping in full
+        // (see that method's stop branch) rather than leaving a stale
+        // choice, recovery budget, armed listeners, or pending reacquire
+        // timer around, or no audible sign that the share actually ended.
         this.#lastShareChoice = undefined;
         this.#recoveryAttempts = [];
+        this.#armedShareEndedPublication = undefined;
+        this.#armedScreenShareUpstreamTrack = undefined;
+        this.#browserReacquireAttempted = false;
+        this.#stopReacquireBackoff();
         this.sound.playSound("streamEnd");
       }
       // Otherwise: acquiring failed or was cancelled before anything was
@@ -2273,8 +2733,11 @@ class Voice {
     // A freshly picked window starts with a clean slate: the previous
     // source's recovery budget has nothing to do with how healthy this new
     // one is, and inheriting it could refuse to recover a perfectly fine
-    // window because a *different* one died twice a minute ago.
+    // window because a *different* one died twice a minute ago. Same
+    // reasoning for the silent-reacquire budget: a source the user just
+    // picked by hand has not spent its one browser-side re-acquire yet.
     this.#recoveryAttempts = [];
+    this.#browserReacquireAttempted = false;
 
     const screenAudioTrack = room.localParticipant.getTrackPublication(
       Track.Source.ScreenShareAudio,
@@ -2332,8 +2795,16 @@ class Voice {
           onCancel: async () => {
             await room.localParticipant.setScreenShareEnabled(false);
             this.#setScreenshare(room.localParticipant.isScreenShareEnabled);
+            // Same deliberate-stop bookkeeping as the torndown/no-replacement
+            // branch above and toggleScreenshare's own stop branch -- this is
+            // the user backing out of the leak-risk dialog entirely, ending
+            // the share for real, not a source swap.
             this.#lastShareChoice = undefined;
             this.#recoveryAttempts = [];
+            this.#armedShareEndedPublication = undefined;
+            this.#armedScreenShareUpstreamTrack = undefined;
+            this.#browserReacquireAttempted = false;
+            this.#stopReacquireBackoff();
             this.sound.playSound("streamEnd");
             resolve();
           },
