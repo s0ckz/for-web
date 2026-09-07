@@ -1087,6 +1087,22 @@ export function ScreenShareBadge(props: { sample: ScreenShareSample }) {
         // this race for good, regardless of what the timer is doing.
         const notSending = () => !fpsKnown() && graceElapsed();
 
+        // Whether `summary().fps` is an actual number to print, as opposed
+        // to `fpsKnown()` above (whether frames have been *sent* at all).
+        // These sound like the same question but aren't: `framesSent` is a
+        // cumulative counter that can already be positive on the very first
+        // sample, while `fps` stays `undefined` until either Chromium has
+        // populated `outbound.framesPerSecond` or a second sample lets
+        // `sampleOutboundVideo` derive a rate from the delta -- neither of
+        // which has necessarily happened yet on that first sample. Printing
+        // the fps segment off `fpsKnown()` alone is exactly how this badge
+        // used to render the literal "undefined fps". `fpsKnown()` itself
+        // must stay framesSent-based, though: it's also what defeats
+        // `notSending` above, and gating that on a computed rate instead
+        // would flip a share into the error state on any single sample that
+        // failed to compute one, not just a genuinely dead share.
+        const fpsValueKnown = () => typeof summary().fps === "number";
+
         return (
           <Show
             when={!notSending()}
@@ -1108,19 +1124,43 @@ export function ScreenShareBadge(props: { sample: ScreenShareSample }) {
                 }
               >
                 <Symbol size={14}>
-                  {summary().hardware === false ? "memory" : "bolt"}
+                  {/*
+                   * `bolt` asserts hardware encoding, so it must not be the
+                   * fallback for "unknown" -- `hardware` is `undefined`
+                   * whenever Chromium hasn't reported `powerEfficientEncoder`
+                   * yet, which on some builds is permanent, not just a
+                   * startup transient (see the doc comment above). `videocam`
+                   * reads as plain "encoding" with no hw/sw claim either way.
+                   */}
+                  {summary().hardware === true
+                    ? "bolt"
+                    : summary().hardware === false
+                      ? "memory"
+                      : "videocam"}
                 </Symbol>
                 <Show when={hardwareKnown()}>
                   <span>{summary().hardware ? "hw" : "sw"}</span>
                 </Show>
-                <Show when={hardwareKnown() && fpsKnown()}>
+                {/*
+                 * Each dot separates two segments that are *both* actually
+                 * rendering -- guard it on the segment before it having
+                 * rendered, not just the one after, so a segment that got
+                 * skipped (e.g. `fps` when only `framesSent`, not the rate
+                 * itself, is known yet) never leaves a leading dot in front
+                 * of whatever renders next.
+                 */}
+                <Show when={hardwareKnown() && fpsValueKnown()}>
                   <BadgeDot />
                 </Show>
-                <Show when={fpsKnown()}>
+                <Show when={fpsValueKnown()}>
                   <span>{`${summary().fps} fps`}</span>
                 </Show>
                 <Show
-                  when={summary().limitedBy && summary().limitedBy !== "none"}
+                  when={
+                    (hardwareKnown() || fpsValueKnown()) &&
+                    summary().limitedBy &&
+                    summary().limitedBy !== "none"
+                  }
                 >
                   <BadgeDot />
                   <span>{summary().limitedBy}</span>
