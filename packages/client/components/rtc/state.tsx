@@ -3,6 +3,7 @@ import {
   batch,
   createContext,
   createEffect,
+  createRoot,
   createSignal,
   JSX,
   Setter,
@@ -761,6 +762,15 @@ class Voice {
   private voiceProcessor?: VoiceProcessor;
   #localSpeakingMeter?: () => void;
 
+  /**
+   * Disposer for the `createRoot` that owns `vidTracks`'s `useTracks` call
+   * (see {@link connect}). `connect` runs outside any Solid render tree, so
+   * without an explicit root the effect and rxjs subscription `useTracks`
+   * creates would never be torn down -- rejoining a call would just keep
+   * stacking more of them. Cleared by {@link disconnect}.
+   */
+  #disposeVidTracks?: () => void;
+
   /** What the last successful share was started with, for recovery */
   #lastShareChoice?: ShareChoice;
   #recoveryAttempts: number[] = [];
@@ -968,13 +978,16 @@ class Voice {
       },
     });
 
-    this.vidTracks = useTracks(
-      [
-        { source: Track.Source.Camera, withPlaceholder: true },
-        { source: Track.Source.ScreenShare, withPlaceholder: false },
-      ],
-      { room, onlySubscribed: false },
-    );
+    createRoot((dispose) => {
+      this.#disposeVidTracks = dispose;
+      this.vidTracks = useTracks(
+        [
+          { source: Track.Source.Camera, withPlaceholder: true },
+          { source: Track.Source.ScreenShare, withPlaceholder: false },
+        ],
+        { room, onlySubscribed: false },
+      );
+    });
 
     batch(() => {
       this.#setRoom(room);
@@ -1166,6 +1179,9 @@ class Voice {
 
       room.removeAllListeners();
       room.disconnect();
+
+      this.#disposeVidTracks?.();
+      this.#disposeVidTracks = undefined;
 
       batch(() => {
         this.#setState("READY");

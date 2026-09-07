@@ -3,6 +3,7 @@ import {
   TrackReference,
   useEnsureParticipant,
   useIsMuted,
+  useMediaTrackBySourceOrName,
   useTrackRefContext,
   VideoTrack,
 } from "solid-livekit-components";
@@ -90,6 +91,16 @@ export function ParticipantTile(props: TileProps) {
     isSelf() ||
     state.voice.getScreenShareWatching(participant.identity);
 
+  // The publication read reactively, rather than `track.publication`'s
+  // one-time snapshot from context: a subscribe/unsubscribe cycle or a
+  // reconnect can hand the participant a new `TrackPublication` instance
+  // for the same source, and the effect below needs to see that to drive
+  // (and clean up after) the *current* one.
+  const { publication: trackPublication } = useMediaTrackBySourceOrName({
+    participant,
+    source: track.source,
+  });
+
   /**
    * Drive the actual LiveKit subscription from that choice, so declining to
    * watch a screen share genuinely stops the server sending video rather than
@@ -100,16 +111,26 @@ export function ParticipantTile(props: TileProps) {
    * The room connects with autoSubscribe: false, so every remote track needs
    * an explicit setSubscribed call somewhere, and this effect is it for both
    * kinds: VideoTrack's own subscription management is turned off below.
+   *
+   * Unmounting this tile (a PiP/float swap, a channel change) must not leave
+   * a share subscribed and decoding with nothing on screen watching it, so
+   * the cleanup below un-desires it again -- unless it was never this
+   * effect's to manage (self) or something else already dropped it.
    */
   createEffect(() => {
     if (isSelf()) return;
-    const publication = track.publication as RemoteTrackPublication | undefined;
+    const publication = trackPublication() as
+      | RemoteTrackPublication
+      | undefined;
     if (typeof publication?.setSubscribed !== "function") return;
     try {
       publication.setSubscribed(isWatching());
     } catch {
       /* publication went away */
     }
+    onCleanup(() => {
+      if (!isSelf() && publication?.isDesired) publication.setSubscribed(false);
+    });
   });
 
   /**
