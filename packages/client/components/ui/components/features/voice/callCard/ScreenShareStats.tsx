@@ -1115,7 +1115,16 @@ export function ScreenShareBadge(props: { sample: ScreenShareSample }) {
           >
             <Badge>
               <Show
-                when={hardwareKnown() || fpsKnown()}
+                // Gate on `fpsValueKnown()`, not `fpsKnown()`: this decides
+                // whether the segments below have anything printable to show,
+                // and `fpsKnown()` (`framesSent > 0`) can be true before
+                // `summary().fps` has a value (see `fpsValueKnown` above).
+                // Gating on `fpsKnown()` here let that state through with
+                // hardware still unknown too, rendering a bare icon with no
+                // text at all -- unlike `notSending`, which must stay on
+                // `fpsKnown()` so a single failed-rate sample can't flip a
+                // genuinely sending share into the error badge.
+                when={hardwareKnown() || fpsValueKnown()}
                 fallback={
                   <>
                     <Symbol size={14}>hourglass_top</Symbol>
