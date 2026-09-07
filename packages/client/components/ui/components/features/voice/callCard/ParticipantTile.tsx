@@ -8,8 +8,7 @@ import {
   VideoTrack,
 } from "solid-livekit-components";
 
-import type { RemoteTrackPublication } from "livekit-client";
-import { Track } from "livekit-client";
+import { RemoteTrackPublication, Track } from "livekit-client";
 import { cva } from "styled-system/css";
 import { styled } from "styled-system/jsx";
 
@@ -131,6 +130,47 @@ export function ParticipantTile(props: TileProps) {
     onCleanup(() => {
       if (!isSelf() && publication?.isDesired) publication.setSubscribed(false);
     });
+  });
+
+  /**
+   * Ask the SFU for a lower temporal layer on watched vp9 screen shares that
+   * are in the strip (this tile is not the focused one) -- pure decode-load
+   * relief, not a pause: `setVideoFPS` only ever writes the `fps` field of an
+   * `UpdateTrackSettings` sent for an already-subscribed track (see
+   * `RemoteTrackPublication.emitTrackUpdate`/`isManualOperationAllowed` in
+   * livekit-client), it never touches `disabled`/`isEnabled`. The strip/focus
+   * split reuses the existing focus concept (`props.focus`, set only by
+   * `FocusedParticipant`) -- no viewport or visibility detection.
+   *
+   * vp9-only: h264/h265 screen shares (the common case -- see
+   * `screenSharePublishOptions` in `rtc/state.tsx`) are unaffected, because
+   * LiveKit's SFU only has independent temporal sub-layers to drop frames
+   * from when the publisher used VP9's SVC encoding; h264/h265 here are
+   * single-layer (`screenSharePublishOptions` disables simulcast for them),
+   * so there is nothing for a subscriber-side fps ask to select between.
+   *
+   * `setVideoFPS(0)` on focus is the reset: `RemoteTrackPublication.fps`
+   * starts `undefined` and only this effect ever changes it, and the `fps`
+   * field on `UpdateTrackSettings` is a plain (non-`optional`) proto3 uint32
+   * -- implicit presence means a `0` is not put on the wire, so `fps: 0`
+   * serializes identically to `fps` never having been set, i.e. genuinely
+   * unlimited rather than "capped at some large number".
+   *
+   * Gated on `isWatching()` (mirrors the subscription effect above) so this
+   * doesn't fire while `isManualOperationAllowed()` would reject it anyway
+   * (unsubscribed) and log a warning.
+   */
+  createEffect(() => {
+    if (!isScreenShare()) return;
+    const publication = trackPublication();
+    if (!(publication instanceof RemoteTrackPublication)) return;
+    if (publication.mimeType?.toLowerCase() !== "video/vp9") return;
+    if (!isWatching()) return;
+    try {
+      publication.setVideoFPS(props.focus ? 0 : 15);
+    } catch {
+      /* publication went away */
+    }
   });
 
   /**

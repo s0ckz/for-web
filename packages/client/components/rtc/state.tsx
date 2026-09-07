@@ -958,6 +958,20 @@ class Voice {
     this.device.setWakeLocked();
 
     const room = new Room({
+      // livekit-client defaults this to false. It force-enables it at
+      // publish time whenever a track's resolved primary video codec
+      // differs from its backup codec (LocalParticipant.publish, "multi-codec
+      // simulcast requires dynacast") -- which `screenSharePublishOptions`
+      // above triggers for most screen shares (vp9/h264 primary against a
+      // vp8/h264 backup), but NOT when the primary codec itself resolves to
+      // plain vp8 (matches the vp8 backup, so the mismatch check is false),
+      // and NOT for camera publishes, which go through `setCameraEnabled`
+      // with livekit-client's own `publishDefaults` (videoCodec: 'vp8',
+      // backupCodec: true -> {codec: 'vp8'} -- same codec, same gap). Setting
+      // it explicitly here closes both gaps instead of relying on an
+      // incidental codec-mismatch side effect. Does NOT enable
+      // `adaptiveStream` -- that stays off; see the perf-plan decisions.
+      dynacast: true,
       audioCaptureDefaults: {
         deviceId: this.#settings.preferredAudioInputDevice,
         echoCancellation: this.#settings.echoCancellation,
