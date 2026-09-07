@@ -526,6 +526,12 @@ const Grid = styled("div", {
         flexDirection: "column",
         height: `max(20%, ${TILE_MIN_FOCUS_HEIGHT})`,
         minHeight: 0,
+        // The strip's height flips between this and `show: false`'s `0`
+        // (below) whenever the show/hide-others chevron is toggled --
+        // animate that instead of snapping, matching the focused tile's own
+        // transition (`ParticipantTile.tsx`'s `getHeight()`, which resizes
+        // in lockstep via `--vc-strip-h`).
+        transition: "height .3s ease",
 
         "& .vc_tile": {
           width: "auto",

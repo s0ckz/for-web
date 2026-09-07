@@ -37,7 +37,21 @@ const PAD = 16,
   PAD_X = `${PAD}px`,
   PAD_Y = `${PAD + 56}px`;
 
-const callCardContext = createContext<(info?: Info) => void>();
+type CallCardContext = {
+  setInfo: (info?: Info) => void;
+  /**
+   * Whether a `VoiceChannelCallCardMount` marker for the *current call's*
+   * channel exists anywhere right now -- independent of whether it has
+   * measured itself yet. Kept separate from `info()` itself because `info()`
+   * reads `undefined` both when no such marker exists and, for at least the
+   * first reactive pass, when one exists but has not measured its rect yet
+   * (see that marker's `updateInfo`) -- and only the former should send the
+   * card flying to the corner (below).
+   */
+  setMarkerPresent: (present: boolean) => void;
+};
+
+const callCardContext = createContext<CallCardContext>();
 
 /** Voice call card context */
 export function VoiceCallCardContext(props: { children: JSX.Element }) {
@@ -46,6 +60,7 @@ export function VoiceCallCardContext(props: { children: JSX.Element }) {
 
   const [mode, setMode] = createSignal<Mode>();
   const [info, setInfo] = createSignal<Info>();
+  const [markerPresent, setMarkerPresent] = createSignal(false);
 
   let ref: HTMLDivElement | undefined,
     events: AbortController | null,
@@ -122,7 +137,18 @@ export function VoiceCallCardContext(props: { children: JSX.Element }) {
       const y = inf?.pos.y ?? ref.getBoundingClientRect().y;
       sty.transform = `translate(${innerWidth + 50}px, ${y}px)`;
       setMode();
-    } else if (!mode()) setFloat("tr");
+    } else if (
+      !mode() &&
+      // `inf?.pos` is truthy here only because the branch above rejected it
+      // over the drawer, not because it is missing -- that always floats,
+      // same as before. Otherwise this only floats for a channel with no
+      // marker mounted anywhere (`!markerPresent()`); a marker that is
+      // mounted but simply has not measured itself yet must not send the
+      // card flying to the corner right before its real position arrives.
+      (inf?.pos || !markerPresent())
+    ) {
+      setFloat("tr");
+    }
   });
 
   const channel = () => info()?.channel;
@@ -167,7 +193,7 @@ export function VoiceCallCardContext(props: { children: JSX.Element }) {
   });
 
   return (
-    <callCardContext.Provider value={setInfo}>
+    <callCardContext.Provider value={{ setInfo, setMarkerPresent }}>
       {props.children}
       <Portal mount={document.getElementById("floating")! as HTMLDivElement}>
         <Float
@@ -252,7 +278,7 @@ export function VoiceChannelCallCardMount(props: {
 }) {
   const voice = useVoice();
   const state = useState();
-  const setInfo = useContext(callCardContext)!;
+  const { setInfo, setMarkerPresent } = useContext(callCardContext)!;
   let ref: HTMLDivElement | undefined;
 
   // The floating card is positioned from this rect, and with the chat hidden it
@@ -263,12 +289,11 @@ export function VoiceChannelCallCardMount(props: {
 
   // `getBoundingClientRect()` forces a synchronous layout, so it must only
   // ever run from the resize observer below (an actual size/position
-  // change), not from `updateInfo` itself -- `updateInfo` also re-runs on
-  // every reactive change unrelated to layout (`voice.channel()`,
-  // `state.appDrawer()`, `props.expanded`), and re-measuring on each of
-  // those would force a reflow on renders that never moved anything. Cached
-  // here instead, and `undefined` until the observer's first callback --
-  // which fires once immediately on `observe()` -- has measured it.
+  // change) plus the one seeding call in `onMount` -- not from `updateInfo`
+  // itself, which also re-runs on every reactive change unrelated to layout
+  // (`voice.channel()`, `state.appDrawer()`, `props.expanded`), and
+  // re-measuring on each of those would force a reflow on renders that never
+  // moved anything. Cached here instead.
   let lastRect: DOMRect | undefined;
 
   function updateInfo() {
@@ -276,6 +301,15 @@ export function VoiceChannelCallCardMount(props: {
     const drawer = state.appDrawer()?.state;
     const expanded = props.expanded;
     const elsewhere = !!vc && vc.id !== props.channel.id;
+
+    // Reported unconditionally, ahead of the `pos` guard below: this is "does
+    // a marker for the active call's channel exist", not "has it measured
+    // itself yet", so it must not wait on `lastRect`. The consumer effect in
+    // `VoiceCallCardContext` uses this to tell a channel with no marker
+    // mounted at all (which should float) apart from one whose marker simply
+    // has not reported its rect yet (which should wait).
+    setMarkerPresent(!elsewhere);
+
     const pos = lastRect;
     if (!pos) return;
 
@@ -308,15 +342,41 @@ export function VoiceChannelCallCardMount(props: {
   createEffect(updateInfo);
 
   onMount(() => {
-    const target = ref?.parentElement;
-    if (!target) return;
+    if (!ref) return;
 
-    createResizeObserver(target, () => {
+    // Seed synchronously, before relying on either resize observer below:
+    // `createEffect(updateInfo)` above is registered before this `onMount`
+    // and so runs first, seeing `lastRect` still `undefined` and bailing out
+    // before ever calling `setInfo` -- and a `ResizeObserver`'s own first
+    // callback is always asynchronous, arriving at least a frame later. Left
+    // alone, that leaves `info()` reporting nothing for a real, visible
+    // moment on every mount (`markerPresent()` above is unaffected -- it is
+    // set before this early return, not after it). Measuring here -- the one
+    // call in this file made outside a resize-observer callback -- and
+    // calling `updateInfo()` directly closes that gap before the browser
+    // ever paints.
+    lastRect = ref.getBoundingClientRect();
+    updateInfo();
+
+    // Hiding the chat does not resize `<main>` (this marker's parent) -- it
+    // is `flex-grow: 1; overflow: hidden` inside a fixed-height row, so its
+    // border box never changes. What actually resizes is this marker itself,
+    // which `expanded` (below) gives `flex: 1; min-height: 0` so it grows to
+    // fill the space the chat used to occupy. Observing only the parent, as
+    // before, made that resize invisible here, so a stale, pre-expansion
+    // rect kept being republished with `expanded: true` -- collapsing the
+    // card instead of growing it. Observing the marker directly (alongside
+    // the parent, still needed for position-only moves such as the drawer
+    // resizing, which never touch this element's own box) covers its own
+    // size changes too. A single observer over both elements, rather than
+    // one each, since the callback does the same thing either way.
+    createResizeObserver([ref, ref.parentElement], () => {
       lastRect = ref!.getBoundingClientRect();
       updateInfo();
     });
   });
   onCleanup(() => {
+    setMarkerPresent(false);
     setInfo();
   });
 

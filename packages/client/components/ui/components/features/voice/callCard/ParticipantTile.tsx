@@ -598,6 +598,17 @@ export const tile = cva({
         top: 0,
         left: 0,
         right: 0,
+        // `bottom: 0` alongside `top: 0` plus an explicit `height` (always
+        // set inline by `getHeight()` while focused, see below) over-
+        // constrains the box -- per the absolute-positioning spec, `auto`
+        // margins then split whatever space `height` leaves over between
+        // `margin-top`/`margin-bottom`, centering the tile vertically
+        // instead of leaving it pinned to the top. `width` stays `auto`
+        // (unaffected: with `left`/`right` both already `0` and `width:
+        // auto`, an `auto` margin resolves to `0` on that axis instead of
+        // trying to center it too).
+        bottom: 0,
+        margin: "auto",
         width: "auto",
         maxWidth: "none",
       },
