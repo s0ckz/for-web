@@ -1,4 +1,4 @@
-import { createSignal, onCleanup, Show } from "solid-js";
+import { Accessor, createSignal, onCleanup, Show } from "solid-js";
 
 import type { TrackReference } from "solid-livekit-components";
 
@@ -7,6 +7,8 @@ import { isScreenShareLinkWeak } from "@revolt/rtc";
 import { Key } from "@solid-primitives/keyed";
 import { type TrackPublication, Track } from "livekit-client";
 import { styled } from "styled-system/jsx";
+
+import { Symbol } from "@revolt/ui/components/utils/Symbol";
 
 /**
  * Statistics for a screen share.
@@ -60,13 +62,39 @@ function resolveAudioCodec(
   return primary;
 }
 
-export function ScreenShareStats(props: {
-  trackRef: TrackReference;
-  username: string;
-  onClose?: () => void;
-}) {
+/**
+ * Live summary of the local sender's own encode, for the compact badge
+ * `ParticipantTile.tsx` shows on the sharer's own tile -- derived from the
+ * same sample as the "Encoder"/"Send rate"/"Limited by" rows below rather
+ * than a second `getStats()` read.
+ */
+type OwnSummary = {
+  /** Chromium's own hardware-vs-software verdict for this encode, when it reports one. */
+  hardware?: boolean;
+  /** Most recent send rate, already rounded. */
+  fps?: number;
+  /** `RTCOutboundRtpStreamStats.qualityLimitationReason`, verbatim ("none" included). */
+  limitedBy?: string;
+};
+
+/**
+ * One sampler shared between the full "stats for nerds" panel and the
+ * sharer's own-tile badge, so a self-share is only ever polled by
+ * `getStats()` once a second, not once per consumer.
+ *
+ * Everything that used to be local state inside the `ScreenShareStats`
+ * component now lives in this factory instead, so `ParticipantTile.tsx` can
+ * create one instance for the sharer's own tile -- outliving the panel being
+ * opened/closed -- and hand it to `ScreenShareStats` (via the `sample`
+ * prop) and `ScreenShareBadge` alike. Every other caller (watching someone
+ * else's share) still has `ScreenShareStats` create its own, exactly as
+ * before.
+ * @param trackRef The screen-share track to sample
+ * @returns The sampled rows, whether this is your own share, and the badge's summary
+ */
+export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
   const [rows, setRows] = createSignal<Row[]>([]);
-  const [copied, setCopied] = createSignal(false);
+  const [ownSummary, setOwnSummary] = createSignal<OwnSummary | undefined>();
 
   // Cumulative counters, so we can turn them into rates.
   let lastBytes = 0;
@@ -75,6 +103,7 @@ export function ScreenShareStats(props: {
   let lastFramesSent = 0;
   let lastTotalEncodeTime = 0;
   let lastFramesEncoded = 0;
+  let lastSourceFrames = 0;
 
   // Audio has its own sender/receiver, separate from the video ones above,
   // so it needs its own byte counter and its own timestamp to derive a rate
@@ -85,7 +114,7 @@ export function ScreenShareStats(props: {
   let lastInsertedSamplesForDeceleration = 0;
   let lastRemovedSamplesForAcceleration = 0;
 
-  const sending = () => isLocal(props.trackRef.participant);
+  const sending = () => isLocal(trackRef().participant);
 
   /**
    * Video rows for your own share: what the capturer produced, what the
@@ -94,18 +123,21 @@ export function ScreenShareStats(props: {
    * never hides whether audio is still flowing.
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const sampleOutboundVideo = async (track: any): Promise<Row[]> => {
+  const sampleOutboundVideo = async (
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    track: any,
+  ): Promise<{ rows: Row[]; summary?: OwnSummary }> => {
     const sender: RTCRtpSender | undefined = track?.sender;
 
     if (!sender?.getStats) {
-      return [{ label: "Status", value: "not publishing" }];
+      return { rows: [{ label: "Status", value: "not publishing" }] };
     }
 
     let report: RTCStatsReport;
     try {
       report = await sender.getStats();
     } catch {
-      return [{ label: "Status", value: "stats unavailable" }];
+      return { rows: [{ label: "Status", value: "stats unavailable" }] };
     }
 
     /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -135,7 +167,7 @@ export function ScreenShareStats(props: {
     });
 
     if (!outbound) {
-      return [{ label: "Status", value: "no video being sent" }];
+      return { rows: [{ label: "Status", value: "no video being sent" }] };
     }
 
     const now = performance.now();
@@ -164,11 +196,36 @@ export function ScreenShareStats(props: {
         ((totalEncodeTime - lastTotalEncodeTime) / framesEncodedDelta) * 1000;
     }
 
+    // How many frames the capturer produced but the encoder never turned
+    // into an encoded frame, as a rate rather than a raw delta -- e.g. the
+    // encoder falling behind under CPU pressure, or discarding a frame that
+    // arrived while it was still working the previous one.
+    // `media-source.frames` is the capturer's own cumulative count;
+    // `outbound-rtp.framesEncoded` (already read above, as `framesEncoded`)
+    // is how many of those the encoder actually finished. Both are
+    // cumulative counters, so this reads their *delta* over the sample
+    // window, same as every other rate here. Never negative: a source stat
+    // that arrives a tick late (or a genuine encoder catch-up burst) must
+    // read as "nothing dropped", not a negative fps.
+    const sourceFrames: number | undefined = source?.frames;
+    let droppedBeforeEncode: number | undefined;
+    if (lastAt && sourceFrames !== undefined) {
+      const seconds = (now - lastAt) / 1000;
+      if (seconds > 0) {
+        const producedDelta = sourceFrames - lastSourceFrames;
+        droppedBeforeEncode = Math.max(
+          0,
+          (producedDelta - framesEncodedDelta) / seconds,
+        );
+      }
+    }
+
     lastBytes = bytes;
     lastAt = now;
     lastFramesSent = framesSent;
     lastTotalEncodeTime = totalEncodeTime;
     lastFramesEncoded = framesEncoded;
+    lastSourceFrames = sourceFrames ?? lastSourceFrames;
 
     const codec = codecs.get(outbound.codecId);
 
@@ -204,99 +261,129 @@ export function ScreenShareStats(props: {
       .map((k) => `${k} ${(durations[k] as number).toFixed(1)}s`)
       .join(", ");
 
-    return [
-      {
-        label: "Capture",
-        value: source?.width ? `${source.width}x${source.height}` : NA,
-      },
-      {
-        label: "Capture rate",
-        value:
-          source?.framesPerSecond !== undefined
-            ? `${Math.round(source.framesPerSecond)} fps`
+    // Chromium's own hardware-vs-software verdict for this encode, when the
+    // browser reports it -- more reliable than guessing from
+    // `encoderImplementation`'s free-text name, which varies by platform and
+    // codec and was never meant to be parsed.
+    const hardware: boolean | undefined =
+      typeof outbound.powerEfficientEncoder === "boolean"
+        ? outbound.powerEfficientEncoder
+        : undefined;
+
+    return {
+      rows: [
+        {
+          label: "Capture",
+          value: source?.width ? `${source.width}x${source.height}` : NA,
+        },
+        {
+          label: "Capture rate",
+          value:
+            source?.framesPerSecond !== undefined
+              ? `${Math.round(source.framesPerSecond)} fps`
+              : NA,
+        },
+        {
+          label: "Sending",
+          value: outbound.frameWidth
+            ? `${outbound.frameWidth}x${outbound.frameHeight}`
             : NA,
-      },
-      {
-        label: "Sending",
-        value: outbound.frameWidth
-          ? `${outbound.frameWidth}x${outbound.frameHeight}`
-          : NA,
-      },
-      { label: "Send rate", value: fps ? `${Math.round(fps)} fps` : NA },
-      { label: "Bitrate", value: formatBitrate(bitrate) },
-      {
-        label: "Codec",
-        value: codec?.mimeType ? codec.mimeType.replace("video/", "") : NA,
-      },
-      // Lets the CBP assumption behind the h264 hardware probe (see
-      // screenShareCodec in rtc/state.tsx) be checked empirically: this is
-      // the profile actually negotiated with the SFU, not just the one we
-      // asked for.
-      { label: "Codec params", value: codec?.sdpFmtpLine ?? NA },
-      { label: "Encoder", value: outbound.encoderImplementation ?? NA },
-      {
-        label: "Encode time",
-        value:
-          encodeTimeMs !== undefined
-            ? targetFrameRate
-              ? `${encodeTimeMs.toFixed(1)} ms / ${(1000 / targetFrameRate).toFixed(1)} ms`
-              : `${encodeTimeMs.toFixed(1)} ms`
+        },
+        { label: "Send rate", value: fps ? `${Math.round(fps)} fps` : NA },
+        { label: "Bitrate", value: formatBitrate(bitrate) },
+        {
+          label: "Codec",
+          value: codec?.mimeType ? codec.mimeType.replace("video/", "") : NA,
+        },
+        // Lets the CBP assumption behind the h264 hardware probe (see
+        // screenShareCodec in rtc/state.tsx) be checked empirically: this is
+        // the profile actually negotiated with the SFU, not just the one we
+        // asked for.
+        { label: "Codec params", value: codec?.sdpFmtpLine ?? NA },
+        { label: "Encoder", value: outbound.encoderImplementation ?? NA },
+        {
+          label: "Encode time",
+          value:
+            encodeTimeMs !== undefined
+              ? targetFrameRate
+                ? `${encodeTimeMs.toFixed(1)} ms / ${(1000 / targetFrameRate).toFixed(1)} ms`
+                : `${encodeTimeMs.toFixed(1)} ms`
+              : NA,
+        },
+        { label: "Scalability", value: outbound.scalabilityMode ?? NA },
+        {
+          label: "Limited by",
+          value: outbound.qualityLimitationReason ?? NA,
+        },
+        { label: "Limited for", value: limitBreakdown || "never" },
+        {
+          label: "Resolution changes",
+          value:
+            outbound.qualityLimitationResolutionChanges !== undefined
+              ? `${outbound.qualityLimitationResolutionChanges}`
+              : NA,
+        },
+        {
+          label: "Frames sent",
+          value: `${framesSent} of ${outbound.framesEncoded ?? 0} encoded`,
+        },
+        {
+          label: "Dropped before encode",
+          value:
+            droppedBeforeEncode !== undefined
+              ? `${Math.round(droppedBeforeEncode)} fps`
+              : NA,
+        },
+        {
+          label: "Packets lost",
+          value:
+            remoteInbound?.packetsLost !== undefined
+              ? `${remoteInbound.packetsLost}`
+              : NA,
+        },
+        {
+          label: "Round trip",
+          value:
+            remoteInbound?.roundTripTime !== undefined
+              ? `${Math.round(remoteInbound.roundTripTime * 1000)} ms`
+              : NA,
+        },
+        {
+          label: "Link capacity",
+          value: candidatePair?.availableOutgoingBitrate
+            ? formatBitrate(candidatePair.availableOutgoingBitrate)
             : NA,
-      },
-      { label: "Scalability", value: outbound.scalabilityMode ?? NA },
-      {
-        label: "Limited by",
-        value: outbound.qualityLimitationReason ?? NA,
-      },
-      { label: "Limited for", value: limitBreakdown || "never" },
-      {
-        label: "Frames sent",
-        value: `${framesSent} of ${outbound.framesEncoded ?? 0} encoded`,
-      },
-      {
-        label: "Packets lost",
-        value:
-          remoteInbound?.packetsLost !== undefined
-            ? `${remoteInbound.packetsLost}`
+        },
+        {
+          // Same check as the one-time weak-link warning in rtc/state.tsx
+          // (see isScreenShareLinkWeak), kept visible here for as long as the
+          // share runs rather than shown once and then gone. Reads only stats
+          // already sampled above -- the bitrate ceiling from the sender's own
+          // parameters (the actual ceiling in force, not just what the current
+          // ScreenShareQualityName implies), "Link capacity", and the
+          // bandwidth-limited share of "Limited for".
+          label: "Weak link",
+          value: maxBitrate
+            ? isScreenShareLinkWeak(
+                maxBitrate,
+                candidatePair?.availableOutgoingBitrate,
+                durations.bandwidth,
+              )
+              ? "yes"
+              : "no"
             : NA,
+        },
+        {
+          label: "NACK / PLI",
+          value: `${outbound.nackCount ?? 0} / ${outbound.pliCount ?? 0}`,
+        },
+      ],
+      summary: {
+        hardware,
+        fps: fps !== undefined ? Math.round(fps) : undefined,
+        limitedBy: outbound.qualityLimitationReason,
       },
-      {
-        label: "Round trip",
-        value:
-          remoteInbound?.roundTripTime !== undefined
-            ? `${Math.round(remoteInbound.roundTripTime * 1000)} ms`
-            : NA,
-      },
-      {
-        label: "Link capacity",
-        value: candidatePair?.availableOutgoingBitrate
-          ? formatBitrate(candidatePair.availableOutgoingBitrate)
-          : NA,
-      },
-      {
-        // Same check as the one-time weak-link warning in rtc/state.tsx
-        // (see isScreenShareLinkWeak), kept visible here for as long as the
-        // share runs rather than shown once and then gone. Reads only stats
-        // already sampled above -- the bitrate ceiling from the sender's own
-        // parameters (the actual ceiling in force, not just what the current
-        // ScreenShareQualityName implies), "Link capacity", and the
-        // bandwidth-limited share of "Limited for".
-        label: "Weak link",
-        value: maxBitrate
-          ? isScreenShareLinkWeak(
-              maxBitrate,
-              candidatePair?.availableOutgoingBitrate,
-              durations.bandwidth,
-            )
-            ? "yes"
-            : "no"
-          : NA,
-      },
-      {
-        label: "NACK / PLI",
-        value: `${outbound.nackCount ?? 0} / ${outbound.pliCount ?? 0}`,
-      },
-    ];
+    };
   };
 
   /**
@@ -761,8 +848,8 @@ export function ScreenShareStats(props: {
     if (document.hidden) return;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const track = props.trackRef.publication?.track as any;
-    const audioPub = props.trackRef.participant.getTrackPublication(
+    const track = trackRef().publication?.track as any;
+    const audioPub = trackRef().participant.getTrackPublication(
       Track.Source.ScreenShareAudio,
     );
 
@@ -783,17 +870,21 @@ export function ScreenShareStats(props: {
     // previous rows for one tick and recovering on the next is the right
     // failure mode for a 1 s diagnostic; going permanently stale is not.
     try {
-      const [videoRows, audioRows] = sending()
-        ? await Promise.all([
-            sampleOutboundVideo(track),
-            sampleOutboundAudio(audioPub),
-          ])
-        : await Promise.all([
-            sampleInboundVideo(track),
-            sampleInboundAudio(audioPub),
-          ]);
-
-      setRows([...videoRows, ...audioRows]);
+      if (sending()) {
+        const [video, audioRows] = await Promise.all([
+          sampleOutboundVideo(track),
+          sampleOutboundAudio(audioPub),
+        ]);
+        setRows([...video.rows, ...audioRows]);
+        setOwnSummary(video.summary);
+      } else {
+        const [videoRows, audioRows] = await Promise.all([
+          sampleInboundVideo(track),
+          sampleInboundAudio(audioPub),
+        ]);
+        setRows([...videoRows, ...audioRows]);
+        setOwnSummary(undefined);
+      }
     } catch {
       // Leave the last good rows in place; the next tick re-samples.
     }
@@ -802,6 +893,45 @@ export function ScreenShareStats(props: {
   sample();
   const timer = setInterval(sample, 1000);
   onCleanup(() => clearInterval(timer));
+
+  return { rows, sending, ownSummary };
+}
+
+/** A running sampler created by {@link createScreenShareSample}. */
+export type ScreenShareSample = ReturnType<typeof createScreenShareSample>;
+
+export function ScreenShareStats(props: {
+  trackRef: TrackReference;
+  username: string;
+  onClose?: () => void;
+  /**
+   * An already-running sample to read instead of starting a new
+   * `getStats()` poll on the same sender.
+   *
+   * Used for the sharer's own tile: `ParticipantTile.tsx` starts exactly one
+   * `createScreenShareSample` there (so its compact badge keeps reading live
+   * numbers whether or not this panel is open) and passes it in here rather
+   * than letting this panel poll the same sender a second time. Every other
+   * caller (watching someone else's share) leaves this unset, and the panel
+   * samples for itself exactly as before.
+   */
+  sample?: ScreenShareSample;
+}) {
+  const [copied, setCopied] = createSignal(false);
+
+  // A deliberate one-time read, not the staleness-prone pattern
+  // eslint-plugin-solid's reactivity rule usually flags this shape for:
+  // `props.sample` is a `ScreenShareSample` (an already-running sampler) or
+  // `undefined`, set once by the parent and never swapped out afterwards --
+  // there is no later value this could go stale against. Reading it inside
+  // a tracked scope instead would just recompute the same decision on every
+  // dependency change for no benefit, and `createScreenShareSample` itself
+  // must run at most once (it starts an interval and registers its own
+  // `onCleanup`), so it cannot live behind a re-run-many-times accessor.
+  // eslint-disable-next-line solid/reactivity
+  const owned = props.sample ?? createScreenShareSample(() => props.trackRef);
+  const rows = owned.rows;
+  const sending = owned.sending;
 
   const copy = async () => {
     const body = rows()
@@ -854,6 +984,45 @@ export function ScreenShareStats(props: {
         </Key>
       </Grid>
     </Panel>
+  );
+}
+
+/**
+ * Compact hardware/fps/limitation badge for the sharer's own tile.
+ *
+ * Reads the same {@link ScreenShareSample} the full panel above renders into
+ * rows from -- see `createScreenShareSample`'s doc comment for why this
+ * takes a running sample rather than a `trackRef` and sampling itself. Stays
+ * empty (renders nothing) until the first successful outbound sample lands,
+ * and again whenever the sender briefly has nothing to report (e.g. a
+ * source change in flight).
+ */
+export function ScreenShareBadge(props: { sample: ScreenShareSample }) {
+  return (
+    <Show when={props.sample.ownSummary()}>
+      {(summary) => (
+        <Badge>
+          <Symbol size={14}>
+            {summary().hardware === false ? "memory" : "bolt"}
+          </Symbol>
+          <span>
+            {summary().hardware === undefined
+              ? "hw?"
+              : summary().hardware
+                ? "hw"
+                : "sw"}
+          </span>
+          <BadgeDot />
+          <span>
+            {summary().fps !== undefined ? `${summary().fps} fps` : NA}
+          </span>
+          <Show when={summary().limitedBy && summary().limitedBy !== "none"}>
+            <BadgeDot />
+            <span>{summary().limitedBy}</span>
+          </Show>
+        </Badge>
+      )}
+    </Show>
   );
 }
 
@@ -921,4 +1090,35 @@ const Label = styled("div", { base: { opacity: 0.6, whiteSpace: "nowrap" } });
 
 const Value = styled("div", {
   base: { textAlign: "right", fontVariantNumeric: "tabular-nums" },
+});
+
+const Badge = styled("div", {
+  base: {
+    gridArea: "1/1",
+    alignSelf: "end",
+    justifySelf: "start",
+    margin: "var(--gap-md)",
+    zIndex: 8,
+
+    display: "flex",
+    alignItems: "center",
+    gap: "var(--gap-xs)",
+    padding: "var(--gap-xs) var(--gap-sm)",
+    borderRadius: "var(--borderRadius-md)",
+    background: "#000000aa",
+    color: "#fff",
+    fontSize: "0.7rem",
+    fontVariantNumeric: "tabular-nums",
+
+    pointerEvents: "none",
+  },
+});
+
+const BadgeDot = styled("div", {
+  base: {
+    width: "3px",
+    height: "3px",
+    borderRadius: "50%",
+    background: "#fff8",
+  },
 });

@@ -24,10 +24,56 @@ import { Symbol } from "@revolt/ui/components/utils/Symbol";
 
 import { VoiceStatefulUserIcons } from "../VoiceStatefulUserIcons";
 
-import { ScreenShareStats } from "./ScreenShareStats";
+import {
+  createScreenShareSample,
+  ScreenShareBadge,
+  ScreenShareStats,
+} from "./ScreenShareStats";
 
 /** How long the pointer must be still before fullscreen chrome fades out */
 const IDLE_TIMEOUT = 2500;
+
+/**
+ * Badge + (when open) full stats panel for the sharer's own screen share,
+ * both fed by one sampler -- see `createScreenShareSample`'s doc comment in
+ * ScreenShareStats.tsx for why the panel takes it as a `sample` prop rather
+ * than polling `getStats()` itself here.
+ *
+ * A dedicated component rather than inlining this in `ParticipantTile`'s
+ * `<Show>`: `createScreenShareSample` starts an interval that must run for
+ * exactly as long as this is mounted, and a component's setup body is what
+ * runs once per mount in Solid -- an inline expression inside `<Show>`
+ * children has no such guarantee.
+ */
+function OwnScreenShareOverlay(props: {
+  trackRef: TrackReference;
+  username: string;
+  open: boolean;
+  onCloseStats: () => void;
+}) {
+  const sample = createScreenShareSample(() => props.trackRef);
+
+  return (
+    <>
+      {/*
+       * Not role="status": unlike ReacquiringNotice below (a rare state
+       * transition), this badge's text changes on every 1s sample tick --
+       * making it a live region would have a screen reader announce a new
+       * fps reading once a second. It stays a plain visual overlay, same as
+       * the "stats for nerds" panel it summarises.
+       */}
+      <ScreenShareBadge sample={sample} />
+      <Show when={props.open}>
+        <ScreenShareStats
+          trackRef={props.trackRef}
+          username={props.username}
+          onClose={props.onCloseStats}
+          sample={sample}
+        />
+      </Show>
+    </>
+  );
+}
 
 /**
  * Individual participant tile.
@@ -390,7 +436,18 @@ export function ParticipantTile() {
           </Show>
         </Show>
 
-        <Show when={isScreenShare() && isWatching() && showStats()}>
+        <Show when={isScreenShare() && isSelf()}>
+          <OwnScreenShareOverlay
+            trackRef={track as TrackReference}
+            username={user().username}
+            open={showStats()}
+            onCloseStats={() => setShowStats(false)}
+          />
+        </Show>
+
+        <Show
+          when={isScreenShare() && isWatching() && showStats() && !isSelf()}
+        >
           <ScreenShareStats
             trackRef={track as TrackReference}
             username={user().username}

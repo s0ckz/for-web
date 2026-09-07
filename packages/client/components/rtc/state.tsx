@@ -50,6 +50,7 @@ import { setNextScreenShareFrameRate } from "./screenShareCapture";
 import {
   browserCaptureOptions,
   classifyCapturedSurface,
+  isNativeDesktop,
 } from "./screenShareSurface";
 import {
   getMicPublication,
@@ -1792,11 +1793,12 @@ class Voice {
       // `getDisplayMedia` and a mid-share quality change needs to actually
       // move the source's framerate too.
       //
-      // Deliberately no `width`/`height` here any more: constraining capture
-      // resolution forced a full-frame libyuv rescale on Chromium's capture
-      // thread even when the source was already smaller, and Chromium's
-      // capture governor (`capture_period = max(2 x last_capture_duration,
-      // 1/target_fps)`) doubles the cost of anything that runs there.
+      // Still deliberately no `width`/`height` on the plain-browser path:
+      // constraining capture resolution there forces a full-frame libyuv
+      // rescale on Chromium's capture thread even when the source was
+      // already smaller, and Chromium's capture governor
+      // (`capture_period = max(2 x last_capture_duration, 1/target_fps)`)
+      // doubles the cost of anything that runs there.
       // `#applyEncoderLimits`'s `scaleResolutionDownBy` controls output
       // resolution on the encoder instead, where it's nearly free with
       // hardware H.26x.
@@ -1804,6 +1806,29 @@ class Voice {
         ideal: quality.resolution.frameRate,
         max: quality.resolution.frameRate,
       },
+      // On the desktop app only: `applyConstraints` here is not a real
+      // track constraint at all -- the injected page patch intercepts it on
+      // for-desktop's native generator track, reads `width`/`height` (same
+      // as it already does for `frameRate`, see `screenShareEncoding`'s doc
+      // comment) and forwards them over IPC to the native Windows capturer's
+      // `setTarget()`, which makes the GPU produce the preset resolution
+      // directly instead of capturing a fixed 1920x1080 box and leaning on
+      // `scaleResolutionDownBy` to shrink it per frame on the encoder queue.
+      // None of the browser cost above applies there -- the browser never
+      // sees a constraint on the (fake) track -- so this is gated on
+      // `isNativeDesktop()` rather than sent unconditionally.
+      ...(isNativeDesktop()
+        ? {
+            width: {
+              ideal: quality.resolution.width,
+              max: quality.resolution.width,
+            },
+            height: {
+              ideal: quality.resolution.height,
+              max: quality.resolution.height,
+            },
+          }
+        : {}),
     });
 
     localTrack.videoTrack.mediaStreamTrack.contentHint = quality.contentHint;
