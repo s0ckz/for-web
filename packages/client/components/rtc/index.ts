@@ -43,10 +43,20 @@ navigator.mediaDevices.getDisplayMedia = async function (opts) {
   // specifically, so it is never reached by camera `getUserMedia` either.
   const frameRate = takeNextScreenShareFrameRate();
   if (frameRate !== undefined && opts) {
+    // `max` deliberately leaves 5fps of headroom above `ideal` rather than
+    // pinning both to the same value. Chromium's own track adapter enforces
+    // `max` as a hard per-frame cap on top of whatever the capturer already
+    // produces, so a source running exactly at `ideal` with a few ms of
+    // normal frame-timing jitter has frames land fractionally early for
+    // their nominal slot -- and at an equal cap the adapter shaves those off
+    // as arriving too soon, silently losing achieved fps for no gain. The
+    // encoder-side ceiling gets the same treatment for the same reason, see
+    // `screenShareEncoding` in state.tsx.
+    const captureFrameRate = { ideal: frameRate, max: frameRate + 5 };
     opts.video =
       typeof opts.video === "object" && opts.video
-        ? { ...opts.video, frameRate: { ideal: frameRate, max: frameRate } }
-        : { frameRate: { ideal: frameRate, max: frameRate } };
+        ? { ...opts.video, frameRate: captureFrameRate }
+        : { frameRate: captureFrameRate };
   }
 
   const stream: MediaStream = await originalMediaCall.call(this, opts);

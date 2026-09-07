@@ -148,8 +148,37 @@ function screenShareEncoding(resolution: VideoResolution | undefined) {
     // well under it, so the extra headroom just leaves it room to breathe
     // rather than forcing it there.
     maxBitrate,
-    maxFramerate: frameRate,
+    // Deliberately above the source's own cap (`frameRate`, applied via
+    // `applyConstraints` in #applyShareChoice/#recoverScreenShare), not equal
+    // to it. The source is the real limiter; this is a second, independent
+    // cap sitting right on top of it. Frame capture timestamps jitter by a
+    // few ms even when the source is healthy, so a frame delivered fractionally
+    // early for its nominal slot reads to the encoder's rate limiter as
+    // arriving "too soon" -- and at an equal ceiling that frame gets dropped
+    // instead of encoded, silently shaving achieved fps below what the source
+    // is actually producing. +5fps of headroom absorbs that jitter without
+    // giving the encoder room to run away: the source cap still does the
+    // actual limiting.
+    //
+    // On for-desktop's native generator track, `applyConstraints` is not a
+    // real track constraint at all -- the injected page patch
+    // (appAudioPatch.ts) overrides `generator.applyConstraints` to read the
+    // requested `frameRate` and forward it to the native capturer via
+    // `screenCaptureBridge.setFps()` (IPC to `setLiveFps` in
+    // screenCapture.ts), then resolves immediately without the browser ever
+    // seeing a constraint on the (fake) track. That native capturer is the
+    // actual source-side limiter there, playing the same role Chromium's own
+    // track constraint plays on the browser capture path -- so this encoder
+    // ceiling needs the same headroom above it either way.
+    maxFramerate: frameRate + 5,
     priority: "high" as const,
+    // For consistency with `priority` above; LiveKit already derives
+    // `networkPriority` from `priority` when it applies encoding parameters
+    // to the sender, so this has no practical effect of its own today. Kept
+    // explicit anyway so this object states its own priority intent fully
+    // rather than relying on that LiveKit-internal derivation to keep doing
+    // it.
+    networkPriority: "high" as const,
   };
 }
 
@@ -288,13 +317,22 @@ function isHardware(probe: CodecProbe): boolean {
  * default: Chromium applies per-profile min/max resolution filtering, so
  * e.g. 1080p60 HEVC can be genuinely absent on hardware that has 720p30
  * HEVC. Every probe is wrapped in one shared {@link
- * SCREEN_SHARE_CODEC_PROBE_TIMEOUT_MS} timeout (`Promise.all` inside a
- * single race, so the wall-clock cost is one probe's worth, not four) --
+ * SCREEN_SHARE_CODEC_PROBE_TIMEOUT_MS} timeout (`Promise.all` raced against
+ * it, so the wall-clock cost of waiting is one probe's worth, not four) --
  * a slow first `encodingInfo` call on a cold GPU process must not stall the
- * share starting. If `mediaCapabilities.encodingInfo` is missing, any probe
- * rejects, or the timeout fires, this returns "vp9" for *this* call only
- * and writes nothing to the cache, so the next attempt retries from
- * scratch.
+ * share starting. If `mediaCapabilities.encodingInfo` is missing or any
+ * probe rejects outright, this returns "vp9" for *this* call only and
+ * writes nothing to the cache, so the next attempt retries from scratch.
+ *
+ * A bare timeout is different: the four `encodingInfo` calls are not
+ * cancelled by losing the race, only abandoned by *this* call -- they keep
+ * running, and whichever one of them resolves the batch still computes and
+ * caches the real decision when it eventually lands, exactly as if it had
+ * won the race. So only the very first share of a cold session (the one
+ * that hits a cold GPU process) actually pays the probe latency; by the
+ * time a second share asks for the same key, the backgrounded probe has
+ * usually already finished and cached the answer, however late it was too
+ * late for the *first* share to use.
  *
  * AV1 is deliberately never probed: LiveKit treats it as SVC and forces
  * L1T3, which non-Intel hardware cannot do, so it would quietly land on
@@ -321,155 +359,173 @@ async function screenShareCodec(
   const inFlight = screenShareCodecInFlight.get(key);
   if (inFlight) return inFlight;
 
-  const promise = (async (): Promise<VideoCodec> => {
-    // Typed as non-optional in lib.dom.d.ts, but not every Chromium build
-    // actually implements `encodingInfo` -- check before using it rather
-    // than trust the type.
-    const mediaCapabilities: MediaCapabilities | undefined =
-      navigator.mediaCapabilities;
+  // Typed as non-optional in lib.dom.d.ts, but not every Chromium build
+  // actually implements `encodingInfo` -- check before using it rather
+  // than trust the type.
+  const mediaCapabilities: MediaCapabilities | undefined =
+    navigator.mediaCapabilities;
 
-    if (
-      typeof RTCRtpSender === "undefined" ||
-      !mediaCapabilities?.encodingInfo
-    ) {
-      // Same reasoning as the timeout path below: record it so a stale
-      // `cbpHardware` from an earlier share cannot leak into the backup
-      // codec choice, but do not cache it.
-      lastScreenShareCodecDecision = {
-        key,
-        codec: "vp9",
-        reason:
-          "mediaCapabilities.encodingInfo unavailable; cannot verify hardware",
-        probes: [],
-        cbpHardware: false,
-        at: Date.now(),
-      };
-      return "vp9";
-    }
-
-    const negotiable = new Set(
-      (RTCRtpSender.getCapabilities?.("video")?.codecs ?? []).map((codec) =>
-        codec.mimeType.toLowerCase(),
-      ),
-    );
-
-    // Built from the already-defaulted width/height/frameRate locals, not
-    // the raw (possibly undefined) `resolution` param, so the bitrate probed
-    // here always matches the resolution actually probed above.
-    const bitrate = screenShareEncoding({
-      width,
-      height,
-      frameRate,
-    }).maxBitrate;
-
-    const probe = (contentType: string): Promise<CodecProbe> =>
-      mediaCapabilities
-        .encodingInfo({
-          type: "webrtc",
-          video: {
-            contentType,
-            width,
-            height,
-            framerate: frameRate,
-            bitrate,
-            scalabilityMode: "L1T1",
-          },
-        })
-        .then((info) => ({
-          contentType,
-          supported: info.supported,
-          powerEfficient: info.powerEfficient,
-        }));
-
-    let probes: CodecProbe[] | undefined;
-    try {
-      probes = await Promise.race([
-        Promise.all([
-          probe(H265_CONTENT_TYPE),
-          probe(H264_CBP_CONTENT_TYPE),
-          probe(H264_MAIN_CONTENT_TYPE),
-          probe(H264_HIGH_CONTENT_TYPE),
-        ]),
-        new Promise<undefined>((resolve) =>
-          setTimeout(
-            () => resolve(undefined),
-            SCREEN_SHARE_CODEC_PROBE_TIMEOUT_MS,
-          ),
-        ),
-      ]);
-    } catch {
-      probes = undefined;
-    }
-
-    if (!probes) {
-      console.info(
-        `[rtc] screen share codec probe for ${key} timed out or failed, using vp9 for this share only`,
-      );
-      // Record it as the last decision without caching it. Skipping this
-      // would leave `lastScreenShareCodecDecision` pointing at some earlier
-      // share's result, and `screenSharePublishOptions` reads `cbpHardware`
-      // off it -- so a stale `true` would pick an h264 backup codec on the
-      // strength of a probe that never ran for this configuration.
-      lastScreenShareCodecDecision = {
-        key,
-        codec: "vp9",
-        reason: "probe timed out or failed; not cached, will retry next share",
-        probes: [],
-        cbpHardware: false,
-        at: Date.now(),
-      };
-      return "vp9";
-    }
-
-    const [h265, h264Cbp, h264Main, h264High] = probes;
-
-    let codec: VideoCodec;
-    let reason: string;
-
-    if (negotiable.has("video/h265") && isHardware(h265)) {
-      codec = "h265";
-      reason = "hardware h265 available and negotiable";
-    } else if (negotiable.has("video/h264") && isHardware(h264Cbp)) {
-      codec = "h264";
-      reason = "hardware h264 available at constrained baseline";
-    } else if (isHardware(h264Main) || isHardware(h264High)) {
-      codec = "vp9";
-      reason =
-        "hardware h264 exists here but only for main/high, which the SFU will not negotiate -- falling back to vp9";
-    } else {
-      codec = "vp9";
-      reason = "no hardware h265/h264 found, falling back to vp9";
-    }
-
-    const decision: ScreenShareCodecDecision = {
+  if (typeof RTCRtpSender === "undefined" || !mediaCapabilities?.encodingInfo) {
+    // Same reasoning as the rejection path below: record it so a stale
+    // `cbpHardware` from an earlier share cannot leak into the backup
+    // codec choice, but do not cache it. Nothing to probe here, so there is
+    // no in-flight work to hand later callers either.
+    lastScreenShareCodecDecision = {
       key,
-      codec,
-      reason,
-      probes,
-      cbpHardware: isHardware(h264Cbp),
+      codec: "vp9",
+      reason:
+        "mediaCapabilities.encodingInfo unavailable; cannot verify hardware",
+      probes: [],
+      cbpHardware: false,
       at: Date.now(),
     };
-
-    console.info(
-      `[rtc] screen share codec for ${key}: ${codec} (${reason})`,
-      probes.map(
-        (p) =>
-          `${p.contentType} supported=${p.supported} powerEfficient=${p.powerEfficient}`,
-      ),
-    );
-
-    screenShareCodecDecisions.set(key, decision);
-    lastScreenShareCodecDecision = decision;
-
-    return codec;
-  })();
-
-  screenShareCodecInFlight.set(key, promise);
-  try {
-    return await promise;
-  } finally {
-    screenShareCodecInFlight.delete(key);
+    return "vp9";
   }
+
+  const negotiable = new Set(
+    (RTCRtpSender.getCapabilities?.("video")?.codecs ?? []).map((codec) =>
+      codec.mimeType.toLowerCase(),
+    ),
+  );
+
+  // Built from the already-defaulted width/height/frameRate locals, not
+  // the raw (possibly undefined) `resolution` param, so the bitrate probed
+  // here always matches the resolution actually probed above.
+  const bitrate = screenShareEncoding({
+    width,
+    height,
+    frameRate,
+  }).maxBitrate;
+
+  const probe = (contentType: string): Promise<CodecProbe> =>
+    mediaCapabilities
+      .encodingInfo({
+        type: "webrtc",
+        video: {
+          contentType,
+          width,
+          height,
+          framerate: frameRate,
+          bitrate,
+          scalabilityMode: "L1T1",
+        },
+      })
+      .then((info) => ({
+        contentType,
+        supported: info.supported,
+        powerEfficient: info.powerEfficient,
+      }));
+
+  // The actual probe work, kept as its own promise rather than folded
+  // straight into the race below. This is what lets a probe that loses the
+  // race to the timeout keep going instead of being thrown away: this
+  // promise is never cancelled by anything, so whichever caller (this one,
+  // or a later one that joins it via `screenShareCodecInFlight`) is still
+  // around when it settles gets the real decision, and it is cached exactly
+  // once regardless of whether that happens before or after the timeout.
+  const probesPromise: Promise<VideoCodec> = Promise.all([
+    probe(H265_CONTENT_TYPE),
+    probe(H264_CBP_CONTENT_TYPE),
+    probe(H264_MAIN_CONTENT_TYPE),
+    probe(H264_HIGH_CONTENT_TYPE),
+  ]).then(
+    (probes) => {
+      const [h265, h264Cbp, h264Main, h264High] = probes;
+
+      let codec: VideoCodec;
+      let reason: string;
+
+      if (negotiable.has("video/h265") && isHardware(h265)) {
+        codec = "h265";
+        reason = "hardware h265 available and negotiable";
+      } else if (negotiable.has("video/h264") && isHardware(h264Cbp)) {
+        codec = "h264";
+        reason = "hardware h264 available at constrained baseline";
+      } else if (isHardware(h264Main) || isHardware(h264High)) {
+        codec = "vp9";
+        reason =
+          "hardware h264 exists here but only for main/high, which the SFU will not negotiate -- falling back to vp9";
+      } else {
+        codec = "vp9";
+        reason = "no hardware h265/h264 found, falling back to vp9";
+      }
+
+      const decision: ScreenShareCodecDecision = {
+        key,
+        codec,
+        reason,
+        probes,
+        cbpHardware: isHardware(h264Cbp),
+        at: Date.now(),
+      };
+
+      console.info(
+        `[rtc] screen share codec for ${key}: ${codec} (${reason})`,
+        probes.map(
+          (p) =>
+            `${p.contentType} supported=${p.supported} powerEfficient=${p.powerEfficient}`,
+        ),
+      );
+
+      screenShareCodecDecisions.set(key, decision);
+      lastScreenShareCodecDecision = decision;
+
+      return codec;
+    },
+    () => {
+      // A genuine rejection (not the timeout below, which never touches
+      // this promise) -- e.g. `encodingInfo` itself threw. Record it
+      // without caching, same as the missing-API branch above, so a
+      // transient failure cannot pin this key at vp9 forever.
+      lastScreenShareCodecDecision = {
+        key,
+        codec: "vp9",
+        reason: "probe rejected; not cached, will retry next share",
+        probes: [],
+        cbpHardware: false,
+        at: Date.now(),
+      };
+      return "vp9";
+    },
+  );
+
+  // Tracked under the real probe, not the race below -- and only cleared
+  // once the real probe settles. A concurrent call for this key, whether it
+  // arrives while we are still waiting on the timeout or only after we have
+  // already fallen back to vp9 here, joins this same probe instead of
+  // starting a second one.
+  screenShareCodecInFlight.set(key, probesPromise);
+  probesPromise.finally(() => screenShareCodecInFlight.delete(key));
+
+  const raced = await Promise.race([
+    probesPromise,
+    new Promise<"timeout">((resolve) =>
+      setTimeout(() => resolve("timeout"), SCREEN_SHARE_CODEC_PROBE_TIMEOUT_MS),
+    ),
+  ]);
+
+  if (raced !== "timeout") return raced;
+
+  console.info(
+    `[rtc] screen share codec probe for ${key} timed out, using vp9 for this share -- the probe keeps running in the background and will cache its result for the next share`,
+  );
+  // Record it as the last decision without caching it yet. Skipping this
+  // would leave `lastScreenShareCodecDecision` pointing at some earlier
+  // share's result, and `screenSharePublishOptions` reads `cbpHardware` off
+  // it -- so a stale `true` would pick an h264 backup codec on the strength
+  // of a probe that never actually finished for this configuration. Once
+  // `probesPromise` above does resolve, its own `.then` overwrites this with
+  // the real decision.
+  lastScreenShareCodecDecision = {
+    key,
+    codec: "vp9",
+    reason:
+      "probe timed out; not cached yet -- the backgrounded probe will cache its result once it resolves",
+    probes: [],
+    cbpHardware: false,
+    at: Date.now(),
+  };
+  return "vp9";
 }
 
 /**
@@ -1339,14 +1395,36 @@ class Voice {
   }
 
   /**
-   * Warm the codec probe for the currently configured quality without
-   * anyone waiting on it, so the first real `toggleScreenshare` call finds
-   * an already-cached decision instead of eating the probe's latency.
+   * Warm the codec probe for every enabled screen-share quality, not just
+   * the one currently configured, without anyone waiting on it -- so the
+   * first real `toggleScreenshare` call finds an already-cached decision no
+   * matter which quality it ends up publishing at, instead of eating the
+   * probe's latency for whichever one was not primed.
+   *
+   * Primed one quality at a time rather than all at once. `screenShareCodec`
+   * already fans a single quality's probe out to four parallel
+   * `encodingInfo` calls (see its doc comment); firing all enabled qualities
+   * (up to three -- low/high/high60) together would mean up to twelve
+   * simultaneous GPU capability queries the moment the room connects,
+   * stacked on top of everything else the client is doing at startup, for no
+   * wall-clock benefit since nothing here is awaited by a caller anyway.
+   * Sequencing keeps the burst to four probes in flight at a time.
+   * `screenShareCodec` caches each quality under its own resolution/
+   * framerate key, so nothing about the eventual cache depends on the order
+   * they were primed in -- only the first `toggleScreenshare` for a
+   * not-yet-primed quality still has to wait its turn.
    */
   #primeScreenShareCodec() {
-    const quality =
-      this.getEnabledScreenShareQualities()[this.#screenShareQuality()];
-    void screenShareCodec(quality?.resolution);
+    const qualities = this.getEnabledScreenShareQualities();
+    const resolutions = ScreenShareQualityNames.filter(
+      (name) => qualities[name],
+    ).map((name) => qualities[name]!.resolution);
+
+    void (async () => {
+      for (const resolution of resolutions) {
+        await screenShareCodec(resolution);
+      }
+    })();
   }
 
   async toggleScreenshare() {
