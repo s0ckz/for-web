@@ -53,7 +53,7 @@ export function RoomAudioManager() {
     },
   );
 
-  const filteredTracks = createMemo(() =>
+  const audioTracks = createMemo(() =>
     tracks().filter(
       (track) =>
         !isLocal(track.participant) &&
@@ -61,14 +61,34 @@ export function RoomAudioManager() {
     ),
   );
 
+  /**
+   * Whether a track's audio should be subscribed at all. Microphone/unknown
+   * audio always is; screen-share audio follows the same per-share Watch
+   * toggle that already gates its video (see ParticipantTile's isWatching /
+   * state.voice.getScreenShareWatching) -- a share nobody chose to watch has
+   * no business paying for an extra decoder.
+   */
+  const isWantedAudio = (track: TrackReferenceOrPlaceholder) =>
+    track.source !== Track.Source.ScreenShareAudio ||
+    state.voice.getScreenShareWatching(track.participant.identity);
+
   createEffect(() => {
-    const tracks = filteredTracks();
-    console.info("[rtc] filtered tracks", filteredTracks());
-    for (const track of tracks) {
-      (track.publication as RemoteTrackPublication).setSubscribed(true);
-      console.info(track.publication);
+    for (const track of audioTracks()) {
+      (track.publication as RemoteTrackPublication).setSubscribed(
+        isWantedAudio(track),
+      );
     }
   });
+
+  // Only render an <AudioTrack> once the publication is both wanted and
+  // actually subscribed -- setSubscribed() above is a request, not
+  // instantaneous, so a share that was just unwatched can still show
+  // isSubscribed: true for a moment until the server round-trip completes.
+  const filteredTracks = createMemo(() =>
+    audioTracks().filter(
+      (track) => isWantedAudio(track) && track.publication.isSubscribed,
+    ),
+  );
 
   return (
     <div style={{ display: "none" }}>
