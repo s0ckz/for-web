@@ -18,17 +18,17 @@ import { IconButton } from "@revolt/ui/components/design";
 import { Symbol } from "@revolt/ui/components/utils/Symbol";
 import { scrollableStyles } from "@revolt/ui/directives";
 
-import { ParticipantTile, tile } from "./ParticipantTile";
+import { focusOverlayContext, ParticipantTile, tile } from "./ParticipantTile";
 import { VoiceCallCardActions } from "./VoiceCallCardActions";
 import { VoiceCallCardStatus } from "./VoiceCallCardStatus";
 
 /**
  * Call card (active)
  */
-export function VoiceCallCardActiveRoom() {
+export function VoiceCallCardActiveRoom(props: { pip: boolean }) {
   return (
     <View>
-      <Participants />
+      <Participants pip={props.pip} />
       <VoiceCallControls>
         <VoiceCallControlHolder right>
           <VoiceHideChat />
@@ -146,7 +146,7 @@ const FOCUS_GRACE_MS = 60_000;
 /**
  * Show a grid of participants
  */
-function Participants() {
+function Participants(props: { pip: boolean }) {
   const voice = useVoice();
   const state = useState();
   const { t } = useLingui();
@@ -329,6 +329,17 @@ function Participants() {
     createResizeObserver(callRef, ({ width, height }, el) => {
       if (el !== callRef) return;
 
+      // `VoiceCallCard.tsx` keeps `Base` laid out (`visibility: hidden`,
+      // not unmounted) while the floating PiP pill shows on top of it, for
+      // exactly this observer to re-measure it on re-dock -- but `Float` is
+      // a fixed 300x170 while floating, so measuring it *now* would write a
+      // tiny --vc-h/box() and, through tileWidth()'s 250px floor, force
+      // every tile down to one per row until the next real resize. Skip the
+      // write and keep the last docked measurement; re-docking is itself a
+      // real size change on this element, so the observer fires again with
+      // the actual docked size as soon as it happens.
+      if (props.pip) return;
+
       const w = Math.round(width);
       const h = Math.round(height);
       if (w === lastW && h === lastH) return;
@@ -341,64 +352,76 @@ function Participants() {
     });
   });
 
+  /**
+   * Where `ParticipantTile` portals the currently-focused tile -- see
+   * `focusOverlayContext`'s doc comment for why a plain ref, not a signal,
+   * and why it has to be assigned before `Grid`'s `TrackLoop` below (it is
+   * written first in the JSX that follows).
+   */
+  let overlayRef: HTMLDivElement | undefined;
+
   return (
-    <Call
-      ref={callRef}
-      focus={focused()}
-      class={focused() ? "" : scrollableStyles()}
-      style={{ "--vc-strip-h": stripHeight() }}
-    >
-      <InRoom>
-        <Show when={focused()}>
-          <ShowBarButtonHolder>
-            <IconButton
-              size="xs"
-              variant={"tonal"}
-              onPress={() => voice.toggleShowBar()}
-              use:floating={{
-                tooltip: {
-                  placement: "top",
-                  content: voice.showBar() ? t`Hide Others` : t`Show Others`,
-                },
-              }}
-            >
-              <Show
-                when={voice.showBar()}
-                fallback={<Symbol>keyboard_arrow_up</Symbol>}
+    <focusOverlayContext.Provider value={() => overlayRef}>
+      <Call
+        ref={callRef}
+        focus={focused()}
+        class={focused() ? "" : scrollableStyles()}
+        style={{ "--vc-strip-h": stripHeight() }}
+      >
+        <InRoom>
+          <Show when={focused()}>
+            <ShowBarButtonHolder>
+              <IconButton
+                size="xs"
+                variant={"tonal"}
+                onPress={() => voice.toggleShowBar()}
+                use:floating={{
+                  tooltip: {
+                    placement: "top",
+                    content: voice.showBar() ? t`Hide Others` : t`Show Others`,
+                  },
+                }}
               >
-                <Symbol>keyboard_arrow_down</Symbol>
-              </Show>
-            </IconButton>
-          </ShowBarButtonHolder>
-        </Show>
-        <Grid
-          focus={focused()}
-          show={voice.showBar()}
-          class={focused() ? scrollableStyles({ direction: "x" }) : ""}
-          style={{ "--vc-tile-width": tileWidth() }}
-        >
-          {/*
-           * One loop for both the focus tile and the strip -- see
-           * `visibleTracks` above for why -- rather than the two separate
-           * `TrackLoop`s (one keyed to just the focused track, one to
-           * `gridTracks()`) this used to be. `ParticipantTile` positions
-           * itself via `voice.isFocus(track)` when it is the focused one
-           * (see its `focus` variant), so nothing else here needs to know
-           * which array position that is.
-           */}
-          <TrackLoop tracks={visibleTracks}>
-            {() => <ParticipantTile />}
-          </TrackLoop>
-          <For each={Array(testTrackCount)}>
-            {() => (
-              <div
-                class={tile({ fullscreen: voice.fullscreen() }) + " vc_tile"}
-              />
-            )}
-          </For>
-        </Grid>
-      </InRoom>
-    </Call>
+                <Show
+                  when={voice.showBar()}
+                  fallback={<Symbol>keyboard_arrow_up</Symbol>}
+                >
+                  <Symbol>keyboard_arrow_down</Symbol>
+                </Show>
+              </IconButton>
+            </ShowBarButtonHolder>
+          </Show>
+          <FocusOverlay ref={overlayRef!} />
+          <Grid
+            focus={focused()}
+            show={voice.showBar()}
+            class={focused() ? scrollableStyles({ direction: "x" }) : ""}
+            style={{ "--vc-tile-width": tileWidth() }}
+          >
+            {/*
+             * One loop for both the focus tile and the strip -- see
+             * `visibleTracks` above for why -- rather than the two separate
+             * `TrackLoop`s (one keyed to just the focused track, one to
+             * `gridTracks()`) this used to be. `ParticipantTile` positions
+             * itself via `voice.isFocus(track)` when it is the focused one
+             * (see its `focus` variant, and `FocusOverlay` above for how it
+             * escapes `Grid` while doing so), so nothing else here needs to
+             * know which array position that is.
+             */}
+            <TrackLoop tracks={visibleTracks}>
+              {() => <ParticipantTile />}
+            </TrackLoop>
+            <For each={Array(testTrackCount)}>
+              {() => (
+                <div
+                  class={tile({ fullscreen: voice.fullscreen() }) + " vc_tile"}
+                />
+              )}
+            </For>
+          </Grid>
+        </InRoom>
+      </Call>
+    </focusOverlayContext.Provider>
   );
 }
 
@@ -475,22 +498,45 @@ const ShowBarButtonHolder = styled("div", {
 });
 
 /**
- * Positioning context for the focused tile's overlay (see `ParticipantTile`'s
- * `focus` variant) and for `ShowBarButtonHolder` above -- both position
- * themselves against this element via `position: absolute`, which is why
- * this stays `position: relative` and why nothing between them and this
- * (`InRoom`, `Grid`) may introduce a positioning context of its own.
+ * Positioning context for the focused tile's overlay (see `FocusOverlay` and
+ * `ParticipantTile`'s `focus` variant) and for `ShowBarButtonHolder` above --
+ * both position themselves against this element via `position: absolute`,
+ * which is why this stays `position: relative` and why nothing between them
+ * and this (`InRoom`, `FocusOverlay`, `Grid`) may introduce a positioning
+ * context of its own.
+ *
+ * THIS INVARIANT HAS ALREADY BEEN BROKEN ONCE, by something that looks
+ * nothing like a `position` rule: `Grid`'s `scrollableStyles({ direction:
+ * "x" })` class (applied only while focused, for the strip's horizontal
+ * scroll) carries `willChange: "transform"`
+ * (`directives/scrollable.ts`), and `will-change: transform` makes an
+ * element a containing block for its absolutely-positioned descendants --
+ * same as `position: relative` would. Because the focused tile used to be a
+ * plain descendant of `Grid` (rendered by the same `TrackLoop` as the strip,
+ * just pulled out of flex flow via `position: absolute`), that silently
+ * retargeted it onto `Grid` -- whose own box is deliberately small (just the
+ * strip's height, `overflow-y: hidden`) -- instead of this element, and the
+ * whole card appeared to lose its focused tile. Fixed by portaling the
+ * focused tile out to `FocusOverlay`, a sibling of `Grid` that -- unlike
+ * `Grid` -- has no reason to ever pick up `will-change`, `transform`,
+ * `filter`, or any other property that creates a containing block as a side
+ * effect. Do not "fix" a future recurrence of this by editing
+ * `scrollable.ts`: that style is shared app-wide, and removing it there
+ * fixes this one symptom by accident while leaving the actual rule (nothing
+ * between the focused tile and this element may become a containing block)
+ * unenforced for the next thing that touches `Grid`.
  *
  * There used to be a `FocusBox` here too: a flex sibling, ahead of `Grid` in
  * the flex column below, whose `flex-grow: 1` pushed `Grid` down to the
  * bottom and gave the focused tile a home to center itself in. It is gone
  * now that the focused tile is rendered by the same `TrackLoop` as the strip
- * (see `visibleTracks`) and instead overlays this element directly. `Grid`
- * is this component's only flex child left when focused, so `justifyContent:
- * "flex-end"` (below, gated on `focus` the same way `FocusBox` used to be
- * conditionally rendered) takes over pinning it to the bottom edge; it is a
- * no-op when unfocused, where `Grid`'s own `minHeight: "100%"` already fills
- * this box with nothing left over to justify.
+ * (see `visibleTracks`) and instead overlays this element directly (via
+ * `FocusOverlay`). `Grid` is this component's only flex child left when
+ * focused, so `justifyContent: "flex-end"` (below, gated on `focus` the same
+ * way `FocusBox` used to be conditionally rendered) takes over pinning it to
+ * the bottom edge; it is a no-op when unfocused, where `Grid`'s own
+ * `minHeight: "100%"` already fills this box with nothing left over to
+ * justify.
  */
 const Call = styled("div", {
   base: {
@@ -507,6 +553,36 @@ const Call = styled("div", {
         justifyContent: "flex-end",
       },
     },
+  },
+});
+
+/**
+ * Mount point `ParticipantTile` portals the currently-focused tile into (see
+ * `focusOverlayContext` above), so that tile's `position: absolute` resolves
+ * against `Call` -- see `Call`'s own doc comment for the whole story of why
+ * that tile cannot simply stay a plain descendant of `Grid`.
+ *
+ * A sibling of `Grid`, both direct children of `Call` (`InRoom` renders no
+ * DOM element of its own), rather than replacing `Grid` or wrapping it: the
+ * strip (everyone *not* focused) still needs to render, scroll, and measure
+ * exactly as it does today, and this only ever holds the one portaled tile
+ * on top of it.
+ *
+ * Always present and sized to the whole card, even with nothing focused --
+ * an empty, `pointer-events: none` box costs nothing, and is simpler than
+ * mounting and unmounting it (and, transitively, remounting whatever
+ * `ParticipantTile` happens to be portaled into it) in step with focus
+ * changes. `pointerEvents: "none"` keeps it from stealing clicks meant for
+ * `Grid` underneath when it is empty (or momentarily behind a focus
+ * transition); `ParticipantTile`'s `focus` variant re-enables its own
+ * pointer events, the same pattern its `Overlay` styled component already
+ * uses for the same reason.
+ */
+const FocusOverlay = styled("div", {
+  base: {
+    position: "absolute",
+    inset: 0,
+    pointerEvents: "none",
   },
 });
 

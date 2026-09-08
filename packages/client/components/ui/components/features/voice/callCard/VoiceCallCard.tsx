@@ -414,7 +414,7 @@ function VoiceCallCard(props: {
             when={props.inCall}
             fallback={<VoiceCallCardPreview channel={props.channel} />}
           >
-            <VoiceCallCardActiveRoom />
+            <VoiceCallCardActiveRoom pip={props.pip} />
           </Show>
         </Card>
       </Base>
