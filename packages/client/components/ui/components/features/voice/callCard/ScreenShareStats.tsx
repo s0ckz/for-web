@@ -1,7 +1,14 @@
-import { Accessor, createSignal, onCleanup, Show } from "solid-js";
+import {
+  Accessor,
+  createEffect,
+  createSignal,
+  onCleanup,
+  Show,
+} from "solid-js";
 
 import type { TrackReference } from "solid-livekit-components";
 
+import { useLingui } from "@lingui/solid/macro";
 import { isLocal } from "@livekit/components-core";
 import { isScreenShareLinkWeak } from "@revolt/rtc";
 import { Key } from "@solid-primitives/keyed";
@@ -75,6 +82,14 @@ type OwnSummary = {
   fps?: number;
   /** `RTCOutboundRtpStreamStats.qualityLimitationReason`, verbatim ("none" included). */
   limitedBy?: string;
+  /**
+   * Cumulative frames actually sent, straight off `outbound-rtp`. Lets
+   * `ScreenShareBadge` tell "genuinely nothing sent yet" (`0`) apart from
+   * "sending, `fps` just hasn't been computed for this tick yet" -- `fps`
+   * alone can't do that, since it's `undefined` on the very first sample
+   * even once frames are flowing.
+   */
+  framesSent?: number;
 };
 
 /**
@@ -382,6 +397,7 @@ export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
         hardware,
         fps: fps !== undefined ? Math.round(fps) : undefined,
         limitedBy: outbound.qualityLimitationReason,
+        framesSent,
       },
     };
   };
@@ -988,6 +1004,16 @@ export function ScreenShareStats(props: {
 }
 
 /**
+ * How long an own share is allowed to report zero frames sent before
+ * {@link ScreenShareBadge} stops calling that "starting…" and calls it
+ * "not sending" instead. Long enough that the ordinary negotiate-then-encode
+ * delay never trips it, short enough that a genuinely dead share (the
+ * Windows "hw? · 0 fps" bug this badge exists to catch) doesn't sit on a
+ * neutral-looking state for long.
+ */
+const NOT_SENDING_GRACE_MS = 5000;
+
+/**
  * Compact hardware/fps/limitation badge for the sharer's own tile.
  *
  * Reads the same {@link ScreenShareSample} the full panel above renders into
@@ -996,32 +1022,163 @@ export function ScreenShareStats(props: {
  * empty (renders nothing) until the first successful outbound sample lands,
  * and again whenever the sender briefly has nothing to report (e.g. a
  * source change in flight).
+ *
+ * Neither `hardware` nor `fps` means anything before the encoder has
+ * actually done something: `powerEfficientEncoder` is unset until the first
+ * frame is encoded (and stays unset forever on Chromium builds that never
+ * expose it at all), and a bare `fps` reading can't be told apart from "not
+ * measured yet" the way `framesSent` can. Showing either early used to print
+ * the literal, undiagnostic "hw? · 0 fps" -- so instead this renders one
+ * neutral "starting…" state until at least one of them becomes meaningful.
+ * If `framesSent` is still `0` after {@link NOT_SENDING_GRACE_MS}, that
+ * flips to an explicit, visually distinct "not sending" state rather than
+ * staying "starting…" forever -- a share that never sends a frame is exactly
+ * the failure this badge exists to surface, so it must not go quiet about it.
  */
 export function ScreenShareBadge(props: { sample: ScreenShareSample }) {
+  const { t } = useLingui();
+
+  // Whether the grace period above has elapsed for the *current* share
+  // attempt without a frame being sent yet.
+  const [graceElapsed, setGraceElapsed] = createSignal(false);
+
+  // Non-reactive bookkeeping for the timer, same style as the plain `let`
+  // counters `createScreenShareSample` above keeps between samples -- there
+  // is nothing here another consumer needs to read reactively.
+  let armed = false;
+  let graceTimer: ReturnType<typeof setTimeout> | undefined;
+
+  // Arms (and re-arms) the grace timer once per share attempt.
+  // `ownSummary()` is `undefined` between shares and whenever a sample fails
+  // (see `createScreenShareSample`), so a transition from absent to present
+  // is "a new share attempt started" -- exactly the point a previously
+  // failed share must stop being able to leave this stuck on "not sending".
+  // Deliberately a plain effect with no return value: returning the cleanup
+  // closure directly from `createEffect` would make Solid treat it as this
+  // effect's previous *value*, not a disposer -- the timer is torn down via
+  // `onCleanup` below instead.
+  createEffect(() => {
+    if (!props.sample.ownSummary()) {
+      armed = false;
+      setGraceElapsed(false);
+      if (graceTimer !== undefined) {
+        clearTimeout(graceTimer);
+        graceTimer = undefined;
+      }
+      return;
+    }
+
+    if (armed) return;
+    armed = true;
+    graceTimer = setTimeout(() => setGraceElapsed(true), NOT_SENDING_GRACE_MS);
+  });
+
+  onCleanup(() => {
+    if (graceTimer !== undefined) clearTimeout(graceTimer);
+  });
+
   return (
     <Show when={props.sample.ownSummary()}>
-      {(summary) => (
-        <Badge>
-          <Symbol size={14}>
-            {summary().hardware === false ? "memory" : "bolt"}
-          </Symbol>
-          <span>
-            {summary().hardware === undefined
-              ? "hw?"
-              : summary().hardware
-                ? "hw"
-                : "sw"}
-          </span>
-          <BadgeDot />
-          <span>
-            {summary().fps !== undefined ? `${summary().fps} fps` : NA}
-          </span>
-          <Show when={summary().limitedBy && summary().limitedBy !== "none"}>
-            <BadgeDot />
-            <span>{summary().limitedBy}</span>
+      {(summary) => {
+        const hardwareKnown = () => typeof summary().hardware === "boolean";
+        const fpsKnown = () => (summary().framesSent ?? 0) > 0;
+        // Only an error once nothing has ever been sent *and* the grace
+        // period has run out -- the moment a frame lands, `fpsKnown()` wins
+        // this race for good, regardless of what the timer is doing.
+        const notSending = () => !fpsKnown() && graceElapsed();
+
+        // Whether `summary().fps` is an actual number to print, as opposed
+        // to `fpsKnown()` above (whether frames have been *sent* at all).
+        // These sound like the same question but aren't: `framesSent` is a
+        // cumulative counter that can already be positive on the very first
+        // sample, while `fps` stays `undefined` until either Chromium has
+        // populated `outbound.framesPerSecond` or a second sample lets
+        // `sampleOutboundVideo` derive a rate from the delta -- neither of
+        // which has necessarily happened yet on that first sample. Printing
+        // the fps segment off `fpsKnown()` alone is exactly how this badge
+        // used to render the literal "undefined fps". `fpsKnown()` itself
+        // must stay framesSent-based, though: it's also what defeats
+        // `notSending` above, and gating that on a computed rate instead
+        // would flip a share into the error state on any single sample that
+        // failed to compute one, not just a genuinely dead share.
+        const fpsValueKnown = () => typeof summary().fps === "number";
+
+        return (
+          <Show
+            when={!notSending()}
+            fallback={
+              <Badge error>
+                <Symbol size={14}>error</Symbol>
+                <span>{t`not sending`}</span>
+              </Badge>
+            }
+          >
+            <Badge>
+              <Show
+                // Gate on `fpsValueKnown()`, not `fpsKnown()`: this decides
+                // whether the segments below have anything printable to show,
+                // and `fpsKnown()` (`framesSent > 0`) can be true before
+                // `summary().fps` has a value (see `fpsValueKnown` above).
+                // Gating on `fpsKnown()` here let that state through with
+                // hardware still unknown too, rendering a bare icon with no
+                // text at all -- unlike `notSending`, which must stay on
+                // `fpsKnown()` so a single failed-rate sample can't flip a
+                // genuinely sending share into the error badge.
+                when={hardwareKnown() || fpsValueKnown()}
+                fallback={
+                  <>
+                    <Symbol size={14}>hourglass_top</Symbol>
+                    <span>{t`starting…`}</span>
+                  </>
+                }
+              >
+                <Symbol size={14}>
+                  {/*
+                   * `bolt` asserts hardware encoding, so it must not be the
+                   * fallback for "unknown" -- `hardware` is `undefined`
+                   * whenever Chromium hasn't reported `powerEfficientEncoder`
+                   * yet, which on some builds is permanent, not just a
+                   * startup transient (see the doc comment above). `videocam`
+                   * reads as plain "encoding" with no hw/sw claim either way.
+                   */}
+                  {summary().hardware === true
+                    ? "bolt"
+                    : summary().hardware === false
+                      ? "memory"
+                      : "videocam"}
+                </Symbol>
+                <Show when={hardwareKnown()}>
+                  <span>{summary().hardware ? "hw" : "sw"}</span>
+                </Show>
+                {/*
+                 * Each dot separates two segments that are *both* actually
+                 * rendering -- guard it on the segment before it having
+                 * rendered, not just the one after, so a segment that got
+                 * skipped (e.g. `fps` when only `framesSent`, not the rate
+                 * itself, is known yet) never leaves a leading dot in front
+                 * of whatever renders next.
+                 */}
+                <Show when={hardwareKnown() && fpsValueKnown()}>
+                  <BadgeDot />
+                </Show>
+                <Show when={fpsValueKnown()}>
+                  <span>{`${summary().fps} fps`}</span>
+                </Show>
+                <Show
+                  when={
+                    (hardwareKnown() || fpsValueKnown()) &&
+                    summary().limitedBy &&
+                    summary().limitedBy !== "none"
+                  }
+                >
+                  <BadgeDot />
+                  <span>{summary().limitedBy}</span>
+                </Show>
+              </Show>
+            </Badge>
           </Show>
-        </Badge>
-      )}
+        );
+      }}
     </Show>
   );
 }
@@ -1111,6 +1268,18 @@ const Badge = styled("div", {
     fontVariantNumeric: "tabular-nums",
 
     pointerEvents: "none",
+  },
+  variants: {
+    // The "not sending" state (see `ScreenShareBadge`) is a genuine error,
+    // not a neutral status like the rest of the badge -- deliberately given
+    // the app's regular error color rather than another shade of the badge's
+    // own near-black backdrop, so it reads as broken at a glance.
+    error: {
+      true: {
+        background: "var(--md-sys-color-error)",
+        color: "var(--md-sys-color-on-error)",
+      },
+    },
   },
 });
 
