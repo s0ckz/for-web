@@ -683,16 +683,43 @@ export const tile = cva({
         top: 0,
         left: 0,
         right: 0,
-        // `bottom: 0` alongside `top: 0` plus an explicit `height` (always
-        // set inline by `getHeight()` while focused, see below) over-
-        // constrains the box -- per the absolute-positioning spec, `auto`
-        // margins then split whatever space `height` leaves over between
-        // `margin-top`/`margin-bottom`, centering the tile vertically
-        // instead of leaving it pinned to the top. `width` stays `auto`
-        // (unaffected: with `left`/`right` both already `0` and `width:
-        // auto`, an `auto` margin resolves to `0` on that axis instead of
-        // trying to center it too).
-        bottom: 0,
+        // `bottom` alongside `top: 0` plus an explicit `height` (always set
+        // inline by `getHeight()` while focused, see below) over-constrains
+        // the box -- per the absolute-positioning spec, `auto` margins then
+        // split whatever space `height` leaves over between `margin-top`/
+        // `margin-bottom`, centering the tile vertically instead of leaving
+        // it pinned to the top. `width` stays `auto` (unaffected: with
+        // `left`/`right` both already `0` and `width: auto`, an `auto`
+        // margin resolves to `0` on that axis instead of trying to center it
+        // too).
+        //
+        // This tile's containing block while focused is `FocusOverlay`,
+        // sized to `Call`'s *entire* box (`inset: 0`, strip included) rather
+        // than just the area above the strip the old `FocusBox` wrapper used
+        // to center against -- see `Call`'s doc comment in
+        // `VoiceCallCardActiveRoom.tsx`. A plain `bottom: 0` therefore
+        // centers within the whole card, which pushes the tile down into
+        // (and lets it overlap) the strip. Pinning `bottom` to
+        // `var(--vc-strip-h, 0px)` instead moves the *bottom* of the
+        // centering box up to where the strip starts, recovering "the area
+        // above the strip" as the box `margin: auto` centers into:
+        //  - when `getHeight()` returns exactly that available height (the
+        //    common case), the auto margins resolve to `0` and the tile
+        //    fills the area above the strip edge-to-edge;
+        //  - when `getHeight()` caps it shorter by aspect ratio, the tile
+        //    centers *within* that area -- reproducing the old `FocusBox`
+        //    behaviour;
+        //  - when the strip is hidden, `--vc-strip-h` is `0px`, so this
+        //    degrades to the plain `bottom: 0` above and the tile fills the
+        //    whole card, which is correct.
+        // `top`, `bottom`, and `height` (the last from `getHeight()`) all
+        // have to agree on the same "area above the strip" reference for
+        // this centering to add up -- that pairing is exactly what broke
+        // when the centering (`margin: auto`) and the whole-card overlay
+        // (`FocusOverlay`'s `inset: 0`) landed in separate PRs, each written
+        // against a different assumption about what this tile's containing
+        // block was. Don't re-split them.
+        bottom: "var(--vc-strip-h, 0px)",
         margin: "auto",
         width: "auto",
         maxWidth: "none",
