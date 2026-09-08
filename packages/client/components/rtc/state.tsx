@@ -2859,11 +2859,32 @@ class Voice {
     return `${t.source}_${t.participant.sid}`;
   }
 
+  /**
+   * Focus (or unfocus) a track -- and, with it, decide whether the strip of
+   * everyone else stays on screen.
+   *
+   * Focus now owns `showBar` rather than leaving it as its own independent
+   * default: focusing a tile means "show me just this", so entering focus
+   * always hides the strip, even if the user had pulled it back into view
+   * during a *previous* focus. Leaving focus (including the no-argument call
+   * the focus-grace timeout in `VoiceCallCardActiveRoom.tsx` makes once a
+   * pinned stream has been gone too long) restores it, since that is when
+   * the grid the strip belongs to reappears. `toggleShowBar` -- the chevron
+   * -- is untouched: it still lets someone reveal the strip while staying
+   * focused, this only sets the strip's state at the moment focus itself
+   * changes.
+   *
+   * `next` is resolved once and used to drive both signals, instead of
+   * setting focus and then reading `this.focusId()` back afterwards --
+   * reading a signal a second time right after this same call changed it is
+   * exactly how the two could end up disagreeing.
+   */
   toggleFocus(t?: TrackReferenceOrPlaceholder) {
     const id = t ? this.trackId(t) : undefined;
-    this.#setFocus(
-      this.focusId() === id || this.vidTracks().length < 2 ? undefined : id,
-    );
+    const next =
+      this.focusId() === id || this.vidTracks().length < 2 ? undefined : id;
+    this.#setFocus(next);
+    this.#setShowBar(next === undefined);
   }
 
   isFocus(t: TrackReferenceOrPlaceholder) {
