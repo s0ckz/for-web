@@ -12,7 +12,12 @@ import { styled } from "styled-system/jsx";
 
 import { UserContextMenu } from "@revolt/app";
 import { useUser } from "@revolt/markdown/users";
-import { InRoom, useIsMicMuted, useIsSpeakingFast } from "@revolt/rtc";
+import {
+  InRoom,
+  useIsMicMuted,
+  useIsSpeakingFast,
+  useVoice,
+} from "@revolt/rtc";
 
 import { Avatar, Ripple, typography } from "../../design";
 import { Row } from "../../layout";
@@ -30,15 +35,15 @@ export function VoiceChannelPreview(props: { channel: Channel }) {
       channelId={props.channel.id}
       fallback={<VariantPreview channel={props.channel} />}
     >
-      <VariantLive />
+      <VariantLive channel={props.channel} />
     </InRoom>
   );
 }
 
 /**
- * Use API as the source of truth
+ * Use LiveKit as the source of truth
  */
-function VariantLive() {
+function VariantLive(props: { channel: Channel }) {
   const tracks = useTracks(
     [{ source: Track.Source.Camera, withPlaceholder: true }],
     { onlySubscribed: false },
@@ -46,13 +51,15 @@ function VariantLive() {
 
   return (
     <Base>
-      <TrackLoop tracks={tracks}>{() => <ParticipantLive />}</TrackLoop>
+      <TrackLoop tracks={tracks}>
+        {() => <ParticipantLive channel={props.channel} />}
+      </TrackLoop>
     </Base>
   );
 }
 
 /**
- * Use LiveKit as the source of truth
+ * Use API as the source of truth
  */
 function VariantPreview(props: { channel: Channel }) {
   return (
@@ -69,19 +76,42 @@ function VariantPreview(props: { channel: Channel }) {
 /**
  * Live variant of participant
  */
-function ParticipantLive() {
+function ParticipantLive(props: { channel: Channel }) {
   const participant = useEnsureParticipant();
 
   const isMuted = useIsMicMuted(participant);
 
   const isSpeaking = useIsSpeakingFast(participant);
 
+  const voice = useVoice();
+
+  const user = useUser(() => participant.identity);
+
+  // Deafen is local-only client state (never reported upstream, see
+  // `toggleDeafen` in `rtc/state.tsx`), so `voice.deafen()` is the only
+  // instant/authoritative source for the local user. For anyone else, the
+  // server-reported `is_receiving` on their `VoiceParticipant` is the only
+  // signal available, and stays "not deafened" if the backend never reports
+  // otherwise.
+  const isSelf = () => !!user().user?.self;
+
+  const voiceParticipant = () =>
+    props.channel.voiceParticipants.get(participant.identity);
+
+  // camera/screenshare are deliberately NOT sourced from `VoiceParticipant`
+  // here: this backend's voice state is unreliable (it strands ghost
+  // participants after they disconnect), while LiveKit is authoritative
+  // for anyone actually in-call. A wrongly-shown icon (stale server data)
+  // is worse than a missing one, so these stay hardcoded false until they
+  // are wired up properly from LiveKit as separate work.
   return (
     <CommonUser
       userId={participant.identity}
       speaking={isSpeaking()}
       muted={isMuted()}
-      deafened={false}
+      deafened={
+        isSelf() ? voice.deafen() : voiceParticipant()?.isReceiving() === false
+      }
       camera={false}
       screenshare={false}
       isLive
