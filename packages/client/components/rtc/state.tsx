@@ -75,6 +75,56 @@ type State =
   | "CONNECTED"
   | "RECONNECTING";
 
+/**
+ * LiveKit participant-attribute key this client uses to broadcast its own
+ * deafen state to everyone else in the room.
+ *
+ * Deafen used to be pure local client state (see the historic comment that
+ * used to live on `toggleDeafen`): the backend this talks to is a prebuilt
+ * image with no endpoint that could ever learn a participant deafened
+ * themselves, so nothing told other clients about it and everyone else's
+ * headphones icon simply never lit up.
+ *
+ * `room.localParticipant.publishData(...)` was the first thing considered
+ * and rejected: data messages are fire-and-forget over the SFU with no
+ * history, so a participant who joins the room *after* a given toggle was
+ * sent would never receive it and would see this user as not-deafened
+ * until their next toggle, if any. Participant *attributes*
+ * (`setAttributes`, `Participant.attributes`, `RoomEvent.
+ * ParticipantAttributesChanged` -- all present since livekit-client
+ * 2.20.2, see LocalParticipant.d.ts/Participant.d.ts/events.d.ts) are held
+ * by the SFU as part of a participant's own state and are replayed to
+ * every later joiner automatically, which is exactly what deafen needs.
+ *
+ * This is a wire contract with every other Stoat client (for-desktop
+ * included, once it adopts the same thing) -- do not rename this key
+ * without updating every reader of it, here and elsewhere. The value is
+ * always written, never omitted: `"1"` means deafened, `"0"` means
+ * explicitly not deafened, and an ABSENT key means unknown (an older
+ * client, or a join whose token lacked the attribute-update grant).
+ * Writing it unconditionally rather than only-when-true is what lets a
+ * reader tell "this client is running code that reports deafen and says
+ * no" apart from "this client has never said anything" (see
+ * `#remoteAttributesKnown` in {@link Voice}) -- the latter is exactly the
+ * case that must fall back to the pre-existing `isReceiving()` server
+ * signal instead of assuming not-deafened. `"0"`, not `""`, is used for
+ * the false case specifically because LiveKit treats an empty-string
+ * attribute value as a deletion of the attribute -- publishing `""` would
+ * silently collapse "explicitly not deafened" back into "never said
+ * anything", the exact ambiguity this key exists to avoid.
+ */
+const DEAFEN_ATTRIBUTE_KEY = "deafened";
+
+/**
+ * Read {@link DEAFEN_ATTRIBUTE_KEY} off a participant's attribute map.
+ * @param attributes `Participant.attributes` (or a `changedAttributes` diff)
+ */
+function readDeafenAttribute(
+  attributes: Readonly<Record<string, string>>,
+): boolean {
+  return attributes[DEAFEN_ATTRIBUTE_KEY] === "1";
+}
+
 type ScreenShareQuality = {
   name: ScreenShareQualityName;
   resolution: VideoResolution;
@@ -815,6 +865,23 @@ class Voice {
   deafen: Accessor<boolean>;
   microphone: Accessor<boolean>;
 
+  /**
+   * Remote participants' deafen state, keyed by identity, as reported by
+   * {@link DEAFEN_ATTRIBUTE_KEY}. An identity is only present here once we
+   * have *actually observed* an attribute from them (seeded from
+   * `participant.attributes` for whoever is already in the room when we
+   * connect, kept live via `RoomEvent.ParticipantAttributesChanged`) -- a
+   * missing entry means "unknown", not "not deafened", so consumers can
+   * fall back to the pre-existing `isReceiving()` server signal instead of
+   * assuming the wrong thing about a client that simply hasn't sent this
+   * attribute yet (e.g. an older build, or a join whose token lacked the
+   * metadata-update grant -- see {@link #publishDeafenAttribute}). Reset to
+   * empty on every {@link disconnect} so state from a previous call never
+   * leaks into the next one.
+   */
+  remoteDeafen: Accessor<Record<string, boolean>>;
+  #setRemoteDeafen: Setter<Record<string, boolean>>;
+
   video: Accessor<boolean>;
   #setVideo: Setter<boolean>;
 
@@ -959,6 +1026,20 @@ class Voice {
    */
   #browserReacquireAttempted = false;
 
+  /**
+   * Whether {@link #publishDeafenAttribute} has already logged this room's
+   * `setAttributes` rejection once. `setAttributes` needs the join token to
+   * grant `canUpdateOwnMetadata`, which this app's backend token mint may
+   * not include -- if it doesn't, every single call (the one-shot publish
+   * on `connected` *and* every future `toggleDeafen`) rejects the same way
+   * forever. Logging every one of those would spam the console on every
+   * mute toggle for the rest of the call; logging exactly once per room
+   * says the same thing once and then gets out of the way. Reset to
+   * `false` in {@link disconnect} so the *next* room (which might have a
+   * token that does grant it) gets its own fresh warning if it also fails.
+   */
+  #deafenAttributeGrantWarned = false;
+
   constructor(
     voiceSettings: VoiceSettings,
     modals: ModalController,
@@ -987,6 +1068,12 @@ class Voice {
 
     this.deafen = () => voiceSettings.deafen;
     this.microphone = () => voiceSettings.micOn && !voiceSettings.deafen;
+
+    const [remoteDeafen, setRemoteDeafen] = createSignal<
+      Record<string, boolean>
+    >({});
+    this.remoteDeafen = remoteDeafen;
+    this.#setRemoteDeafen = setRemoteDeafen;
 
     const [video, setVideo] = createSignal(false);
     this.video = video;
@@ -1164,6 +1251,7 @@ class Voice {
         this.#setMicEnabled(room, this.#settings.micOn).then((track) => {
           this.#settings.micOn = track != null;
         });
+      const seededRemoteDeafen: Record<string, boolean> = {};
       for (const p of room.remoteParticipants.values()) {
         const screenShareTrack = p.getTrackPublication(
           Track.Source.ScreenShare,
@@ -1171,7 +1259,24 @@ class Voice {
         if (screenShareTrack) {
           this.screenShareTracks.add(screenShareTrack.trackSid);
         }
+        // Seed remote deafen state from whoever is already in the room --
+        // their attributes (if any) were set before we joined, and the SFU
+        // replays a participant's full attribute set to every later
+        // joiner, so this is available immediately with no need to wait
+        // for a `ParticipantAttributesChanged` event that will never come
+        // for someone who hasn't touched deafen since we joined.
+        if (DEAFEN_ATTRIBUTE_KEY in p.attributes) {
+          seededRemoteDeafen[p.identity] = readDeafenAttribute(p.attributes);
+        }
       }
+      this.#setRemoteDeafen(seededRemoteDeafen);
+
+      // Publish our own current deafen state once we're actually connected
+      // -- see #publishDeafenAttribute's doc comment for why this, and not
+      // just relying on the next toggle, matters for someone who joins
+      // already deafened.
+      void this.#publishDeafenAttribute(room, this.#settings.deafen);
+
       this.sound.playSound("userJoinVoice");
       // Only here, not the constructor: `this.limits()` (from `useInstance`)
       // isn't populated yet at construction, so priming earlier could probe
@@ -1285,12 +1390,51 @@ class Voice {
       }
     });
 
-    room.addListener("participantConnected", () => {
+    room.addListener("participantConnected", (participant) => {
       this.sound.playSound("userJoinVoice");
+      // Someone who joins *after* us may already have deafen attributes
+      // set (e.g. they reconnected mid-call while deafened) -- the
+      // `connected` seeding above only covers whoever was present when we
+      // joined, so a newcomer needs the same treatment here.
+      if (DEAFEN_ATTRIBUTE_KEY in participant.attributes) {
+        const deafened = readDeafenAttribute(participant.attributes);
+        this.#setRemoteDeafen((prev) => ({
+          ...prev,
+          [participant.identity]: deafened,
+        }));
+      }
     });
 
-    room.addListener("participantDisconnected", () => {
+    room.addListener("participantDisconnected", (participant) => {
       this.sound.playSound("userLeaveVoice");
+      // Drop their entry rather than leaving a stale one behind: if this
+      // identity reconnects later (a fresh `RemoteParticipant` object),
+      // it's re-seeded from scratch above rather than inheriting whatever
+      // was true the last time they were here.
+      this.#setRemoteDeafen((prev) => {
+        if (!(participant.identity in prev)) return prev;
+        const next = { ...prev };
+        delete next[participant.identity];
+        return next;
+      });
+    });
+
+    // Kept live for the rest of the call: fires whenever any participant
+    // (local or remote) changes their attributes. We only care about
+    // remote changes to DEAFEN_ATTRIBUTE_KEY here -- our own local
+    // attribute writes (from #publishDeafenAttribute) also route through
+    // this event, but `this.deafen()` is already this client's own
+    // authoritative source, so there is nothing to learn by reading our
+    // own attribute back.
+    room.addListener("participantAttributesChanged", (changed, participant) => {
+      if (participant.isLocal) return;
+      if (!(DEAFEN_ATTRIBUTE_KEY in changed)) return;
+
+      const deafened = readDeafenAttribute(participant.attributes);
+      this.#setRemoteDeafen((prev) => ({
+        ...prev,
+        [participant.identity]: deafened,
+      }));
     });
 
     room.addListener("trackPublished", (pub) => {
@@ -1350,6 +1494,12 @@ class Voice {
       this.#armedScreenShareUpstreamTrack = undefined;
       this.#browserReacquireAttempted = false;
       this.#stopReacquireBackoff();
+      // Per-room deafen-attribute state: a stale remote map must not leak
+      // into the next call (wrong icons for identities that never even
+      // joined this next room), and a fresh room deserves its own chance
+      // at the grant-missing warning even if the last one lacked it.
+      this.#setRemoteDeafen({});
+      this.#deafenAttributeGrantWarned = false;
 
       room.removeAllListeners();
       room.disconnect();
@@ -1494,6 +1644,48 @@ class Voice {
     });
   }
 
+  /**
+   * Publish this client's own deafen state onto its LiveKit participant
+   * attributes -- see {@link DEAFEN_ATTRIBUTE_KEY} for why attributes and
+   * not `publishData`. Called once on `connected` (so a user who joins
+   * already deafened is correct for everyone else from the start, not just
+   * from their next toggle) and again from {@link toggleDeafen} every time
+   * it changes.
+   *
+   * `setAttributes` requires the join token to grant
+   * `canUpdateOwnMetadata`. This app's backend mints that token and may not
+   * include the grant, in which case the promise rejects on every call,
+   * forever, for this room. That must never surface as a user-visible error
+   * or an unhandled rejection -- it just means remote clients keep falling
+   * back to the pre-existing `isReceiving()` signal, exactly today's
+   * behaviour before this feature existed -- so the rejection is swallowed
+   * here and reported at most once per room via
+   * {@link #deafenAttributeGrantWarned}.
+   * @param room The connected room to publish onto
+   * @param deafened This client's current deafen state
+   */
+  async #publishDeafenAttribute(room: Room, deafened: boolean) {
+    try {
+      await room.localParticipant.setAttributes({
+        // Always written, never omitted -- see DEAFEN_ATTRIBUTE_KEY's doc
+        // comment for what "1" vs "0" vs absent mean. "0", not "", for the
+        // not-deafened case: LiveKit treats an empty-string attribute value
+        // as a delete, so writing "" here would silently collapse
+        // "explicitly not deafened" into "never said anything" -- exactly
+        // the distinction this attribute exists to preserve.
+        [DEAFEN_ATTRIBUTE_KEY]: deafened ? "1" : "0",
+      });
+    } catch (e) {
+      if (!this.#deafenAttributeGrantWarned) {
+        this.#deafenAttributeGrantWarned = true;
+        console.warn(
+          "[rtc] could not publish deafen attribute -- join token likely lacks canUpdateOwnMetadata; remote clients will fall back to the server's isReceiving() signal for this user",
+          e,
+        );
+      }
+    }
+  }
+
   async toggleDeafen(fromMute?: boolean) {
     try {
       const room = this.room();
@@ -1507,6 +1699,10 @@ class Voice {
       if (fromMute) {
         this.#settings.micOn = this.#isMicEnabled(room);
       }
+      // Broadcast the new state -- see #publishDeafenAttribute's doc
+      // comment; deliberately not awaited so a slow/rejected metadata
+      // update never delays the local mute/sound feedback below.
+      void this.#publishDeafenAttribute(room, this.#settings.deafen);
       if (this.#settings.deafen) {
         this.sound.playSound("deafen");
       } else {

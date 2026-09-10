@@ -158,6 +158,13 @@ export function ParticipantTile() {
   const isSpeaking = useIsSpeakingFast(participant);
   const isSelf = () => !!user().user?.self;
 
+  // See the matching comment in VoiceChannelPreview.tsx's ParticipantLive:
+  // `voice.remoteDeafen()` is the LiveKit-attribute-backed signal for
+  // anyone but ourselves, authoritative whenever this identity has an
+  // entry; only fall back to the server's `is_receiving` when it doesn't.
+  const remoteDeafenAttribute = () =>
+    voice.remoteDeafen()[participant.identity];
+
   /**
    * Screen shares are opt-in: joining a call with several people sharing should
    * not immediately pull down every stream. Your own share is always shown.
@@ -615,21 +622,26 @@ export function ParticipantTile() {
                     userId={participant.identity}
                     muted={isMuted()}
                     camera={isVideo()}
-                    // Deafen is local-only client state (never reported
-                    // upstream, see `toggleDeafen` in `rtc/state.tsx`), so
                     // `voice.deafen()` is the only instant/authoritative
-                    // source for the local user. For anyone else, the
+                    // source for the local user's own state -- it is never
+                    // reported upstream in a way the server round-trips
+                    // back to us. For anyone else, `voice.remoteDeafen()`
+                    // (the LiveKit participant attribute, see
+                    // DEAFEN_ATTRIBUTE_KEY in `rtc/state.tsx`) wins
+                    // whenever present -- it's the SFU replaying that
+                    // participant's own broadcast. Only fall back to the
                     // server-reported `is_receiving` on their
-                    // `VoiceParticipant` is the only signal available, and
-                    // stays "not deafened" if the backend never reports
-                    // otherwise.
+                    // `VoiceParticipant` when that remote client hasn't
+                    // published the attribute at all (older build, or a
+                    // join token missing the attribute-update grant).
                     deafened={
                       isSelf()
                         ? voice.deafen()
-                        : voice
+                        : (remoteDeafenAttribute() ??
+                          voice
                             .channel()
                             ?.voiceParticipants.get(participant.identity)
-                            ?.isReceiving() === false
+                            ?.isReceiving() === false)
                     }
                     // screenshare is deliberately NOT sourced from
                     // `VoiceParticipant` here: this backend's voice state
