@@ -615,6 +615,29 @@ export function ParticipantTile() {
                     userId={participant.identity}
                     muted={isMuted()}
                     camera={isVideo()}
+                    // Deafen is local-only client state (never reported
+                    // upstream, see `toggleDeafen` in `rtc/state.tsx`), so
+                    // `voice.deafen()` is the only instant/authoritative
+                    // source for the local user. For anyone else, the
+                    // server-reported `is_receiving` on their
+                    // `VoiceParticipant` is the only signal available, and
+                    // stays "not deafened" if the backend never reports
+                    // otherwise.
+                    deafened={
+                      isSelf()
+                        ? voice.deafen()
+                        : voice
+                            .channel()
+                            ?.voiceParticipants.get(participant.identity)
+                            ?.isReceiving() === false
+                    }
+                    // screenshare is deliberately NOT sourced from
+                    // `VoiceParticipant` here: this backend's voice state
+                    // is unreliable (it strands ghost participants after
+                    // they disconnect), while LiveKit is authoritative
+                    // for anyone actually in-call. A wrongly-shown icon
+                    // (stale server data) is worse than a missing one, so
+                    // this is left to be wired up from LiveKit separately.
                   />
                 )}
               </Row>
