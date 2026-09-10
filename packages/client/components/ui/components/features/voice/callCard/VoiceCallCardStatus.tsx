@@ -89,7 +89,14 @@ const Status = styled("div", {
         color: "var(--md-sys-color-outline)",
       },
       DISCONNECTED: {
-        color: "var(--md-sys-color-outline)",
+        // Escalated from the same grey as CONNECTING/RECONNECTING: an
+        // unexpected drop (see Voice.#handleUnexpectedDisconnect in
+        // rtc/state.tsx) is now reported via a snackbar and a sound, but
+        // this caption is still the only *persistent* on-card indication,
+        // and low-contrast grey read as "still working on it" rather than
+        // "something went wrong" -- easy to miss entirely if the call card
+        // isn't in view when the drop happens.
+        color: "var(--md-sys-color-error)",
       },
       RECONNECTING: {
         color: "var(--md-sys-color-outline)",
