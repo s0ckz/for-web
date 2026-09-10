@@ -973,7 +973,7 @@ export function ScreenShareStats(props: {
   return (
     <Panel onClick={(e) => e.stopPropagation()}>
       <Header>
-        <span>stats for nerds{sending() ? " -- your share" : ""}</span>
+        <Title>stats for nerds{sending() ? " -- your share" : ""}</Title>
         <Buttons>
           <Action onClick={copy}>{copied() ? "copied" : "copy"}</Action>
           <Show when={props.onClose}>
@@ -1183,16 +1183,73 @@ export function ScreenShareBadge(props: { sample: ScreenShareSample }) {
   );
 }
 
+/*
+ * `Panel` used to be laid out purely as a grid item -- `gridArea: "1/1"` +
+ * `alignSelf/justifySelf: "start"` -- sharing the tile's single implicit
+ * grid cell with every other overlay (`Controls`, `NotWatching`, the `tile`
+ * focus variant, ...). That works fine for placement, but it makes
+ * `maxHeight: "calc(100% - ...)"` (needed so the panel can never exceed the
+ * tile, see below) resolve against *that grid cell's* size, not the tile's --
+ * and per the grid item content-sizing rules, a cell holding only
+ * `align-self: start` items (items that do not stretch to the cell's full
+ * size) is track-sized to the *content* those items want, not to the
+ * container. That is circular for a `max-height` meant to cap that same
+ * content: the percentage basis becomes indefinite before the cap can ever
+ * apply, and a `%`/`calc()` max-height against an indefinite basis resolves
+ * to `none` per spec -- i.e. exactly the "silently does nothing" failure
+ * mode this file's plan warned about. Some engines paper over this for the
+ * *stretched* items in the same cell (hence `Controls` etc. working), but
+ * nothing here should depend on that for an item that explicitly opts out
+ * of stretching.
+ *
+ * `position: absolute` sidesteps the whole question: an absolutely
+ * positioned box's percentage height resolves against its containing
+ * block's own (used) height, which is well-defined regardless of how that
+ * ancestor's children are laid out -- and `tile`'s cva base now sets
+ * `position: relative` (`ParticipantTile.tsx`) specifically so this panel's
+ * containing block is the tile itself, in both the normal case (tile height
+ * is definite via `aspect-ratio` + width) and the focused case (`tile`'s own
+ * `focus: true` variant sets `position: absolute` with an inline `height`
+ * from `getHeight()` -- still a definite height on the *same* element this
+ * panel is now positioned against). `top`/`left` replace the old
+ * `margin: var(--gap-md)` + grid alignment for placement; `maxWidth` is
+ * unchanged, since the horizontal case was never the problem.
+ */
 const Panel = styled("div", {
   base: {
-    gridArea: "1/1",
-    alignSelf: "start",
-    justifySelf: "start",
-    margin: "var(--gap-md)",
-    padding: "var(--gap-md)",
+    position: "absolute",
+    top: "var(--gap-md)",
+    left: "var(--gap-md)",
     zIndex: 10,
 
+    // Belt-and-braces for the `calc(100% - ...)` maxHeight below: without
+    // `border-box`, `padding` would be added on top of the capped height
+    // instead of being carved out of it, letting the panel grow past the
+    // cap by exactly its own padding.
+    boxSizing: "border-box",
+    padding: "var(--gap-md)",
+
+    // Flex column so `Header` (fixed-size) and `Grid` (the rows, scrolling)
+    // stack and only the latter grows/scrolls -- see `Grid` below for why
+    // the scrollbar lives there rather than here, on `Panel`.
+    display: "flex",
+    flexDirection: "column",
+
     maxWidth: "min(320px, 90%)",
+    // The actual "too tall for its tile" fix: caps the panel at the tile's
+    // height minus a `--gap-md` margin on both the top (the panel's own
+    // `top` offset above) and bottom, so it can never grow past the tile
+    // regardless of how many rows the sampler emits (~25 outbound / ~21
+    // inbound -- see this file's top doc comment). `Grid` below is what
+    // actually overflows and scrolls; this only ever caps the ceiling.
+    maxHeight: "calc(100% - 2 * var(--gap-md))",
+    // Every sibling overlay sharing this same grid cell (`Controls`,
+    // `NotWatching`, the `tile` focus variant) declares this explicitly
+    // rather than relying on the tile happening to be hit-testable --
+    // closing that same latent gap here rather than leaving this panel as
+    // the one overlay that only works by accident.
+    pointerEvents: "auto",
+
     borderRadius: "var(--borderRadius-md)",
     background: "#000000cc",
     color: "#fff",
@@ -1205,8 +1262,29 @@ const Panel = styled("div", {
   },
 });
 
+/**
+ * No `position: sticky` here, deliberately. The obvious way to keep
+ * `copy`/`close` reachable while the rows scroll is a sticky header with an
+ * opaque background masking whatever passes underneath it -- and that was
+ * tried first, but it does not actually work against this panel's
+ * translucent design: `Panel`'s own background is `#000000cc` (80% alpha),
+ * so matching it on the sticky header still lets 20% of scrolled-under row
+ * text show through as visible ghosting, and the header ends up compositing
+ * to a visibly different (darker) shade than the rest of the panel. Patching
+ * the alpha upward just trades one visible artifact for another (a
+ * header/body seam), and an opaque header would abandon the panel's
+ * translucent look outright.
+ *
+ * The actual fix is to remove the need for a mask at all: `Panel` is a flex
+ * column, `Header` here is a fixed-size flex item (`flexShrink: 0`), and
+ * only `Grid` below -- the rows -- scrolls. Content that never shares
+ * `Header`'s box in the first place can't show through it, at any scroll
+ * offset, with no background/alpha/margin tricks required.
+ */
 const Header = styled("div", {
   base: {
+    flexShrink: 0,
+
     display: "flex",
     alignItems: "center",
     justifyContent: "space-between",
@@ -1218,8 +1296,31 @@ const Header = styled("div", {
   },
 });
 
+/**
+ * The "stats for nerds" title. `min-width: 0` overrides a flex item's
+ * default `min-width: auto`, which would otherwise floor this span's width
+ * at its own content size and let that content keep shoving `Buttons`
+ * sideways no matter how little room `Header` has -- only with the floor
+ * removed can `overflow: hidden` + `text-overflow: ellipsis` actually clip
+ * the text instead of losing the fight for space against `copy`/`close`.
+ * This was the most plausible "can't close it" path: `justify-content:
+ * space-between` with no shrink control on either side let the uppercase
+ * title push `close` right off the panel's edge on a narrow tile.
+ */
+const Title = styled("span", {
+  base: {
+    minWidth: 0,
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  },
+});
+
+/** `flexShrink: 0` is `Title`'s other half: `copy`/`close` must never be the
+ * side that gives, or a long title could still squeeze them illegibly small
+ * instead of eliding itself. */
 const Buttons = styled("div", {
-  base: { display: "flex", gap: "var(--gap-sm)" },
+  base: { display: "flex", gap: "var(--gap-sm)", flexShrink: 0 },
 });
 
 const Action = styled("button", {
@@ -1240,13 +1341,43 @@ const Grid = styled("div", {
     display: "grid",
     gridTemplateColumns: "auto 1fr",
     columnGap: "var(--gap-md)",
+
+    // This is where `Panel`'s old `overflowY`/`overscrollBehavior` moved to
+    // (see `Header`'s doc comment for why): the rows are the only thing
+    // that should ever scroll under `Header`, so the scrollbar belongs on
+    // this element, not on `Panel` itself.
+    overflowY: "auto",
+    // Stops an over-scroll at the top/bottom of this scroll area from
+    // "chaining" into scrolling the page/tile behind it -- this panel
+    // floats over content the user very likely does not want to nudge while
+    // reading stats.
+    overscrollBehavior: "contain",
+    // A flex item's (`Panel`'s child) default `min-height: auto` sizes it
+    // to fit its content, which for a scroll container means "big enough
+    // that nothing needs to scroll" -- exactly defeating the point of
+    // `overflowY: auto` above. Zeroing it lets `Grid` actually shrink below
+    // its content height and hand the excess to the scrollbar. Grid layout
+    // itself (the `auto 1fr` columns) is unaffected: a flex/grid item's
+    // min-size axis and its own internal `display: grid` formatting are
+    // independent, so this only changes how much vertical space `Grid` is
+    // willing to be squeezed into, not how its two columns lay out.
+    minHeight: 0,
   },
 });
 
 const Label = styled("div", { base: { opacity: 0.6, whiteSpace: "nowrap" } });
 
 const Value = styled("div", {
-  base: { textAlign: "right", fontVariantNumeric: "tabular-nums" },
+  base: {
+    textAlign: "right",
+    fontVariantNumeric: "tabular-nums",
+    // Codec rows (`sdpFmtpLine`, see e.g. the outbound/inbound sample
+    // builders above) can be long enough to run past `Panel`'s 320px cap
+    // with nowhere to break -- `anywhere` allows a break at any character
+    // once there is no better (word/hyphen) opportunity, wrapping the value
+    // inside the panel instead of overflowing its edge.
+    overflowWrap: "anywhere",
+  },
 });
 
 const Badge = styled("div", {

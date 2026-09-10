@@ -547,7 +547,25 @@ export function ParticipantTile() {
           </ReacquiringNotice>
         </Show>
 
-        <Show when={isScreenShare() && isWatching() && !chromeHidden()}>
+        {/*
+         * `|| showStats()` keeps this toolbar mounted whenever the stats
+         * panel is open, even once `chromeHidden()` would otherwise hide it
+         * (fullscreen + an idle pointer, see `chromeHidden`/`IDLE_TIMEOUT`
+         * above). Without it, the *only* toggle for `ScreenShareStats` --
+         * the `analytics` button below -- disappears while the panel it
+         * controls stays open, leaving it up with nothing on screen able to
+         * close it in that state. This is deliberately not "always show
+         * `Controls` while `showStats()`": the fullscreen/idle chrome-hiding
+         * behavior for every *other* control here (stop watching,
+         * fullscreen toggle) is unaffected, since those still disappear
+         * together with the rest of the chrome the moment the panel is
+         * closed.
+         */}
+        <Show
+          when={
+            isScreenShare() && isWatching() && (!chromeHidden() || showStats())
+          }
+        >
           <Controls onClick={(e) => e.stopPropagation()}>
             <ControlButton
               title="Statistics"
@@ -633,6 +651,15 @@ export function ParticipantTile() {
 export const tile = cva({
   base: {
     display: "grid",
+    // Makes this tile the containing block for `ScreenShareStats.tsx`'s
+    // `Panel`, which positions itself `absolute` against it (see `Panel`'s
+    // own doc comment for why a plain grid-item `max-height` percentage
+    // could not be trusted to resolve here). Harmless for the `focus: true`
+    // variant below, which already sets `position: absolute` on this same
+    // element -- an explicit `position` always wins over this `relative`,
+    // it just also happens to be a valid (and, for an absolutely positioned
+    // box, always-positioned) containing block itself.
+    position: "relative",
     aspectRatio: "16/9",
     // Only the outline (the speaking ring) actually needs to animate.
     // `transition: all` was making every property change on this element --
