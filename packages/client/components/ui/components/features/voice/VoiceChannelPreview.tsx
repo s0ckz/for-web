@@ -87,16 +87,23 @@ function ParticipantLive(props: { channel: Channel }) {
 
   const user = useUser(() => participant.identity);
 
-  // Deafen is local-only client state (never reported upstream, see
-  // `toggleDeafen` in `rtc/state.tsx`), so `voice.deafen()` is the only
-  // instant/authoritative source for the local user. For anyone else, the
-  // server-reported `is_receiving` on their `VoiceParticipant` is the only
-  // signal available, and stays "not deafened" if the backend never reports
-  // otherwise.
+  // For the local user, `voice.deafen()` (this client's own toggle state)
+  // is the only instant/authoritative source -- it is never reported
+  // upstream in a way the server round-trips back to us. For anyone else,
+  // prefer the LiveKit participant attribute `voice.remoteDeafen()` reads
+  // (see DEAFEN_ATTRIBUTE_KEY in `rtc/state.tsx`): it is the SFU replaying
+  // that participant's own broadcast, so it is authoritative whenever
+  // present. It is only ever *absent* for a remote participant whose
+  // client hasn't published it yet (an older build, or a join token
+  // missing the attribute-update grant) -- in that one case only, fall
+  // back to the server-reported `is_receiving` on their `VoiceParticipant`.
   const isSelf = () => !!user().user?.self;
 
   const voiceParticipant = () =>
     props.channel.voiceParticipants.get(participant.identity);
+
+  const remoteDeafenAttribute = () =>
+    voice.remoteDeafen()[participant.identity];
 
   // camera/screenshare are deliberately NOT sourced from `VoiceParticipant`
   // here: this backend's voice state is unreliable (it strands ghost
@@ -110,7 +117,10 @@ function ParticipantLive(props: { channel: Channel }) {
       speaking={isSpeaking()}
       muted={isMuted()}
       deafened={
-        isSelf() ? voice.deafen() : voiceParticipant()?.isReceiving() === false
+        isSelf()
+          ? voice.deafen()
+          : (remoteDeafenAttribute() ??
+            voiceParticipant()?.isReceiving() === false)
       }
       camera={false}
       screenshare={false}
