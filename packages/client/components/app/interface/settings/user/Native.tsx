@@ -48,8 +48,16 @@ declare global {
        * Only present in builds of the desktop app that ship the recovery IPC,
        * hence optional -- the web client must degrade to simply ending the
        * share.
+       *
+       * Resolves `"gone"` when the shared window is confirmed destroyed
+       * (closed, not merely minimised/occluded) -- a terminal verdict the
+       * caller should treat as "stop retrying and end the share" rather than
+       * parking it. A bare `false` keeps its original meaning: not found yet,
+       * still worth another retry (also what an older desktop build without
+       * this widened return type will resolve, since it can only ever
+       * produce `true`/`false`).
        */
-      reacquireScreenShare?(): Promise<boolean>;
+      reacquireScreenShare?(): Promise<boolean | "gone">;
       isWayland?(): boolean;
     };
 

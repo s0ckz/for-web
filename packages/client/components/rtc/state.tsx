@@ -704,6 +704,45 @@ const RECOVERY_WINDOW_MS = 60_000;
  */
 const REACQUIRE_BACKOFF_MS = [5_000, 15_000, 60_000];
 
+/**
+ * Absolute cap on how long a screen share may sit parked (counted from when
+ * the capture first went down -- see {@link Voice.#onScreenShareEnded}
+ * stamping {@link Voice.#parkedSince}, not from when
+ * {@link Voice.#scheduleReacquireRetry} first parks it) before we give up
+ * and end it for real, even though {@link Voice.#recoverScreenShare} never
+ * got a definitive answer either way. This is the platform-independent
+ * safety net: for-desktop's own reacquire poll already gives up after
+ * REACQUIRE_TIMEOUT_MS (90s, in `window.ts`) per attempt and can report the
+ * terminal `"gone"` immediately on a confirmed-destroyed window, but an
+ * older desktop build only ever resolves a bare `false`, and plain web
+ * (`#recoverScreenShareBrowser`) has no terminal signal at all -- both would
+ * otherwise retry with {@link REACQUIRE_BACKOFF_MS}'s backoff forever, which
+ * is exactly the "never stops" bug this whole cap exists to close. Set
+ * comfortably longer than one reacquire poll (90s) so a genuinely slow
+ * window recreation (e.g. a heavy app restarting) still wins and the share
+ * recovers instead of being cut off from under it.
+ *
+ * Not a hard bound, though: the cap is only ever tested *between*
+ * `#recoverScreenShare` calls (before starting one, and again after it
+ * resolves), never while one is in flight, so a reacquire call that was
+ * already running when the cap ticked over is left to finish rather than
+ * cut off mid-call. Worst case the share therefore lives for roughly
+ * `MAX_PARKED_MS` plus one more reacquire poll (up to REACQUIRE_TIMEOUT_MS,
+ * 90s) on top -- not the ~2 minutes this constant might otherwise imply.
+ */
+const MAX_PARKED_MS = 2 * 60 * 1000;
+
+/**
+ * How long the sharer's own "screen share ended" notice
+ * ({@link Voice.screenShareState}`()` starting with `"ended-"`) stays up
+ * before Voice clears it back to `"idle"` on its own -- see
+ * {@link Voice.#showEndedNotice}. Owned here rather than as a timer inside
+ * `ParticipantTile`: `screenShareState` is shared Voice state, not view
+ * state, so a stray remount of the tile (e.g. the participant grid
+ * re-rendering) must not reset or duplicate the clock.
+ */
+const ENDED_NOTICE_MS = 4_000;
+
 /** What a screen share was started with, remembered so a capture that dies
  * can be recovered with the same quality/audio rather than the saved default. */
 type ShareChoice = { qualityName: ScreenShareQualityName; audio: boolean };
@@ -733,13 +772,30 @@ class Voice {
 
   /**
    * Whether a live screen share's capture is currently down and being
-   * automatically retried (see {@link #scheduleReacquireRetry}). Distinct
-   * from {@link screenshare}, which stays `true` throughout -- from the
-   * sharer's perspective the share never stopped, this is just enough for
-   * their own tile to show an inline notice while it waits to come back.
+   * automatically retried (see {@link #scheduleReacquireRetry}), or has just
+   * ended on a terminal verdict. Distinct from {@link screenshare}, which
+   * stays `true` throughout `"reacquiring"` -- from the sharer's perspective
+   * the share never stopped, this is just enough for their own tile to show
+   * an inline notice while it waits to come back. The `"ended-"` states are
+   * different: `screenshare()` has already flipped `false` by the time
+   * either is set (see {@link #endScreenShare}), and they exist purely so
+   * the sharer can be told why their tile just lost its share instead of it
+   * silently vanishing -- the UI clears back to `"idle"` a few seconds later
+   * (see `#showEndedNotice`). The two are split rather than a single
+   * `"ended"` because they know different amounts: `"ended-gone"` is a
+   * confirmed-destroyed window (for-desktop's `"gone"` verdict, see
+   * `#recoverScreenShare`) and can say so specifically, while
+   * `"ended-timeout"` is {@link MAX_PARKED_MS} giving up on an *ambiguous*
+   * verdict (an older desktop build's bare `false`, or plain web, neither of
+   * which ever confirms the window/tab is actually gone) and must not claim
+   * a cause it was never told.
    */
-  screenShareState: Accessor<"idle" | "reacquiring">;
-  #setScreenShareState: Setter<"idle" | "reacquiring">;
+  screenShareState: Accessor<
+    "idle" | "reacquiring" | "ended-gone" | "ended-timeout"
+  >;
+  #setScreenShareState: Setter<
+    "idle" | "reacquiring" | "ended-gone" | "ended-timeout"
+  >;
 
   fullscreen: Accessor<boolean>;
   #setFullscreen: Setter<boolean>;
@@ -808,6 +864,30 @@ class Voice {
   #reacquireBackoffStep = 0;
 
   /**
+   * Timestamp of the moment the capture first went down in the current
+   * parking episode, or `undefined` when nothing is parked. Stamped at the
+   * top of {@link #onScreenShareEnded}, *before* the first
+   * {@link #recoverScreenShare} call -- not inside {@link
+   * #scheduleReacquireRetry}, which only runs after that first call already
+   * returned. Stamping it that early matters: {@link #recoverScreenShare}
+   * can itself block for up to REACQUIRE_TIMEOUT_MS (90s, in for-desktop's
+   * `window.ts`) per attempt, and stamping only once parking starts would
+   * let one or more such in-flight calls run before {@link MAX_PARKED_MS}
+   * is ever measured against anything, letting the real parked duration
+   * balloon well past what the cap documents. Compared against
+   * {@link MAX_PARKED_MS} both before and after every {@link
+   * #recoverScreenShare} call so a share that never gets a definitive
+   * answer either way still ends close to on schedule instead of parking
+   * indefinitely. Cleared in {@link #stopReacquireBackoff}, the single place
+   * all three "stop being parked" paths -- a real stop, disconnect, and a
+   * successful recovery -- already funnel through.
+   */
+  #parkedSince?: number;
+
+  /** Pending {@link #showEndedNotice} auto-clear timer. */
+  #endedNoticeTimer?: ReturnType<typeof setTimeout>;
+
+  /**
    * Whether the one silent re-acquire {@link #recoverScreenShareBrowser}
    * is allowed has already been spent for the share currently running.
    * Reset when a fresh share starts and when the current one stops -- see
@@ -853,7 +933,7 @@ class Voice {
     this.#setScreenshare = setScreenshare;
 
     const [screenShareState, setScreenShareState] = createSignal<
-      "idle" | "reacquiring"
+      "idle" | "reacquiring" | "ended-gone" | "ended-timeout"
     >("idle");
     this.screenShareState = screenShareState;
     this.#setScreenShareState = setScreenShareState;
@@ -1464,18 +1544,7 @@ class Voice {
 
     if (this.screenshare()) {
       // Deliberately stopping means there is nothing left to recover.
-      this.#lastShareChoice = undefined;
-      this.#recoveryAttempts = [];
-      this.#armedShareEndedPublication = undefined;
-      this.#armedScreenShareUpstreamTrack = undefined;
-      this.#browserReacquireAttempted = false;
-      this.#stopReacquireBackoff();
-
-      await room.localParticipant.setScreenShareEnabled(false);
-
-      this.#setScreenshare(room.localParticipant.isScreenShareEnabled);
-
-      this.sound.playSound("streamEnd");
+      await this.#endScreenShare(room);
     } else {
       const qualities = this.getEnabledScreenShareQualities();
       let screenPickerQualityName: ScreenShareQualityName | undefined;
@@ -2166,6 +2235,15 @@ class Voice {
     // wipe #lastShareChoice and #recoveryAttempts out from under it.
     if (this.#recovering) return;
 
+    // Stamp the start of this parking episode here, before the first
+    // #recoverScreenShare call below rather than inside
+    // #scheduleReacquireRetry -- see #parkedSince's doc comment for why that
+    // timing matters (that call alone can block up to REACQUIRE_TIMEOUT_MS).
+    // `??=` so a re-entrant call (guarded against above by `#recovering`
+    // returning early, but cheap insurance regardless) cannot push this
+    // episode's clock forward.
+    this.#parkedSince ??= Date.now();
+
     // LiveKit only unpublishes the video half, and the audio track would keep
     // playing into the call on its own.
     const oldAudioTrack = room.localParticipant.getTrackPublication(
@@ -2179,20 +2257,38 @@ class Voice {
       }
     }
 
-    if (await this.#recoverScreenShare(room, endedPublication)) {
+    const verdict = await this.#recoverScreenShare(room, endedPublication);
+    if (verdict === "recovered") {
       this.#stopReacquireBackoff();
       return;
     }
 
-    // Recovery could not bring the share back up *right now*. That is not
-    // the same thing as the user stopping -- only a real stop (or a
+    // Confirmed destroyed: there is nothing to retry, so end the share for
+    // real instead of parking it forever -- this terminal verdict is the
+    // whole reason a closed window's share used to sit "reacquiring"
+    // indefinitely.
+    //
+    // `screenshare()` is still checked, same as the "retry" branch below:
+    // the user can click stop while recovery was in flight, independently
+    // of `#recovering`, which already sets `screenshare()` false and clears
+    // the bookkeeping `#endScreenShare` would otherwise redo.
+    if (verdict === "gone") {
+      if (this.screenshare()) {
+        await this.#endScreenShare(room);
+        this.#showEndedNotice("gone");
+      }
+      return;
+    }
+
+    // Recovery could not bring the share back up *right now* ("retry"). That
+    // is not the same thing as the user stopping -- only a real stop (or a
     // disconnect) should ever call `toggleScreenshare()` from here. Park
     // instead and keep retrying with backoff; see #scheduleReacquireRetry.
     //
-    // `screenshare()` is still checked, though: the user can click stop
-    // while recovery was in flight above, which runs independently of
-    // `#recovering` and sets `screenshare()` false right then -- and there is
-    // nothing left to park in that case.
+    // MAX_PARKED_MS is not tested here: #parkedSince was only just stamped
+    // above, so it cannot possibly have elapsed yet on this very first
+    // attempt -- the cap only becomes relevant on the retries that
+    // #scheduleReacquireRetry below drives.
     if (this.screenshare()) {
       this.#scheduleReacquireRetry(room);
     }
@@ -2214,6 +2310,11 @@ class Voice {
    */
   #scheduleReacquireRetry(room: Room) {
     this.#setScreenShareState("reacquiring");
+    // #parkedSince is stamped by #onScreenShareEnded, before the first
+    // #recoverScreenShare call ever runs -- not here. See its doc comment
+    // for why: stamping it only once parking starts (i.e. after that first,
+    // potentially up-to-90s-long call already returned) would undercount how
+    // long the capture has actually been down.
 
     const delay =
       REACQUIRE_BACKOFF_MS[
@@ -2221,16 +2322,62 @@ class Voice {
       ];
     this.#reacquireBackoffStep++;
 
+    /** Whether {@link MAX_PARKED_MS} has been exceeded, ending the share and
+     * showing the neutral "timeout" notice if so. Checked both before and
+     * after the {@link #recoverScreenShare} call below: `#recoverScreenShare`
+     * can itself run for up to REACQUIRE_TIMEOUT_MS (90s), so checking only
+     * after it returns would let one more such call start even when the cap
+     * had already elapsed going in -- see MAX_PARKED_MS's doc comment for
+     * why that overshoot is still fine, but only within one call's worth. */
+    const capExceeded = async () => {
+      if (
+        this.#parkedSince === undefined ||
+        Date.now() - this.#parkedSince <= MAX_PARKED_MS
+      ) {
+        return false;
+      }
+      if (this.screenshare()) {
+        await this.#endScreenShare(room);
+        this.#showEndedNotice("timeout");
+      }
+      return true;
+    };
+
     clearTimeout(this.#reacquireTimer);
     this.#reacquireTimer = setTimeout(async () => {
       // The user stopped, or disconnected and reconnected to a different
       // room, while this timer was pending.
       if (!this.screenshare() || this.room() !== room) return;
 
-      if (await this.#recoverScreenShare(room)) {
+      // Before: an ambiguous ("retry") verdict from a previous round may
+      // already have run the parked time past the cap -- don't spend
+      // another up-to-90s call finding that out the slow way.
+      if (await capExceeded()) return;
+
+      const verdict = await this.#recoverScreenShare(room);
+      if (verdict === "recovered") {
         this.#stopReacquireBackoff();
         return;
       }
+
+      if (verdict === "gone") {
+        if (this.screenshare()) {
+          await this.#endScreenShare(room);
+          this.#showEndedNotice("gone");
+        }
+        return;
+      }
+
+      // "retry": bound how long a share may sit parked in the first place --
+      // see MAX_PARKED_MS's doc comment. This is the platform-independent
+      // net that catches an ambiguous verdict (an older desktop build's bare
+      // `false`, or plain web, neither of which can ever produce "gone")
+      // that would otherwise retry with backoff forever.
+      //
+      // After: the call above just ran, so re-check now too -- it may have
+      // pushed the parked time past the cap even though the check before it
+      // passed.
+      if (await capExceeded()) return;
 
       if (this.screenshare()) {
         this.#scheduleReacquireRetry(room);
@@ -2247,7 +2394,74 @@ class Voice {
     clearTimeout(this.#reacquireTimer);
     this.#reacquireTimer = undefined;
     this.#reacquireBackoffStep = 0;
+    this.#parkedSince = undefined;
     this.#setScreenShareState("idle");
+  }
+
+  /**
+   * Tear down a screen share for real -- the shared bookkeeping behind every
+   * path that ends a share, whether the user clicked "stop" themselves
+   * (`toggleScreenshare`) or a terminal verdict decided for them (`"gone"`
+   * from {@link #recoverScreenShare}, or the {@link MAX_PARKED_MS} cap
+   * running out on an ambiguous one). Peers are notified implicitly:
+   * `setScreenShareEnabled(false)` unpublishes the track and LiveKit
+   * propagates `trackUnpublished` to everyone watching.
+   *
+   * Deliberately does not touch {@link screenShareState}: a deliberate stop
+   * has nothing to announce and should land back on `"idle"` (which
+   * `#stopReacquireBackoff` below already does), while the terminal paths
+   * that call this need to show an "ended" notice afterwards -- see those
+   * call sites.
+   *
+   * Not folded into `disconnect()`'s near-identical inline bookkeeping
+   * (~line 1188): that is a separate, pre-existing duplication out of scope
+   * for this change.
+   */
+  async #endScreenShare(room: Room) {
+    this.#lastShareChoice = undefined;
+    this.#recoveryAttempts = [];
+    this.#armedShareEndedPublication = undefined;
+    this.#armedScreenShareUpstreamTrack = undefined;
+    this.#browserReacquireAttempted = false;
+    this.#stopReacquireBackoff();
+
+    await room.localParticipant.setScreenShareEnabled(false);
+
+    this.#setScreenshare(room.localParticipant.isScreenShareEnabled);
+
+    this.sound.playSound("streamEnd");
+  }
+
+  /**
+   * Flip {@link screenShareState} to an `"ended-"` state for
+   * {@link ENDED_NOTICE_MS}, then clear it back to `"idle"` -- the inline
+   * notice {@link #endScreenShare}'s terminal callers (a `"gone"` verdict,
+   * or the {@link MAX_PARKED_MS} cap) show on the sharer's own tile. Kept
+   * separate from `#endScreenShare` itself: a deliberate stop
+   * (`toggleScreenshare`) calls that too and must land on `"idle"`, not an
+   * `"ended-"` state -- see `#endScreenShare`'s doc comment.
+   *
+   * @param reason Which terminal path is calling, so the UI states a cause
+   * it actually knows rather than guessing: `"gone"` (a confirmed-destroyed
+   * window, for-desktop's `"gone"` verdict) knows *why* the share ended and
+   * shows the specific wording, while `"timeout"` (the {@link
+   * MAX_PARKED_MS} cap giving up on an answer that was never anything more
+   * than "not yet") only knows *that* it ended, so its notice must stay
+   * deliberately neutral.
+   */
+  #showEndedNotice(reason: "gone" | "timeout") {
+    this.#setScreenShareState(
+      reason === "gone" ? "ended-gone" : "ended-timeout",
+    );
+    clearTimeout(this.#endedNoticeTimer);
+    this.#endedNoticeTimer = setTimeout(() => {
+      // Only clear if nothing else claimed the state meanwhile (a fresh
+      // share, another terminal verdict) -- guards this stale timer against
+      // stomping on unrelated state set after it was scheduled.
+      if (this.screenShareState().startsWith("ended-")) {
+        this.#setScreenShareState("idle");
+      }
+    }, ENDED_NOTICE_MS);
   }
 
   /**
@@ -2264,14 +2478,22 @@ class Voice {
    * {@link #scheduleReacquireRetry}), since the dead publication is long
    * gone by then -- only {@link #recoverScreenShareBrowser}'s "still live,
    * just muted" check needs it.
-   * @returns Whether the share is back up
+   * @returns A terminal verdict: `"recovered"` (share is back up),
+   * `"retry"` (not yet -- keep parking with backoff, today's `false`
+   * meaning), or `"gone"` (the shared window is confirmed destroyed --
+   * callers should end the share for real rather than park it). Only the
+   * `window.native` branch can ever produce `"gone"`; both the plain-web
+   * fallback ({@link #recoverScreenShareBrowser}) and an older desktop build
+   * that still resolves a bare boolean map onto `"recovered"`/`"retry"`
+   * only, never `"gone"` -- {@link MAX_PARKED_MS} is what eventually ends a
+   * share that never comes back on those paths.
    */
   async #recoverScreenShare(
     room: Room,
     endedPublication?: LocalTrackPublication,
-  ): Promise<boolean> {
+  ): Promise<"recovered" | "retry" | "gone"> {
     const choice = this.#lastShareChoice;
-    if (!choice || this.#recovering || !this.screenshare()) return false;
+    if (!choice || this.#recovering || !this.screenshare()) return "retry";
 
     const now = Date.now();
     this.#recoveryAttempts = this.#recoveryAttempts.filter(
@@ -2281,26 +2503,38 @@ class Voice {
       console.warn(
         "[rtc] screen share keeps dying, giving up on automatic recovery",
       );
-      return false;
+      return "retry";
     }
 
     const reacquire = window.native?.reacquireScreenShare;
     if (typeof reacquire !== "function") {
-      return this.#recoverScreenShareBrowser(room, choice, endedPublication);
+      return (await this.#recoverScreenShareBrowser(
+        room,
+        choice,
+        endedPublication,
+      ))
+        ? "recovered"
+        : "retry";
     }
 
     this.#recovering = true;
     try {
       // Main waits (up to a few minutes) for the window to come back; a
-      // minimised window cannot be captured, so this can take a while.
-      if (!(await reacquire())) return false;
+      // minimised window cannot be captured, so this can take a while. A
+      // window share whose target is confirmed destroyed resolves the
+      // terminal "gone" immediately instead of running out that wait -- see
+      // for-desktop's screenShare:reacquire handler and
+      // isWindowConfirmedGone.
+      const verdict = await reacquire();
+      if (verdict === "gone") return "gone";
+      if (!verdict) return "retry";
 
       // The entry guard above only checked `screenshare()` before this long
       // wait started -- the user can click stop while it was in flight,
       // which runs independently of `#recovering` and sets `screenshare()`
       // false right away. Bail here rather than republishing a share the
       // user just asked to end.
-      if (!this.screenshare()) return false;
+      if (!this.screenshare()) return "retry";
 
       // LiveKit unpublishes a track that ended, but it does so asynchronously
       // and we may well get here first. setScreenShareEnabled(true) reuses any
@@ -2350,7 +2584,7 @@ class Voice {
 
       if (!localTrack) {
         this.#recoveryAttempts.push(now);
-        return false;
+        return "retry";
       }
 
       this.#setScreenshare(room.localParticipant.isScreenShareEnabled);
@@ -2367,10 +2601,10 @@ class Voice {
         false,
       );
 
-      return true;
+      return "recovered";
     } catch (err) {
       console.warn("[rtc] screen share recovery failed", err);
-      return false;
+      return "retry";
     } finally {
       this.#recovering = false;
     }

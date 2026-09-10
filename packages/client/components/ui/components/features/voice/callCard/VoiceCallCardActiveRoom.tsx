@@ -18,7 +18,12 @@ import { IconButton } from "@revolt/ui/components/design";
 import { Symbol } from "@revolt/ui/components/utils/Symbol";
 import { scrollableStyles } from "@revolt/ui/directives";
 
-import { focusOverlayContext, ParticipantTile, tile } from "./ParticipantTile";
+import {
+  focusOverlayContext,
+  ParticipantTile,
+  ReacquiringNotice,
+  tile,
+} from "./ParticipantTile";
 import { VoiceCallCardActions } from "./VoiceCallCardActions";
 import { VoiceCallCardStatus } from "./VoiceCallCardStatus";
 
@@ -392,6 +397,25 @@ function Participants(props: { pip: boolean }) {
             </ShowBarButtonHolder>
           </Show>
           <FocusOverlay ref={overlayRef!} />
+          {/*
+           * "Screen share ended" notice -- see EndedShareNoticeOverlay's doc
+           * comment for why this lives here rather than inside
+           * `ParticipantTile` (where the analogous "reacquiring" notice
+           * still is). `voice.screenShareState` is this client's own Voice
+           * state either way, so unlike the tile-hosted notice this needs no
+           * `isSelf()` check: only the sharer's own client ever sets an
+           * `"ended-"` state on it.
+           */}
+          <Show when={voice.screenShareState().startsWith("ended-")}>
+            <EndedShareNoticeOverlay>
+              <ReacquiringNotice role="status">
+                <Symbol size={16}>stop_screen_share</Symbol>
+                {voice.screenShareState() === "ended-gone"
+                  ? "Screen share ended — the shared window was closed"
+                  : "Screen share ended — the source stopped being available"}
+              </ReacquiringNotice>
+            </EndedShareNoticeOverlay>
+          </Show>
           <Grid
             focus={focused()}
             show={voice.showBar()}
@@ -582,6 +606,48 @@ const FocusOverlay = styled("div", {
   base: {
     position: "absolute",
     inset: 0,
+    pointerEvents: "none",
+  },
+});
+
+/**
+ * Host for the sharer's own "screen share ended" notice (see the `<Show>`
+ * just above this component's use, and `Voice#showEndedNotice`).
+ *
+ * This cannot live inside `ParticipantTile` the way the "reacquiring" notice
+ * does: `Voice.vidTracks` (`state.tsx`, `useTracks([...
+ * {source: Track.Source.ScreenShare, withPlaceholder: false}], ...)`) feeds
+ * `visibleTracks`/`gridTracks` below, and with `withPlaceholder: false` the
+ * track ref for a share disappears the instant it is unpublished --
+ * `#endScreenShare`'s `setScreenShareEnabled(false)`, called right before
+ * `screenShareState()` ever flips to an `"ended-"` state. `ParticipantTile`
+ * (and this notice, had it stayed there) would already be unmounted by the
+ * time there is anything to show. A sibling of `Grid`, sized like
+ * `FocusOverlay` above it, outlives that unmount: it belongs to the call
+ * card, not to any one tile.
+ *
+ * `position: absolute; inset: 0` against `Call` (see `Call`'s own doc
+ * comment for why it is the containing block here), with `pointerEvents:
+ * "none"` so this empty box never steals clicks meant for `Grid` -- the
+ * notice inside re-enables its own pointer events the same way `Controls`
+ * and `Overlay` do, though this one has nothing interactive in it anyway.
+ *
+ * `ReacquiringNotice` sizes and positions itself via `gridArea`/`alignSelf`/
+ * `justifySelf`, which only do anything inside a CSS grid (its usual home,
+ * `ParticipantTile`'s own `tile`). This is a flex row instead, with both
+ * axes pinned to `flex-start`: that shrinks the notice to its own content
+ * size in both dimensions -- without it, a plain block child here would
+ * stretch to this overlay's full width and height, since `inset: 0` sizes
+ * this box to the entire call card.
+ */
+const EndedShareNoticeOverlay = styled("div", {
+  base: {
+    position: "absolute",
+    inset: 0,
+    zIndex: 20,
+    display: "flex",
+    alignItems: "flex-start",
+    justifyContent: "flex-start",
     pointerEvents: "none",
   },
 });
