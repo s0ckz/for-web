@@ -17,6 +17,7 @@ import {
 
 import {
   AudioPresets,
+  DisconnectReason,
   LocalTrack,
   LocalTrackPublication,
   LocalVideoTrack,
@@ -41,6 +42,10 @@ import {
   ScreenShareQualityNames,
   Voice as VoiceSettings,
 } from "@revolt/state/stores/Voice";
+import {
+  SnackbarController,
+  useSnackbar,
+} from "@revolt/ui/components/design/Snackbar";
 import { VoiceCallCardContext } from "@revolt/ui/components/features/voice/callCard/VoiceCallCard";
 
 import { Device, useDevice } from "@revolt/common";
@@ -697,6 +702,52 @@ const MAX_RECOVERIES = 3;
 const RECOVERY_WINDOW_MS = 60_000;
 
 /**
+ * At most this many automatic rejoins after an *unexpected* room
+ * disconnect (see {@link Voice.#handleUnexpectedDisconnect}) within
+ * {@link DISCONNECT_RECOVERY_WINDOW_MS}, mirroring the
+ * {@link MAX_RECOVERIES}/{@link RECOVERY_WINDOW_MS} sliding-window idiom
+ * screen-share recovery already uses -- same shape, deliberately a
+ * *separate* budget (own constants, own {@link Voice.#disconnectRecoveryAttempts}
+ * array) so a connection that keeps dropping and a capture that keeps dying
+ * cannot exhaust each other's allowance.
+ */
+const MAX_DISCONNECT_RECOVERIES = 3;
+
+/** ... within this window, so a connection that cannot stay up stops flapping. */
+const DISCONNECT_RECOVERY_WINDOW_MS = 60_000;
+
+/**
+ * `DisconnectReason`s that mean the server deliberately ended *this exact*
+ * session rather than the connection merely failing -- rejoining would just
+ * reconnect into the same eviction (a second tab/device with the same
+ * identity, an explicit kick, the room being torn down) and flap against
+ * whatever caused it. Every other reason, including `undefined` (older
+ * livekit-server versions, or a reason livekit-client itself does not know
+ * about), is treated as recoverable and gets one bounded rejoin -- see
+ * {@link Voice.#handleUnexpectedDisconnect}.
+ */
+const TERMINAL_DISCONNECT_REASONS: ReadonlySet<DisconnectReason> = new Set([
+  DisconnectReason.DUPLICATE_IDENTITY,
+  DisconnectReason.PARTICIPANT_REMOVED,
+  DisconnectReason.ROOM_DELETED,
+]);
+
+/**
+ * Renders a `DisconnectReason` as a stable, human-readable string for logs
+ * and the snackbar -- `DisconnectReason` is a numeric enum, so the bare
+ * value alone (`2`) means nothing in `app-audio.log` without this reverse
+ * lookup. `undefined` is named explicitly rather than falling through to
+ * `"undefined"`: livekit-client does not always supply a reason, and that
+ * is itself useful information to capture, not an error in this function.
+ */
+function describeDisconnectReason(
+  reason: DisconnectReason | undefined,
+): string {
+  if (reason === undefined) return "no reason given";
+  return `${DisconnectReason[reason] ?? "UNRECOGNIZED"} (${reason})`;
+}
+
+/**
  * Backoff schedule for {@link Voice.#scheduleReacquireRetry}: how long to
  * wait before each retry once {@link Voice.#recoverScreenShare} has failed to
  * bring a share back up. The last entry repeats for as long as the share
@@ -815,6 +866,7 @@ class Voice {
   private openModal;
   private config;
   private limits;
+  private snackbar: SnackbarController;
   private screenShareTracks: Set<string>;
   private voiceProcessor?: VoiceProcessor;
   #localSpeakingMeter?: () => void;
@@ -832,6 +884,16 @@ class Voice {
   #lastShareChoice?: ShareChoice;
   #recoveryAttempts: number[] = [];
   #recovering = false;
+
+  /**
+   * Sliding window of automatic-rejoin timestamps, bounding
+   * {@link Voice.#handleUnexpectedDisconnect}'s auto-rejoin the same way
+   * {@link #recoveryAttempts} bounds screen-share recovery. Kept separate
+   * from {@link #recoveryAttempts} on purpose: a flapping LiveKit connection
+   * and a flapping screen-share capture are unrelated failures and must not
+   * share (and so prematurely exhaust) the same budget.
+   */
+  #disconnectRecoveryAttempts: number[] = [];
 
   /**
    * The publication {@link #armScreenShareEnded} last attached its "ended"
@@ -902,10 +964,12 @@ class Voice {
     modals: ModalController,
     sound: SoundController,
     device: Device,
+    snackbar: SnackbarController,
   ) {
     this.#settings = voiceSettings;
     this.sound = sound;
     this.device = device;
+    this.snackbar = snackbar;
 
     const [channel, setChannel] = createSignal<Channel>();
     this.channel = channel;
@@ -1115,7 +1179,22 @@ class Voice {
       this.#primeScreenShareCodec();
     });
 
-    room.addListener("disconnected", () => this.#setState("DISCONNECTED"));
+    // This fires ONLY for a drop the user did not ask for: `disconnect()`
+    // (below) calls `room.removeAllListeners()` before `room.disconnect()`,
+    // so a deliberate leave (or a channel switch, which tears down through
+    // the same path via `connect()`'s own `this.disconnect()` call) unhooks
+    // this listener before it ever gets the chance to fire. No
+    // `DisconnectReason.CLIENT_INITIATED` special-case is needed to tell
+    // "we meant to do that" apart from "something went wrong" -- the
+    // listener's absence already does that job.
+    room.addListener("disconnected", (reason) => {
+      // Deliberately not awaited here: a LiveKit event callback must stay
+      // synchronous, and #handleUnexpectedDisconnect's own try/catch
+      // already accounts for connect()'s rejection (its `Promise.any` node
+      // probe throws if every node fails) -- nothing here can throw past
+      // that, so there is no unhandled rejection to worry about.
+      void this.#handleUnexpectedDisconnect(reason);
+    });
 
     // A media/signal reconnect attempt in progress -- see RoomEvent.Reconnecting
     // in livekit-client. Screen share recovery (#recoverScreenShare) is a
@@ -1293,6 +1372,126 @@ class Voice {
     } catch (e) {
       this.onErr(e);
     }
+  }
+
+  /**
+   * Handles `room`'s `"disconnected"` event -- the whole unexpected-drop
+   * path (a deliberate leave never reaches this listener at all; see the
+   * comment where it is attached in {@link connect}). Before this existed,
+   * an unexpected LiveKit disconnect left the client in a zombie state
+   * indefinitely: wake lock held, listeners attached to a dead `Room`, and
+   * the call card still mounted with controls that operated on nothing.
+   *
+   * Order of operations matters and is deliberate:
+   *
+   * 1. Capture `channel()` *before* tearing down -- {@link disconnect}
+   *    clears it.
+   * 2. Always tear down via {@link disconnect}, whether or not a rejoin
+   *    follows -- this is what releases the wake lock, detaches the dead
+   *    room's listeners, drops the call card back to "not in a call", and
+   *    (as a side effect of reusing `disconnect()` rather than duplicating
+   *    it) plays `userLeaveVoice`, which doubles as this path's "make it
+   *    perceptible" signal -- there is no dedicated error/disconnect sound
+   *    asset in `public/assets/sounds/`, and this is the only suitable
+   *    existing one.
+   * 3. Only *then* decide whether to rejoin, via the existing `connect()` --
+   *    not a bespoke reconnect -- because the LiveKit token from
+   *    `channel.joinCall()` is single-use and may already be expired, and
+   *    `connect()` is what re-fetches a fresh one.
+   *
+   * `reason` is classified into terminal (never rejoin: the server evicted
+   * or removed *this exact* session on purpose, and rejoining would just
+   * fight whatever caused that) versus recoverable (everything else,
+   * including `undefined`) -- see {@link TERMINAL_DISCONNECT_REASONS}.
+   * Recoverable attempts are bounded by {@link MAX_DISCONNECT_RECOVERIES}
+   * within {@link DISCONNECT_RECOVERY_WINDOW_MS}, the same sliding-window
+   * idiom {@link #recoveryAttempts} already uses for screen-share recovery,
+   * kept as a separate counter so the two budgets cannot exhaust each
+   * other.
+   *
+   * Every branch reports through the snackbar so the user is actually told
+   * what happened -- the only surface that used to change at all was a
+   * low-contrast grey caption in the call card's control strip (see
+   * `VoiceCallCardStatus.tsx`), invisible unless you were already looking
+   * at it.
+   */
+  async #handleUnexpectedDisconnect(reason: DisconnectReason | undefined) {
+    const reasonName = describeDisconnectReason(reason);
+
+    // console.error (level 3) is what for-desktop's `window.ts` forwards
+    // into `app-audio.log` -- this alone persists the reason with no new
+    // IPC and no preload change, and it works identically on plain web via
+    // devtools. This is the first deliverable: the reason was previously
+    // discarded entirely, which is why the drop that prompted this fix was
+    // undiagnosable.
+    console.error(
+      `[rtc] room disconnected unexpectedly (reason: ${reasonName})`,
+    );
+
+    // Capture before disconnect() clears channel() to undefined.
+    const channel = this.channel();
+
+    // Always run teardown, rejoin or not -- see the doc comment above for
+    // why this must happen before the rejoin decision, not after it.
+    this.disconnect();
+
+    // Nothing to rejoin into. Shouldn't happen in practice -- a
+    // "disconnected" event implies connect() had previously set a channel
+    // -- but keeps this method total rather than assuming it.
+    if (!channel) return;
+
+    if (reason !== undefined && TERMINAL_DISCONNECT_REASONS.has(reason)) {
+      this.snackbar.show({
+        message: `Disconnected from voice: ${reasonName}. Not rejoining automatically.`,
+        closeable: true,
+      });
+      return;
+    }
+
+    const now = Date.now();
+    this.#disconnectRecoveryAttempts = this.#disconnectRecoveryAttempts.filter(
+      (at) => now - at < DISCONNECT_RECOVERY_WINDOW_MS,
+    );
+    if (this.#disconnectRecoveryAttempts.length >= MAX_DISCONNECT_RECOVERIES) {
+      console.warn("[rtc] voice keeps dropping, giving up on automatic rejoin");
+      this.snackbar.show({
+        message: `Disconnected from voice: ${reasonName}. Giving up after repeated drops -- rejoin manually.`,
+        closeable: true,
+      });
+      return;
+    }
+    this.#disconnectRecoveryAttempts.push(now);
+
+    this.snackbar.show({
+      message: `Disconnected from voice: ${reasonName}. Attempting to rejoin...`,
+      closeable: true,
+    });
+
+    try {
+      await this.connect(channel);
+    } catch (err) {
+      console.error("[rtc] automatic voice rejoin failed", err);
+      // Guard against a rejoin racing a user action: if the user left again
+      // or switched to a different channel while this connect() call was in
+      // flight, channel() will no longer be the one we captured above, and
+      // reporting *this* attempt's failure would be misleading -- whatever
+      // the user did since is what actually determines their state now.
+      if (this.channel() !== channel) return;
+      this.snackbar.show({
+        message: "Could not rejoin voice automatically.",
+        replaceActive: true,
+        closeable: true,
+      });
+      return;
+    }
+
+    // Same race guard as the catch branch above, for the success path.
+    if (this.channel() !== channel) return;
+    this.snackbar.show({
+      message: "Reconnected to voice.",
+      replaceActive: true,
+      closeable: true,
+    });
   }
 
   async toggleDeafen(fromMute?: boolean) {
@@ -3295,7 +3494,11 @@ export function VoiceContext(props: { children: JSX.Element }) {
   const modals = useModals();
   const sound = useSound();
   const device = useDevice();
-  const voice = new Voice(state.voice, modals, sound, device);
+  // VoiceContext is mounted inside SnackbarProvider (see `src/index.tsx`),
+  // so this is safe -- see the "Make it perceptible" work item on Bug 5 for
+  // why Voice, a plain class with no JSX of its own, needs this at all.
+  const snackbar = useSnackbar();
+  const voice = new Voice(state.voice, modals, sound, device, snackbar);
 
   return (
     <voiceContext.Provider value={voice}>
