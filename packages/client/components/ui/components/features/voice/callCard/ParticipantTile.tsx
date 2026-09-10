@@ -519,6 +519,14 @@ export function ParticipantTile() {
          * Only shown on the sharer's own tile: everyone else just keeps
          * seeing the frozen last frame, which is the point.
          *
+         * The "ended" notice that used to live in this same slot has moved
+         * to `VoiceCallCardActiveRoom` -- see its doc comment for why: with
+         * `Voice.vidTracks`'s `withPlaceholder: false`, the track ref (and
+         * with it this whole tile) unmounts the instant the share is
+         * unpublished, which is the exact moment `screenShareState()` flips
+         * to an `"ended-"` state. A notice gated on `isSelf()` here would
+         * therefore never have a host element left to render into.
+         *
          * `role="status"` (implicit `aria-live="polite"` +
          * `aria-atomic="true"`) so a screen reader actually announces this
          * to the sharer instead of it being silently visual-only -- same
@@ -850,7 +858,15 @@ const Controls = styled("div", {
   },
 });
 
-const ReacquiringNotice = styled("div", {
+/**
+ * Exported for reuse by `VoiceCallCardActiveRoom`'s "screen share ended"
+ * notice -- see that file's doc comment for why the "ended" states in
+ * particular cannot be shown from inside this component, unlike
+ * `"reacquiring"` above which stays here. Same look, same
+ * `role="status"`/`aria-live="polite"` reasoning; the ended notice is just
+ * hosted somewhere its element outlives the tile.
+ */
+export const ReacquiringNotice = styled("div", {
   base: {
     gridArea: "1/1",
     alignSelf: "start",
