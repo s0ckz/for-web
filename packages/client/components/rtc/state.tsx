@@ -1056,6 +1056,19 @@ class Voice {
     this.channel = channel;
     this.#setChannel = setChannel;
 
+    // Tell the desktop shell whether a call is live, so it can gate the
+    // F5/Ctrl+R reload shortcut behind a confirmation instead of silently
+    // dropping the call. `channel` is set in `connect()` and cleared in
+    // `disconnect()`, which between them cover every path in and out of a
+    // call (join, leave, channel switch, an unexpected drop via
+    // `#handleUnexpectedDisconnect`, and auto-rejoin) -- an effect here is a
+    // single place that catches all of them rather than reporting from each
+    // call site individually. `window.native` doesn't exist in plain web,
+    // and older desktop builds don't have `setInCall` -- both are no-ops.
+    createEffect(() => {
+      window.native?.setInCall?.(!!channel());
+    });
+
     const [room, setRoom] = createSignal<Room>();
     this.room = room;
     this.#setRoom = setRoom;
