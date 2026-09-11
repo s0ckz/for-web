@@ -59,6 +59,17 @@ declare global {
        */
       reacquireScreenShare?(): Promise<boolean | "gone">;
       isWayland?(): boolean;
+      /**
+       * Tell the desktop shell whether a voice call is currently active, so
+       * it can gate the F5/Ctrl+R reload shortcut behind a confirmation
+       * instead of silently dropping the call.
+       *
+       * Only present in builds of the desktop app that ship the call-aware
+       * reload guard, hence optional -- an older desktop build (or plain web,
+       * which has no `window.native` at all) simply never learns the call
+       * state and keeps reloading immediately, exactly as before this existed.
+       */
+      setInCall?(inCall: boolean): void;
     };
 
     desktopConfig: {
