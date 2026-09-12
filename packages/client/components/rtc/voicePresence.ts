@@ -17,10 +17,14 @@ import type { Channel, Client } from "stoat.js";
  * a channel they failed to join. Only the server's `VoiceChannelJoin` /
  * `VoiceChannelMove` events are allowed to add participants.
  *
- * Lives here rather than on the SDK `Client` because `stoat.js` is an
- * upstream git submodule this repo cannot push changes to -- everything
- * needed is already public from app code (`Channel.voiceParticipants` is
- * a public `ReactiveMap`, `client.channels.values()` a public iterator).
+ * Lives here rather than on the SDK `Client` because this is application
+ * policy, not protocol handling: it encodes *this* client's rule that a
+ * user is in at most one voice channel at a time, which the SDK has no
+ * business assuming on behalf of every consumer. Everything it needs is
+ * already public from app code (`Channel.voiceParticipants` is a public
+ * `ReactiveMap`, `client.channels.values()` a public iterator), and
+ * keeping it out of `stoat.js` -- a submodule tracking a fork of an
+ * upstream SDK -- is one less patch to carry across upstream merges.
  * @param client The current client
  * @param channel The voice channel the local user is now in, if any
  */
