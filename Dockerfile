@@ -12,6 +12,7 @@ WORKDIR /build
 
 # Copy workspace config files for dependency resolution
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY patches/ patches/
 
 COPY packages/ packages/
 

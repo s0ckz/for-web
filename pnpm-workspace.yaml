@@ -16,4 +16,6 @@ nodeLinker: isolated
 overrides:
   "prettier": "^3.8.1"
   "solid-js": "1.9.14"
+patchedDependencies:
+  mdui@2.1.3: patches/mdui@2.1.3.patch
 strictPeerDependencies: false
