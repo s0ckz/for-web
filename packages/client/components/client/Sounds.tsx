@@ -15,6 +15,21 @@ import unmuteSound from "../../public/assets/sounds/unmute.ogg";
 import userJoinVoiceSound from "../../public/assets/sounds/user_join_voice.ogg";
 import userLeaveVoiceSound from "../../public/assets/sounds/user_leave_voice.ogg";
 import userMovedSound from "../../public/assets/sounds/user_moved.ogg";
+// Leaf module with no imports of its own, so reaching into rtc/ from here
+// introduces no cycle -- `@revolt/rtc` imports this file, not vice versa.
+import { perceptualGain } from "../rtc/volume";
+
+/**
+ * The slice of voice settings notification sounds need to respect.
+ *
+ * Deliberately structural rather than the `Voice` store class itself: that
+ * class is not re-exported from `@revolt/state`, and this only ever reads
+ * two values, so a narrow shape keeps the coupling honest.
+ */
+type OutputSettings = {
+  readonly preferredAudioOutputDevice: string | undefined;
+  readonly outputVolume: number;
+};
 
 /**
  * A controller class for making sure sounds are managed in one place and to prevent undesirable sound overlaps
@@ -22,12 +37,15 @@ import userMovedSound from "../../public/assets/sounds/user_moved.ogg";
 export class SoundController {
   readonly soundState: Sounds;
 
+  readonly outputSettings: OutputSettings;
+
   node?: HTMLAudioElement;
 
   lastPlayedSound?: keyof TypeSounds;
 
-  constructor(soundState: Sounds) {
+  constructor(soundState: Sounds, outputSettings: OutputSettings) {
     this.soundState = soundState;
+    this.outputSettings = outputSettings;
 
     this.isPlaying = this.isPlaying.bind(this);
     this.canPlay = this.canPlay.bind(this);
@@ -169,19 +187,56 @@ export class SoundController {
         break;
       }
     }
+    const node = this.node;
     this.lastPlayedSound = sound;
+
+    // Play at the level the rest of the app plays at, the way
+    // `RoomAudioManager` and the soundboard already do. Clamped to 1
+    // because `perceptualGain` deliberately allows boost above 100% for
+    // its other callers, which feed gain nodes -- HTMLMediaElement.volume
+    // throws outside 0..1, so the boost half of that slider cannot apply
+    // here. At 0% output volume these fall silent along with everything
+    // else, which is what the slider says it does.
+    node.volume = Math.min(1, perceptualGain(this.outputSettings.outputVolume));
+
     // Successful dispatch is normal operation, not a fault -- console.debug
     // so it shows up in devtools without reaching app-audio.log (the
     // Electron shell only forwards console.error and above to that file).
-    console.debug(`[sound] playing "${sound}": ${this.node.src}`);
+    console.debug(`[sound] playing "${sound}": ${node.src}`);
+
     // play() returns a promise that rejects on autoplay-policy blocks, a
     // decode failure, the element being removed, etc. -- previously this was
     // discarded entirely, so a rejection here was completely silent. This is
     // a genuine playback fault, so it goes to console.error to reach
     // app-audio.log.
-    this.node.play().catch((err) => {
-      console.error(`[sound] play() rejected for "${sound}":`, err);
-    });
+    const play = () =>
+      node.play().catch((err) => {
+        console.error(`[sound] play() rejected for "${sound}":`, err);
+      });
+
+    // Route to the output device chosen in Stoat instead of whatever the OS
+    // default happens to be. Voice audio and the soundboard both honour this
+    // setting, so without it notification sounds are the one thing coming
+    // out of a different pair of speakers than the rest of the app.
+    //
+    // `setSinkId` is absent from the TS DOM lib (hence the cast) and from
+    // non-Chromium engines, and it rejects for a device that has since been
+    // unplugged. In every one of those cases fall back to the default device
+    // and still play: a sound on the wrong device beats no sound at all.
+    const sinkId = this.outputSettings.preferredAudioOutputDevice;
+    const sinkable = node as HTMLAudioElement & {
+      setSinkId?: (id: string) => Promise<void>;
+    };
+
+    if (sinkId && typeof sinkable.setSinkId === "function") {
+      sinkable.setSinkId(sinkId).then(play, (err) => {
+        console.error(`[sound] setSinkId failed for "${sound}":`, err);
+        play();
+      });
+    } else {
+      play();
+    }
+
     return true;
   }
 }
@@ -189,9 +244,9 @@ export class SoundController {
 const soundContext = createContext(null! as SoundController);
 
 export function SoundContext(props: { children: JSXElement }) {
-  const { sounds } = useState();
+  const state = useState();
 
-  const controller = new SoundController(sounds);
+  const controller = new SoundController(state.sounds, state.voice);
 
   return (
     <soundContext.Provider value={controller}>
