@@ -1,0 +1,31 @@
+diff --git a/components/text-field/index.js b/components/text-field/index.js
+index e7c8041a1225504381609c4087bcf84a7b456c5b..7d36039ba11e4091c00e926dfec80e50ccab2cf0 100644
+--- a/components/text-field/index.js
++++ b/components/text-field/index.js
+@@ -193,7 +193,7 @@ let TextField = class TextField extends FocusableMixin(MduiElement) {
+      * 如果表单验证未通过，此属性将包含提示信息。如果验证通过，此属性将为空字符串
+      */
+     get validationMessage() {
+-        return this.inputRef.value.validationMessage;
++        return this.inputRef.value?.validationMessage;
+     }
+     /**
+      * 获取当前值，并转换为 `number` 类型；或设置一个 `number` 类型的值。
+@@ -379,7 +379,7 @@ let TextField = class TextField extends FocusableMixin(MduiElement) {
+         const hasPrefix = !!this.prefix || this.hasSlotController.test('prefix');
+         const hasSuffix = !!this.suffix || this.hasSlotController.test('suffix');
+         const hasHelper = !!this.helper || this.hasSlotController.test('helper');
+-        const hasError = hasErrorIcon && !!(this.error || this.inputRef.value.validationMessage);
++        const hasError = hasErrorIcon && !!(this.error || this.inputRef.value?.validationMessage);
+         const hasCounter = this.counter && !!this.maxlength;
+         // 存在 input slot 时，隐藏组件内部的 .input 元素，使用 slot 代替
+         const hasInputSlot = this.hasSlotController.test('input');
+@@ -538,7 +538,7 @@ let TextField = class TextField extends FocusableMixin(MduiElement) {
+      */
+     renderHelper(hasError, hasHelper) {
+         return hasError
+-            ? html `<div part="error" class="error">${this.error || this.inputRef.value.validationMessage}</div>`
++            ? html `<div part="error" class="error">${this.error || this.inputRef.value?.validationMessage}</div>`
+             : hasHelper
+                 ? html `<slot name="helper" part="helper" class="helper">${this.helper}</slot>`
+                 : // 右边有 counter，需要占位
