@@ -37,10 +37,18 @@ export class SoundController {
   /**
    * Get whether a sound is currently being played by the sound controller
    *
+   * NOTE: this used to read `this.node?.paused ?? false`, which is inverted --
+   * that returns `true` when the node is *paused*, i.e. exactly backwards.
+   * It has been inert until now because both branches of `canPlay` return
+   * `true` regardless of this value, so fixing the inversion here changes
+   * nothing observable yet. Left in place (rather than "optimised" away) so
+   * the sound-collision check in `canPlay` has a correct signal to read if
+   * it is ever tightened.
+   *
    * @returns Whether a sound is currently playing
    */
   isPlaying(): boolean {
-    return this.node?.paused ?? false;
+    return this.node ? !this.node.paused : false;
   }
 
   /**
@@ -68,12 +76,39 @@ export class SoundController {
   /**
    * Play a sound, following the rules of sound playability unless force is true
    *
+   * Logs diagnostics for every outcome so playback failures are never silent:
+   * suppression (canPlay() false) and a rejected play() promise are genuine
+   * faults and go to console.error so they reach app-audio.log in the
+   * Electron shell (which only forwards error-level and above); a
+   * successful dispatch is normal operation and goes to console.debug only.
+   *
    * @param sound The sound to play
    * @param force Bypass canPlay check
    * @returns Whether the sound played
    */
   playSound(sound: keyof TypeSounds, force?: boolean): boolean {
     if (!force && !this.canPlay(sound)) {
+      // Distinguish the two ways a sound gets suppressed, because only one
+      // of them is a fault:
+      //
+      //  `false`     -- the user turned this sound off in settings. Routine;
+      //                 logging it at error level would spam app-audio.log
+      //                 on every message for anyone who dislikes the chime.
+      //  `undefined` -- `enabled()` is `return this.get()[t]` with no
+      //                 fallback, so a persisted `sounds` store written
+      //                 before this key existed reads as undefined and
+      //                 silently disables a sound the user never touched
+      //                 (and whose settings checkbox renders unticked).
+      //                 That is a real bug and needs to reach the log.
+      const enabled = this.soundState.enabled(sound);
+      const message = `[sound] suppressed "${sound}": enabled = ${String(enabled)}`;
+
+      if (enabled === false) {
+        console.debug(message);
+      } else {
+        console.error(`${message} (expected a boolean -- stale sounds store?)`);
+      }
+
       return false;
     }
     switch (sound) {
@@ -135,7 +170,18 @@ export class SoundController {
       }
     }
     this.lastPlayedSound = sound;
-    this.node.play();
+    // Successful dispatch is normal operation, not a fault -- console.debug
+    // so it shows up in devtools without reaching app-audio.log (the
+    // Electron shell only forwards console.error and above to that file).
+    console.debug(`[sound] playing "${sound}": ${this.node.src}`);
+    // play() returns a promise that rejects on autoplay-policy blocks, a
+    // decode failure, the element being removed, etc. -- previously this was
+    // discarded entirely, so a rejection here was completely silent. This is
+    // a genuine playback fault, so it goes to console.error to reach
+    // app-audio.log.
+    this.node.play().catch((err) => {
+      console.error(`[sound] play() rejected for "${sound}":`, err);
+    });
     return true;
   }
 }
