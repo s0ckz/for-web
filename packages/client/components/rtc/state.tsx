@@ -32,7 +32,7 @@ import {
 } from "livekit-client";
 import { Channel } from "stoat.js";
 
-import { SoundController, useSound } from "@revolt/client";
+import { SoundController, useClient, useSound } from "@revolt/client";
 import { useInstance } from "@revolt/instance";
 import { ModalController, useModals } from "@revolt/modal";
 import { useState } from "@revolt/state";
@@ -65,6 +65,7 @@ import {
   SoundboardSound,
 } from "./soundboard";
 import { registerSpeakingMeter } from "./speaking";
+import { reconcileLocalVoicePresence } from "./voicePresence";
 import { VoiceProcessor } from "./VoiceProcessor";
 import { perceptualGain } from "./volume";
 
@@ -933,6 +934,7 @@ class Voice {
   private openModal;
   private config;
   private limits;
+  private getClient;
   private snackbar: SnackbarController;
   private screenShareTracks: Set<string>;
   private voiceProcessor?: VoiceProcessor;
@@ -1122,6 +1124,7 @@ class Voice {
     this.config = inst.config;
     this.limits = inst.limits;
     this.openModal = modals.openModal;
+    this.getClient = useClient();
 
     this.screenShareTracks = new Set();
 
@@ -1257,6 +1260,17 @@ class Voice {
       this.#setScreenShareState("idle");
       this.#setSoundboard(new SoundboardPlayer(room));
     });
+
+    // We've just committed to `channel` -- the sidebar should reflect that
+    // now, not several seconds from now once the server's own
+    // VoiceChannelLeave/Move for whatever channel we were in before makes
+    // it to us. This only ever removes us from other channels' voice
+    // participant lists; it never adds us to this one (that stays the
+    // server's job via VoiceChannelJoin/Move). Safe against the
+    // `this.disconnect()` call above: disconnect() runs synchronously and
+    // (when leaving an existing call) performs its own full removal before
+    // this line ever runs, so there's no ordering race between the two.
+    reconcileLocalVoicePresence(this.getClient(), channel);
 
     room.addListener("connected", () => {
       this.#setState("CONNECTED");
@@ -1495,6 +1509,13 @@ class Voice {
     try {
       const room = this.room();
       if (!room) return;
+
+      // We're now in no voice channel at all -- don't wait for the
+      // server's own VoiceChannelLeave to say so, which is exactly the
+      // multi-second window the sidebar bug lived in. Passing nothing
+      // means "remove me everywhere" (see
+      // `reconcileLocalVoicePresence`'s doc comment).
+      reconcileLocalVoicePresence(this.getClient());
 
       this.soundboard()?.dispose();
 
