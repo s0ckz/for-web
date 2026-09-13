@@ -1094,6 +1094,18 @@ class Voice {
   #endedNoticeTimer?: ReturnType<typeof setTimeout>;
 
   /**
+   * Pending native-path self-correction timer from {@link
+   * #applyEncoderLimits} -- see {@link
+   * #scheduleNativeEncoderLimitsRecheck}'s doc comment for what it checks
+   * and why. Cleared by {@link #clearNativeEncoderLimitsRecheck}, called
+   * whenever a fresh `#applyEncoderLimits` call supersedes it and from every
+   * path that ends a share ({@link #endScreenShare}, {@link disconnect}) --
+   * the same shape {@link #stopReacquireBackoff} uses for the reacquire
+   * timer.
+   */
+  #nativeEncoderLimitsRecheckTimer?: ReturnType<typeof setTimeout>;
+
+  /**
    * Whether the one silent re-acquire {@link #recoverScreenShareBrowser}
    * is allowed has already been spent for the share currently running.
    * Reset when a fresh share starts and when the current one stops -- see
@@ -1603,6 +1615,7 @@ class Voice {
       this.#armedScreenShareUpstreamTrack = undefined;
       this.#browserReacquireAttempted = false;
       this.#stopReacquireBackoff();
+      this.#clearNativeEncoderLimitsRecheck();
       // Per-room deafen-attribute state: a stale remote map must not leak
       // into the next call (wrong icons for identities that never even
       // joined this next room), and a fresh room deserves its own chance
@@ -2294,19 +2307,150 @@ class Voice {
     const sender = localTrack.videoTrack?.sender;
     if (!sender?.getParameters) return;
 
+    // A fresh call (mid-share quality change, or the `localTrackPublished`
+    // re-apply after a republish) supersedes whatever native re-check the
+    // previous call may still have pending -- that timer's captured
+    // `resolution` is stale the moment a new one lands, and letting it fire
+    // anyway could re-apply a scale factor for a quality the user already
+    // moved past.
+    this.#clearNativeEncoderLimitsRecheck();
+
     // The capturer's actual output, now that capture no longer requests a
     // resolution -- may be larger (a 4K monitor, or a 21:9 ultrawide) or
     // smaller (a small window) than what was asked for.
     const captured = localTrack.videoTrack?.mediaStreamTrack.getSettings();
-    const scaleResolutionDownBy = screenShareScaleFactor(
-      captured ?? {},
+
+    let scaleResolutionDownBy: number;
+    if (isNativeDesktop()) {
+      // The native path's `applyConstraints` (in `#applyShareChoice`, just
+      // before this runs) is not a real track constraint at all -- the
+      // injected page patch (appAudioPatch.ts) forwards the requested
+      // width/height as a `setTarget()` IPC call to the native Windows
+      // capturer and resolves synchronously, long before that capturer's
+      // next frame lands. So `getSettings()` above (`captured`) is reading
+      // the *same* patch's `lastWidth`/`lastHeight`, which is only updated
+      // as frames actually arrive -- at this instant it still reports
+      // whatever size the previous frame was (e.g. 1920x1080 moments after
+      // asking for 1280x720). Feeding that stale size into
+      // `screenShareScaleFactor` double-counts a resize the native capturer
+      // is already doing on its own: `setTarget()` makes it fit the
+      // captured frame *inside* the requested box itself (aspect preserved,
+      // never upscaled -- see win-capture's `setTarget`), so once real
+      // frames catch up they already arrive at the target size and the
+      // correct additional encoder factor is 1 -- not the >1 factor stale
+      // 1080p settings against a 720p target would produce (this was the
+      // double-downscale: native already shrank to 720p, then the encoder
+      // shrank again to ~480p on top of it).
+      //
+      // This is only right if native actually honours the target. It can
+      // refuse (logged on the native side as "native refused a target
+      // change"), in which case frames stay at the old, larger size and
+      // factor 1 would leave the encoder sending that size under the new,
+      // smaller quality's bitrate ceiling -- uncapped resolution, capped
+      // bitrate. `#scheduleNativeEncoderLimitsRecheck` below is the
+      // self-correction for exactly that case, once a real frame has had
+      // time to land.
+      //
+      // The durable fix is for for-desktop's `applyConstraints` patch to
+      // report the target size from `getSettings()` synchronously instead
+      // of the last delivered frame's -- out of scope here since it needs
+      // an app release; trusting the target and self-correcting keeps
+      // for-web correct in the meantime regardless of when that ships.
+      scaleResolutionDownBy = 1;
+
+      console.info(
+        `[rtc] screen share encoder limits: native capturer scales to target ${resolution.width}x${resolution.height} -> scaleResolutionDownBy 1.000 (getSettings() reported ${captured?.width ?? "?"}x${captured?.height ?? "?"}, stale until the next frame)`,
+      );
+
+      this.#scheduleNativeEncoderLimitsRecheck(localTrack, resolution);
+    } else {
+      // Chromium path: `applyConstraints` is a real track constraint here,
+      // so `getSettings()` already reflects it by the time this runs -- no
+      // staleness to work around.
+      scaleResolutionDownBy = screenShareScaleFactor(
+        captured ?? {},
+        resolution,
+      );
+
+      console.info(
+        `[rtc] screen share encoder limits: captured ${captured?.width ?? "?"}x${captured?.height ?? "?"} -> target ${resolution.width}x${resolution.height} (scaleResolutionDownBy ${scaleResolutionDownBy.toFixed(3)})`,
+      );
+    }
+
+    await this.#setScreenShareEncoderParams(
+      sender,
       resolution,
+      scaleResolutionDownBy,
     );
+  }
 
-    console.info(
-      `[rtc] screen share encoder limits: captured ${captured?.width ?? "?"}x${captured?.height ?? "?"} -> target ${resolution.width}x${resolution.height} (scaleResolutionDownBy ${scaleResolutionDownBy.toFixed(3)})`,
-    );
+  /**
+   * ~1s after {@link #applyEncoderLimits} trusted the native path's target
+   * and set `scaleResolutionDownBy` to 1 without proof (see that method's
+   * doc comment), read `getSettings()` again -- by now at least one real
+   * frame at the native capturer's actual output size should have landed --
+   * and self-correct if the capturer did not honour the target after all.
+   *
+   * One shot, not a polling loop: a capturer that honoured the target needs
+   * exactly one confirmation (this finds nothing to do and stops), and one
+   * that refused needs exactly one correction, not a timer running for the
+   * rest of the share. Never scheduled on the Chromium path, which has
+   * nothing to re-check.
+   *
+   * Cancelled by {@link #clearNativeEncoderLimitsRecheck} before it can fire
+   * against a stale target -- from a fresh `#applyEncoderLimits` call, and
+   * from every path that ends the share ({@link #endScreenShare}, {@link
+   * disconnect}).
+   */
+  #scheduleNativeEncoderLimitsRecheck(
+    localTrack: LocalTrackPublication,
+    resolution: VideoResolution,
+  ) {
+    this.#nativeEncoderLimitsRecheckTimer = setTimeout(() => {
+      this.#nativeEncoderLimitsRecheckTimer = undefined;
 
+      const sender = localTrack.videoTrack?.sender;
+      if (!sender?.getParameters) return;
+
+      const captured = localTrack.videoTrack?.mediaStreamTrack.getSettings();
+      const scaleResolutionDownBy = screenShareScaleFactor(
+        captured ?? {},
+        resolution,
+      );
+
+      // Within rounding of 1: native honoured the target, frames already
+      // arrive at the right size, nothing to correct.
+      if (scaleResolutionDownBy <= 1.01) return;
+
+      console.info(
+        `[rtc] screen share encoder limits: native re-check found capturer still at ${captured?.width ?? "?"}x${captured?.height ?? "?"} against target ${resolution.width}x${resolution.height} (native refused a target change) -> scaleResolutionDownBy ${scaleResolutionDownBy.toFixed(3)}`,
+      );
+
+      void this.#setScreenShareEncoderParams(
+        sender,
+        resolution,
+        scaleResolutionDownBy,
+      );
+    }, 1000);
+  }
+
+  /** Cancel a pending {@link #scheduleNativeEncoderLimitsRecheck} timer. */
+  #clearNativeEncoderLimitsRecheck() {
+    clearTimeout(this.#nativeEncoderLimitsRecheckTimer);
+    this.#nativeEncoderLimitsRecheckTimer = undefined;
+  }
+
+  /**
+   * The actual `sender.getParameters()`/`setParameters()` round trip behind
+   * {@link #applyEncoderLimits}, factored out so both that method's normal
+   * call and {@link #scheduleNativeEncoderLimitsRecheck}'s deferred
+   * self-correction share one implementation of it.
+   */
+  async #setScreenShareEncoderParams(
+    sender: RTCRtpSender,
+    resolution: VideoResolution,
+    scaleResolutionDownBy: number,
+  ) {
     try {
       const params = sender.getParameters();
       if (!params.encodings?.length) return;
@@ -2937,6 +3081,7 @@ class Voice {
     this.#armedScreenShareUpstreamTrack = undefined;
     this.#browserReacquireAttempted = false;
     this.#stopReacquireBackoff();
+    this.#clearNativeEncoderLimitsRecheck();
 
     await room.localParticipant.setScreenShareEnabled(false);
 
