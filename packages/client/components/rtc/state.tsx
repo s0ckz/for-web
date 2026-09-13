@@ -407,8 +407,22 @@ function isHardware(probe: CodecProbe): boolean {
 
 /**
  * The best codec this client can hardware-encode for a share at the given
- * resolution/framerate, in preference order h265 > h264 (Constrained
- * Baseline only) > vp9.
+ * resolution/framerate, in preference order h264 (Constrained Baseline
+ * only) > h265 > vp9.
+ *
+ * H.264 CBP is preferred over H.265 despite H.265 usually meaning better
+ * quality per bit: on 2026-09-13 a sharer with hardware H.265 available
+ * and negotiable published HEVC, but the viewer could not decode it.
+ * LiveKit's SFU responded by asking the publisher for a vp8 backup
+ * (livekit-client's `handleSubscribedQualityUpdate` ->
+ * `publishAdditionalCodecForTrack`, which publishes whatever backup codec
+ * the server requests -- independent of our `backupCodec` option) -- and
+ * that additional VP8 track sat idle, encoding almost nothing while frames
+ * were dropped before encode. The primary HEVC stream was perfect and
+ * nobody could watch it. HEVC decode in Chromium is hardware-only and not
+ * universal; hardware H.264 CBP decodes everywhere, uses the same hardware
+ * encode path on the sharer, and never needs the backup mechanism to
+ * engage at all.
  *
  * `RTCRtpSender.getCapabilities("video")` lists every codec Chromium can
  * *negotiate*, including OpenH264 -- a software fallback Chromium always
@@ -552,12 +566,14 @@ async function screenShareCodec(
       let codec: VideoCodec;
       let reason: string;
 
-      if (negotiable.has("video/h265") && isHardware(h265)) {
-        codec = "h265";
-        reason = "hardware h265 available and negotiable";
-      } else if (negotiable.has("video/h264") && isHardware(h264Cbp)) {
+      if (negotiable.has("video/h264") && isHardware(h264Cbp)) {
         codec = "h264";
-        reason = "hardware h264 available at constrained baseline";
+        reason =
+          "hardware h264 available at constrained baseline (preferred over h265: decodes on every viewer)";
+      } else if (negotiable.has("video/h265") && isHardware(h265)) {
+        codec = "h265";
+        reason =
+          "hardware h265 available and negotiable, used only because no hardware h264 constrained baseline was found";
       } else if (isHardware(h264Main) || isHardware(h264High)) {
         codec = "vp9";
         reason =
