@@ -133,6 +133,57 @@ type ScreenShareQuality = {
   contentHint: string;
 };
 
+/**
+ * The full, ungated definition of every screen share quality -- independent
+ * of {@link Voice.limits}, unlike {@link Voice.getEnabledScreenShareQualities}
+ * which filters this down to what the current instance actually offers.
+ * Kept around so code that needs a quality's shape regardless of whether it
+ * is currently enabled (e.g. {@link Voice.#screenShareQuality}'s fallback
+ * walk, which needs to know a *saved* quality's framerate even when that
+ * quality isn't offered here) doesn't have to special-case around the gate.
+ *
+ * LiveKit's `ScreenSharePresets` has no 60fps preset at either resolution
+ * used here -- it stops at `h720fps30`/`h1080fps30` -- so `low60` and
+ * `high60` are both hand-built to match the same `VideoResolution` shape the
+ * presets use. Both are offered ungated, on every platform, by deliberate
+ * product decision: 60fps is only actually reachable on Windows window
+ * shares through the native GPU capture path in `for-desktop`, which does
+ * not run through Chromium's capture governor. Everywhere else (other
+ * platforms, or a whole-screen share even on Windows) picking either just
+ * raises the bitrate ceiling (see `screenShareEncoding`) without the capture
+ * pipeline producing any extra frames to spend it on -- see
+ * `#watchForWeakLink` for the mitigation.
+ */
+const ALL_SCREEN_SHARE_QUALITIES: Record<
+  ScreenShareQualityName,
+  ScreenShareQuality
+> = {
+  low: {
+    name: "low",
+    resolution: ScreenSharePresets.h720fps30.resolution,
+    fullName: `720p 30FPS`,
+    contentHint: "motion",
+  },
+  low60: {
+    name: "low60",
+    resolution: { width: 1280, height: 720, frameRate: 60 },
+    fullName: `720p 60FPS`,
+    contentHint: "motion",
+  },
+  high: {
+    name: "high",
+    resolution: ScreenSharePresets.h1080fps30.resolution,
+    fullName: `1080p 30FPS`,
+    contentHint: "motion",
+  },
+  high60: {
+    name: "high60",
+    resolution: { width: 1920, height: 1080, frameRate: 60 },
+    fullName: `1080p 60FPS`,
+    contentHint: "motion",
+  },
+};
+
 /** Capture constraints for the screen share's audio half */
 const SCREEN_SHARE_AUDIO: ScreenShareCaptureOptions["audio"] = {
   autoGainControl: false,
@@ -177,6 +228,14 @@ const SCREEN_SHARE_AUDIO: ScreenShareCaptureOptions["audio"] = {
  * visible stop/start for every viewer. 6 Mbps now fits comfortably under
  * that link.
  *
+ * 720p60 ("low60") gets 6 Mbps, arrived at two ways that agree: it is the
+ * same 1.5x rule applied to 720p30's 4 Mbps that gave 1080p60 its 9 Mbps
+ * from 1080p30's 6 Mbps (168-172 above), and it is ~77% of the 7.78 Mbps
+ * link that 1080p30's own 6 Mbps ceiling was chosen against (173-178 above)
+ * -- so it inherits that same headroom rather than a fresh guess. This
+ * preset exists for links that can hold 1080p30's 6 Mbps but not 1080p60's
+ * 9 Mbps: a lower resolution at the same 60fps fits within that headroom.
+ *
  * high60's 9 Mbps is deliberately *not* brought down to fit that same link --
  * it is the ungated top preset offered everywhere, and sizing it to one
  * user's uplink would degrade it for everyone with more headroom. That
@@ -194,7 +253,7 @@ function screenShareEncoding(resolution: VideoResolution | undefined) {
 
   let maxBitrate: number;
   if (height <= 720) {
-    maxBitrate = 4_000_000;
+    maxBitrate = frameRate > 30 ? 6_000_000 : 4_000_000;
   } else if (frameRate > 30) {
     maxBitrate = 9_000_000;
   } else {
@@ -1836,10 +1895,23 @@ class Voice {
    * to "low" when the saved one isn't offered here (e.g. this instance's
    * video_resolution limit is lower than it was when the setting was saved).
    * Walks {@link ScreenShareQualityNames} backward from the saved choice --
-   * it's declared low to high -- so a saved "high60" that isn't enabled lands
-   * on "high" if that is enabled, and only falls all the way to "low" if
-   * nothing in between is either. "low" is always enabled, so the loop always
-   * has somewhere to land.
+   * it's declared low to high -- so a saved "high" that isn't enabled lands
+   * on "low60" or "low" (whichever is enabled), and only falls all the way to
+   * "low" if nothing else qualifies. "low" is always enabled, so the loop
+   * always has somewhere to land.
+   *
+   * The walk preserves framerate class: a candidate is skipped if its
+   * framerate is higher than the saved choice's. {@link ScreenShareQualityNames}
+   * is ordered by cost (bitrate ceiling), not by desirability, and cost isn't
+   * monotonic with framerate -- "low60" (720p60, 4 fps class jump from "low")
+   * sits between "low" and "high" (1080p30) in that ordering even though it
+   * asks for more frames than "high" does. Without this guard, a saved
+   * "high" (1080p30) that isn't enabled would silently land one step back on
+   * "low60" (720p60) -- moving a 30fps choice to 60fps, raising the bitrate
+   * ceiling and arming the weak-link warning, on an instance that never
+   * offered 60fps capture in the first place. A saved 60fps choice ("high60"
+   * or "low60") may still degrade to a 30fps quality when nothing at 60fps
+   * qualifies.
    */
   #screenShareQuality(): ScreenShareQualityName {
     const saved = this.#settings.screenShareQuality;
@@ -1848,9 +1920,25 @@ class Voice {
     if (saved && qualities[saved]) return saved;
 
     const savedIndex = saved ? ScreenShareQualityNames.indexOf(saved) : -1;
+    // Looked up from the full, ungated definition table (not `qualities`,
+    // which by construction does not contain `saved` on this path) so the
+    // saved choice's framerate class is known even when it isn't offered
+    // here.
+    const savedFrameRate =
+      saved && savedIndex !== -1
+        ? ALL_SCREEN_SHARE_QUALITIES[saved].resolution.frameRate
+        : undefined;
     for (let i = savedIndex - 1; i >= 0; i--) {
       const name = ScreenShareQualityNames[i];
-      if (qualities[name]) return name;
+      const candidate = qualities[name];
+      if (!candidate) continue;
+      if (
+        savedFrameRate !== undefined &&
+        (candidate.resolution.frameRate ?? 0) > savedFrameRate
+      ) {
+        continue;
+      }
+      return name;
     }
 
     return "low";
@@ -1859,16 +1947,16 @@ class Voice {
   getEnabledScreenShareQualities(): Partial<
     Record<ScreenShareQualityName, ScreenShareQuality>
   > {
-    // Always enable low
+    // low and low60 are always enabled: both are 720p, and
+    // limits().video_resolution gates by resolution, not framerate -- a
+    // 720p limit already permits 60fps at that same resolution, so low60
+    // belongs in the same always-on branch as low rather than behind the
+    // 1080p-gated branch below.
     const qualities: Partial<
       Record<ScreenShareQualityName, ScreenShareQuality>
     > = {
-      low: {
-        name: "low",
-        resolution: ScreenSharePresets.h720fps30.resolution,
-        fullName: `720p 30FPS`,
-        contentHint: "motion",
-      },
+      low: ALL_SCREEN_SHARE_QUALITIES.low,
+      low60: ALL_SCREEN_SHARE_QUALITIES.low60,
     };
 
     const limit = this.limits().video_resolution;
@@ -1878,31 +1966,8 @@ class Voice {
       (limit[0] === 0 || limit[0] >= 1920) &&
       (limit[1] === 0 || limit[1] >= 1080)
     ) {
-      qualities.high = {
-        name: "high",
-        resolution: ScreenSharePresets.h1080fps30.resolution,
-        fullName: `1080p 30FPS`,
-        contentHint: "motion",
-      };
-
-      // LiveKit has no 60fps screen-share preset -- ScreenSharePresets stops
-      // at h1080fps30 -- so this one is hand-built to match the same
-      // VideoResolution shape the presets above use.
-      //
-      // Offered ungated, on every platform, by deliberate product decision:
-      // 60fps is only actually reachable on Windows window shares through the
-      // native GPU capture path in for-desktop, which does not run through
-      // Chromium's capture governor. Everywhere else (other platforms, or a
-      // whole-screen share even on Windows) this raises the bitrate ceiling
-      // (see screenShareEncoding) without the capture pipeline producing any
-      // extra frames to spend it on -- see #watchForWeakLink for the
-      // mitigation.
-      qualities.high60 = {
-        name: "high60",
-        resolution: { width: 1920, height: 1080, frameRate: 60 },
-        fullName: `1080p 60FPS`,
-        contentHint: "motion",
-      };
+      qualities.high = ALL_SCREEN_SHARE_QUALITIES.high;
+      qualities.high60 = ALL_SCREEN_SHARE_QUALITIES.high60;
 
       // The upstream "Source 5FPS" option lived here. It is deliberately gone:
       // it shares this 1080p-capable branch, so raising an instance's
@@ -1944,7 +2009,7 @@ class Voice {
    * Primed one quality at a time rather than all at once. `screenShareCodec`
    * already fans a single quality's probe out to four parallel
    * `encodingInfo` calls (see its doc comment); firing all enabled qualities
-   * (up to three -- low/high/high60) together would mean up to twelve
+   * (up to four -- low/low60/high/high60) together would mean up to sixteen
    * simultaneous GPU capability queries the moment the room connects,
    * stacked on top of everything else the client is doing at startup, for no
    * wall-clock benefit since nothing here is awaited by a caller anyway.
@@ -2333,14 +2398,12 @@ class Voice {
 
     await this.#applyEncoderLimits(localTrack, quality.resolution);
 
-    // Only high60 raises the bitrate ceiling without the capture pipeline
-    // necessarily producing any more frames to spend it on -- see
-    // getEnabledScreenShareQualities and #watchForWeakLink.
-    if (qualityName === "high60") {
-      this.#watchForWeakLink(
-        localTrack,
-        screenShareEncoding(quality.resolution).maxBitrate,
-      );
+    // Only the 60fps qualities (low60, high60) raise the bitrate ceiling
+    // without the capture pipeline necessarily producing any more frames to
+    // spend it on -- see getEnabledScreenShareQualities and
+    // #watchForWeakLink.
+    if ((quality.resolution.frameRate ?? 30) > 30) {
+      this.#watchForWeakLink(localTrack, quality);
     }
 
     if (!audio) {
@@ -2517,17 +2580,17 @@ class Voice {
   }
 
   /**
-   * A few seconds after applying a 1080p60 quality choice, check whether the
+   * A few seconds after applying a 60fps quality choice, check whether the
    * link can actually carry the bitrate ceiling that comes with it.
    *
    * Mirrors {@link Voice.#watchForSoftwareFallback}'s shape: sample
-   * `getStats()` once on a delay and act on what it finds. high60 is the only
-   * quality this runs for (see the call site in `#applyShareChoice`) because
-   * it is the only one whose ceiling can rise with no extra frames to show
-   * for it on a non-native capture path -- see getEnabledScreenShareQualities
-   * -- which is exactly what makes a marginal uplink worse off for having
-   * picked it: more bits chasing the same frame rate means more congestion,
-   * not more motion.
+   * `getStats()` once on a delay and act on what it finds. The 60fps
+   * qualities (`low60`, `high60`) are the only ones this runs for (see the
+   * call site in `#applyShareChoice`) because they are the only ones whose
+   * ceiling can rise with no extra frames to show for it on a non-native
+   * capture path -- see getEnabledScreenShareQualities -- which is exactly
+   * what makes a marginal uplink worse off for having picked one: more bits
+   * chasing the same frame rate means more congestion, not more motion.
    *
    * Surfaced through the existing `error2` modal (same pattern as
    * `#onCameraErr`, a plain `Error` with a human message rather than an API
@@ -2537,10 +2600,15 @@ class Voice {
    * same {@link isScreenShareLinkWeak} check to stay visible for as long as
    * the share runs, without repeating the modal.
    * @param localTrack The publication the quality choice was just applied to
-   * @param maxBitrate The encoder ceiling `high60` was just given
+   * @param quality The quality that was just applied, whose ceiling and name
+   * are both named in the warning
    */
-  #watchForWeakLink(localTrack: LocalTrackPublication, maxBitrate: number) {
+  #watchForWeakLink(
+    localTrack: LocalTrackPublication,
+    quality: ScreenShareQuality,
+  ) {
     if (weakLinkWarningShown) return;
+    const maxBitrate = screenShareEncoding(quality.resolution).maxBitrate;
 
     setTimeout(async () => {
       try {
@@ -2575,13 +2643,13 @@ class Voice {
 
         weakLinkWarningShown = true;
         console.warn(
-          `[rtc] screen share link looks too weak for the 1080p60 bitrate ceiling (${maxBitrate} bps): available outgoing bitrate ${availableOutgoingBitrate ?? "unknown"} bps, ${bandwidthLimitedSeconds ?? 0}s bandwidth-limited`,
+          `[rtc] screen share link looks too weak for the ${quality.fullName} bitrate ceiling (${maxBitrate} bps): available outgoing bitrate ${availableOutgoingBitrate ?? "unknown"} bps, ${bandwidthLimitedSeconds ?? 0}s bandwidth-limited`,
         );
 
         this.openModal({
           type: "error2",
           error: new Error(
-            "Your connection looks too weak for 1080p 60FPS screen sharing -- try 1080p 30FPS instead for a smoother stream.",
+            `Your connection looks too weak for ${quality.fullName} screen sharing -- try a 30FPS quality instead for a smoother stream.`,
           ),
         });
       } catch {
