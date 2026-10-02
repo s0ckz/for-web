@@ -11,6 +11,12 @@ import type { TrackReference } from "solid-livekit-components";
 import { useLingui } from "@lingui/solid/macro";
 import { isLocal } from "@livekit/components-core";
 import { isScreenShareLinkWeak } from "@revolt/rtc";
+import {
+  pollScreenShareStats,
+  selectedCandidatePair,
+  StatsCounters,
+  VideoPresentation,
+} from "@revolt/rtc/screenShareTelemetry";
 import { Key } from "@solid-primitives/keyed";
 import { type TrackPublication, Track } from "livekit-client";
 import { styled } from "styled-system/jsx";
@@ -21,8 +27,8 @@ import { Symbol } from "@revolt/ui/components/utils/Symbol";
  * Statistics for a screen share.
  *
  * For a share you are watching, this reads inbound-rtp off the receiver, so it
- * reports what actually arrived rather than what was requested. For your own
- * share it reads outbound-rtp and media-source off the sender instead, which
+ * separates received/decoded rates from video-element compositor presentation. For your own
+ * share it reads outbound-rtp and media-source counters off the sender, which
  * is the only way to tell the two halves of a framerate problem apart: what
  * the capturer produced versus what the encoder managed to send, and why it
  * was held back. The copy button produces a plain text block suitable for
@@ -33,10 +39,16 @@ type Row = { label: string; value: string };
 
 const NA = "--";
 
-function formatBitrate(bitsPerSecond: number) {
-  if (!bitsPerSecond) return NA;
+function formatBitrate(bitsPerSecond: number | undefined) {
+  if (bitsPerSecond === undefined || !Number.isFinite(bitsPerSecond)) return NA;
   if (bitsPerSecond >= 1e6) return `${(bitsPerSecond / 1e6).toFixed(2)} Mbps`;
   return `${Math.round(bitsPerSecond / 1e3)} kbps`;
+}
+
+function formatFps(fps: number | undefined) {
+  return fps !== undefined && Number.isFinite(fps)
+    ? `${fps.toFixed(1)} fps`
+    : NA;
 }
 
 /**
@@ -107,27 +119,27 @@ type OwnSummary = {
  * @param trackRef The screen-share track to sample
  * @returns The sampled rows, whether this is your own share, and the badge's summary
  */
-export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
+export function createScreenShareSample(
+  trackRef: Accessor<TrackReference>,
+  videoElement?: Accessor<HTMLVideoElement | undefined>,
+) {
   const [rows, setRows] = createSignal<Row[]>([]);
   const [ownSummary, setOwnSummary] = createSignal<OwnSummary | undefined>();
 
-  // Cumulative counters, so we can turn them into rates.
-  let lastBytes = 0;
-  let lastAt = 0;
-  let lastFramesDecoded = 0;
-  let lastFramesSent = 0;
-  let lastTotalEncodeTime = 0;
-  let lastFramesEncoded = 0;
-  let lastSourceFrames = 0;
-
-  // Audio has its own sender/receiver, separate from the video ones above,
-  // so it needs its own byte counter and its own timestamp to derive a rate
-  // from -- reusing `lastAt` here would mix an audio delta with whatever
-  // interval the video half happened to measure.
-  let lastAudioBytes = 0;
-  let lastAudioAt = 0;
-  let lastInsertedSamplesForDeceleration = 0;
-  let lastRemovedSamplesForAcceleration = 0;
+  const videoCounters = new StatsCounters();
+  const audioCounters = new StatsCounters();
+  const presentation = new VideoPresentation();
+  let videoStreamId: string | undefined;
+  let audioStreamId: string | undefined;
+  const reset = () => {
+    videoCounters.reset();
+    audioCounters.reset();
+    videoStreamId = undefined;
+    audioStreamId = undefined;
+    presentation.reset();
+    setRows([]);
+    setOwnSummary(undefined);
+  };
 
   const sending = () => isLocal(trackRef().participant);
 
@@ -137,21 +149,24 @@ export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
    * combined separately in `sample()` so a video-side "nothing to report"
    * never hides whether audio is still flowing.
    */
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const sampleOutboundVideo = async (
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     track: any,
+    isCurrent: () => boolean,
   ): Promise<{ rows: Row[]; summary?: OwnSummary }> => {
     const sender: RTCRtpSender | undefined = track?.sender;
 
     if (!sender?.getStats) {
+      videoCounters.reset();
       return { rows: [{ label: "Status", value: "not publishing" }] };
     }
 
     let report: RTCStatsReport;
     try {
       report = await sender.getStats();
+      if (!isCurrent()) return { rows: [] };
     } catch {
+      if (isCurrent()) videoCounters.reset();
       return { rows: [{ label: "Status", value: "stats unavailable" }] };
     }
 
@@ -161,86 +176,85 @@ export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
     let remoteInbound: any = null;
     let candidatePair: any = null;
     const codecs = new Map<string, any>();
-    let bytes = 0;
     /* eslint-enable @typescript-eslint/no-explicit-any */
 
+    let rates = videoCounters.read(report.values(), sender);
+    let outboundAdvancing = false;
     report.forEach((stat) => {
       if (stat.type === "codec") codecs.set(stat.id, stat);
-      if (stat.type === "media-source" && stat.kind === "video") source = stat;
-      if (stat.type === "remote-inbound-rtp" && stat.kind === "video")
-        remoteInbound = stat;
-      if (stat.type === "candidate-pair" && stat.nominated)
-        candidatePair = stat;
       if (stat.type === "outbound-rtp" && stat.kind === "video") {
-        bytes += stat.bytesSent ?? 0;
-        // Simulcast or a backup codec means several outbound streams; report
-        // the largest, which is the one people are actually watching.
-        if (!outbound || (stat.frameWidth ?? 0) > (outbound.frameWidth ?? 0)) {
+        // A sender does not know which layer each viewer is watching.
+        // Describe the largest active stream and label its bitrate accordingly.
+        const advancing = (rates.rate(stat, "framesSent") ?? 0) > 0;
+        if (
+          stat.active !== false &&
+          (!outbound ||
+            (advancing && !outboundAdvancing) ||
+            (advancing === outboundAdvancing &&
+              (stat.frameWidth ?? 0) > (outbound.frameWidth ?? 0)))
+        ) {
           outbound = stat;
+          outboundAdvancing = advancing;
         }
       }
     });
 
     if (!outbound) {
+      videoCounters.reset();
       return { rows: [{ label: "Status", value: "no video being sent" }] };
     }
 
-    const now = performance.now();
-    let bitrate = 0;
-    if (lastAt) {
-      const seconds = (now - lastAt) / 1000;
-      if (seconds > 0) bitrate = ((bytes - lastBytes) * 8) / seconds;
+    if (videoStreamId !== outbound.id) {
+      videoCounters.reset();
+      rates = videoCounters.read(report.values(), sender);
     }
-
-    let fps: number | undefined = outbound.framesPerSecond;
-    const framesSent = outbound.framesSent ?? 0;
-    if (fps === undefined && lastAt) {
-      const seconds = (now - lastAt) / 1000;
-      if (seconds > 0) fps = (framesSent - lastFramesSent) / seconds;
-    }
+    videoStreamId = outbound.id;
+    const sources = Array.from(report.values()).filter(
+      (stat) =>
+        stat.type === "media-source" &&
+        stat.kind === "video" &&
+        (!stat.trackIdentifier ||
+          stat.trackIdentifier === track?.mediaStreamTrack?.id),
+    );
+    source = outbound.mediaSourceId
+      ? report.get(outbound.mediaSourceId)
+      : sources.length === 1
+        ? sources[0]
+        : undefined;
+    remoteInbound = outbound.remoteId
+      ? report.get(outbound.remoteId)
+      : Array.from(report.values()).find(
+          (stat) =>
+            stat.type === "remote-inbound-rtp" && stat.localId === outbound.id,
+        );
+    candidatePair = selectedCandidatePair(report, outbound);
+    const byteRate = rates.rate(outbound, "bytesSent");
+    const bitrate = byteRate === undefined ? undefined : byteRate * 8;
+    const fps = rates.rate(outbound, "framesSent");
+    const encodedFps = rates.rate(outbound, "framesEncoded");
+    const sourceFps = source ? rates.rate(source, "frames") : undefined;
+    const framesSent: number | undefined = outbound.framesSent;
 
     // Mean time the encoder spent per frame, over just this sample window
     // (not the cumulative average since the share started) -- against the
     // budget one frame has at the current framerate.
-    const totalEncodeTime = outbound.totalEncodeTime ?? 0;
-    const framesEncoded = outbound.framesEncoded ?? 0;
-    const framesEncodedDelta = framesEncoded - lastFramesEncoded;
+    const encodeSeconds = rates.delta(outbound, "totalEncodeTime");
+    const framesEncodedDelta = rates.delta(outbound, "framesEncoded");
     let encodeTimeMs: number | undefined;
-    if (lastAt && framesEncodedDelta > 0) {
-      encodeTimeMs =
-        ((totalEncodeTime - lastTotalEncodeTime) / framesEncodedDelta) * 1000;
+    if (
+      encodeSeconds !== undefined &&
+      framesEncodedDelta !== undefined &&
+      framesEncodedDelta > 0
+    ) {
+      encodeTimeMs = (encodeSeconds / framesEncodedDelta) * 1000;
     }
 
-    // How many frames the capturer produced but the encoder never turned
-    // into an encoded frame, as a rate rather than a raw delta -- e.g. the
-    // encoder falling behind under CPU pressure, or discarding a frame that
-    // arrived while it was still working the previous one.
-    // `media-source.frames` is the capturer's own cumulative count;
-    // `outbound-rtp.framesEncoded` (already read above, as `framesEncoded`)
-    // is how many of those the encoder actually finished. Both are
-    // cumulative counters, so this reads their *delta* over the sample
-    // window, same as every other rate here. Never negative: a source stat
-    // that arrives a tick late (or a genuine encoder catch-up burst) must
-    // read as "nothing dropped", not a negative fps.
-    const sourceFrames: number | undefined = source?.frames;
-    let droppedBeforeEncode: number | undefined;
-    if (lastAt && sourceFrames !== undefined) {
-      const seconds = (now - lastAt) / 1000;
-      if (seconds > 0) {
-        const producedDelta = sourceFrames - lastSourceFrames;
-        droppedBeforeEncode = Math.max(
-          0,
-          (producedDelta - framesEncodedDelta) / seconds,
-        );
-      }
-    }
-
-    lastBytes = bytes;
-    lastAt = now;
-    lastFramesSent = framesSent;
-    lastTotalEncodeTime = totalEncodeTime;
-    lastFramesEncoded = framesEncoded;
-    lastSourceFrames = sourceFrames ?? lastSourceFrames;
+    // Different pipeline stages can straddle sample windows. This gap is
+    // diagnostic evidence of backlog/omission, not an exact dropped-frame count.
+    const sourceEncodeGap =
+      sourceFps !== undefined && encodedFps !== undefined
+        ? Math.max(0, sourceFps - encodedFps)
+        : undefined;
 
     const codec = codecs.get(outbound.codecId);
 
@@ -252,8 +266,14 @@ export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
     // what capture was asked for if the sender has no encodings yet.
     // Deliberately never `getSettings().frameRate` here -- that is measured
     // too, and would reintroduce the same circularity.
+    let parameters: RTCRtpSendParameters | undefined;
+    try {
+      parameters = sender.getParameters();
+    } catch {
+      /* stopped sender */
+    }
     const targetFrameRate: number | undefined = (() => {
-      const maxFramerate = sender.getParameters().encodings?.[0]?.maxFramerate;
+      const maxFramerate = parameters?.encodings?.[0]?.maxFramerate;
       if (maxFramerate) return maxFramerate;
 
       const frameRateConstraint =
@@ -266,7 +286,7 @@ export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
     // below -- read the same way as targetFrameRate above, straight off the
     // sender's own parameters rather than re-derived from the quality name.
     const maxBitrate: number | undefined =
-      sender.getParameters().encodings?.[0]?.maxBitrate;
+      parameters?.encodings?.[0]?.maxBitrate;
 
     // Where the time went while quality was limited -- `cpu` here means the
     // encoder could not keep up, `bandwidth` means the network could not.
@@ -293,19 +313,25 @@ export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
         },
         {
           label: "Capture rate",
-          value:
-            source?.framesPerSecond !== undefined
-              ? `${Math.round(source.framesPerSecond)} fps`
-              : NA,
+          value: formatFps(sourceFps),
         },
         {
-          label: "Sending",
+          label: "Largest sending stream",
           value: outbound.frameWidth
             ? `${outbound.frameWidth}x${outbound.frameHeight}`
             : NA,
         },
-        { label: "Send rate", value: fps ? `${Math.round(fps)} fps` : NA },
-        { label: "Bitrate", value: formatBitrate(bitrate) },
+        { label: "Sent FPS", value: formatFps(fps) },
+        { label: "Encoded FPS", value: formatFps(encodedFps) },
+        {
+          label: "Browser encode estimate",
+          value: formatFps(outbound.framesPerSecond),
+        },
+        {
+          label: "Stream SSRC",
+          value: outbound.ssrc === undefined ? NA : String(outbound.ssrc),
+        },
+        { label: "Stream bitrate", value: formatBitrate(bitrate) },
         {
           label: "Codec",
           value: codec?.mimeType ? codec.mimeType.replace("video/", "") : NA,
@@ -330,7 +356,12 @@ export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
           label: "Limited by",
           value: outbound.qualityLimitationReason ?? NA,
         },
-        { label: "Limited for", value: limitBreakdown || "never" },
+        {
+          label: "Limited for (lifetime)",
+          value: outbound.qualityLimitationDurations
+            ? limitBreakdown || "never"
+            : NA,
+        },
         {
           label: "Resolution changes",
           value:
@@ -340,13 +371,13 @@ export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
         },
         {
           label: "Frames sent",
-          value: `${framesSent} of ${outbound.framesEncoded ?? 0} encoded`,
+          value: `${framesSent ?? NA} sent / ${outbound.framesEncoded ?? NA} encoded (lifetime)`,
         },
         {
-          label: "Dropped before encode",
+          label: "Source/encode gap",
           value:
-            droppedBeforeEncode !== undefined
-              ? `${Math.round(droppedBeforeEncode)} fps`
+            sourceEncodeGap !== undefined
+              ? `${sourceEncodeGap.toFixed(1)} fps`
               : NA,
         },
         {
@@ -365,9 +396,7 @@ export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
         },
         {
           label: "Link capacity",
-          value: candidatePair?.availableOutgoingBitrate
-            ? formatBitrate(candidatePair.availableOutgoingBitrate)
-            : NA,
+          value: formatBitrate(candidatePair?.availableOutgoingBitrate),
         },
         {
           // Same check as the one-time weak-link warning in rtc/state.tsx
@@ -418,8 +447,10 @@ export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
    */
   const sampleOutboundAudio = async (
     pub: TrackPublication | undefined,
+    isCurrent: () => boolean,
   ): Promise<Row[]> => {
     if (!pub) {
+      audioCounters.reset();
       return [{ label: "Audio", value: "not shared" }];
     }
 
@@ -427,24 +458,21 @@ export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
     const sender: RTCRtpSender | undefined = (pub.track as any)?.sender;
 
     if (!sender?.getStats) {
-      lastAudioBytes = 0;
-      lastAudioAt = 0;
+      audioCounters.reset();
       return [{ label: "Audio", value: "not publishing" }];
     }
 
     let report: RTCStatsReport;
     // `getParameters()` shares the try/catch with `getStats()` -- per spec it
     // throws `InvalidStateError` on a stopped/stopping transceiver, and this
-    // whole function runs bare off a `setInterval` tick with no `.catch`, so
-    // an uncaught throw here becomes an unhandled rejection that leaves the
-    // panel stuck on stale numbers instead of reporting the teardown.
+    // stopped sender reports unavailable data without retaining old rates.
     let maxBitrate: number | undefined;
     try {
       report = await sender.getStats();
+      if (!isCurrent()) return [];
       maxBitrate = sender.getParameters().encodings?.[0]?.maxBitrate;
     } catch {
-      lastAudioBytes = 0;
-      lastAudioAt = 0;
+      if (isCurrent()) audioCounters.reset();
       return [{ label: "Audio", value: "stats unavailable" }];
     }
 
@@ -453,14 +481,12 @@ export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
     let remoteInbound: any = null;
     const codecs = new Map<string, any>();
     /* eslint-enable @typescript-eslint/no-explicit-any */
-    let bytes = 0;
 
     report.forEach((stat) => {
       if (stat.type === "codec") codecs.set(stat.id, stat);
       if (stat.type === "remote-inbound-rtp" && stat.kind === "audio")
         remoteInbound = stat;
       if (stat.type === "outbound-rtp" && stat.kind === "audio") {
-        bytes += stat.bytesSent ?? 0;
         outbound = stat;
       }
     });
@@ -468,19 +494,21 @@ export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
     if (!outbound) {
       // Publication and sender exist, but the RTP stats haven't shown up in
       // a report yet -- normal for the first tick or two after publishing.
-      lastAudioBytes = 0;
-      lastAudioAt = 0;
+      audioCounters.reset();
       return [{ label: "Audio", value: "stats pending" }];
     }
 
-    const now = performance.now();
-    let bitrate = 0;
-    if (lastAudioAt) {
-      const seconds = (now - lastAudioAt) / 1000;
-      if (seconds > 0) bitrate = ((bytes - lastAudioBytes) * 8) / seconds;
-    }
-    lastAudioBytes = bytes;
-    lastAudioAt = now;
+    remoteInbound = outbound.remoteId
+      ? report.get(outbound.remoteId)
+      : Array.from(report.values()).find(
+          (stat) =>
+            stat.type === "remote-inbound-rtp" && stat.localId === outbound.id,
+        );
+    if (audioStreamId !== outbound.id) audioCounters.reset();
+    audioStreamId = outbound.id;
+    const rates = audioCounters.read(report.values(), sender);
+    const byteRate = rates.rate(outbound, "bytesSent");
+    const bitrate = byteRate === undefined ? undefined : byteRate * 8;
 
     const codec = resolveAudioCodec(codecs, outbound.codecId);
 
@@ -527,18 +555,24 @@ export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
    * so a video-side "nothing to report" never hides whether audio is still
    * flowing -- that is exactly the question a dead video track raises.
    */
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const sampleInboundVideo = async (track: any): Promise<Row[]> => {
+  const sampleInboundVideo = async (
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    track: any,
+    isCurrent: () => boolean,
+  ): Promise<Row[]> => {
     const receiver: RTCRtpReceiver | undefined = track?.receiver;
 
     if (!receiver?.getStats) {
+      videoCounters.reset();
       return [{ label: "Status", value: "no receiver (not subscribed?)" }];
     }
 
     let report: RTCStatsReport;
     try {
       report = await receiver.getStats();
+      if (!isCurrent()) return [];
     } catch {
+      if (isCurrent()) videoCounters.reset();
       return [{ label: "Status", value: "stats unavailable" }];
     }
 
@@ -551,35 +585,46 @@ export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
 
     report.forEach((stat) => {
       if (stat.type === "codec") codecs.set(stat.id, stat);
-      if (stat.type === "inbound-rtp" && stat.kind === "video") inbound = stat;
-      if (stat.type === "candidate-pair" && stat.nominated)
-        candidatePair = stat;
+    });
+    let rates = videoCounters.read(report.values(), receiver);
+    let inboundAdvancing = false;
+    report.forEach((stat) => {
+      if (stat.type !== "inbound-rtp" || stat.kind !== "video") return;
+      if (
+        /\/(rtx|red|ulpfec|flexfec)/i.test(
+          codecs.get(stat.codecId)?.mimeType ?? "",
+        )
+      )
+        return;
+      const advancing = (rates.rate(stat, "framesDecoded") ?? 0) > 0;
+      if (
+        !inbound ||
+        (advancing && !inboundAdvancing) ||
+        (advancing === inboundAdvancing &&
+          (stat.frameWidth ?? 0) > (inbound.frameWidth ?? 0))
+      ) {
+        inbound = stat;
+        inboundAdvancing = advancing;
+      }
     });
 
     if (!inbound) {
+      videoCounters.reset();
       return [{ label: "Status", value: "no video being received" }];
     }
 
-    const now = performance.now();
-    const bytes = inbound.bytesReceived ?? 0;
-    let bitrate = 0;
-    if (lastAt) {
-      const seconds = (now - lastAt) / 1000;
-      if (seconds > 0) bitrate = ((bytes - lastBytes) * 8) / seconds;
+    if (videoStreamId !== inbound.id) {
+      videoCounters.reset();
+      rates = videoCounters.read(report.values(), receiver);
     }
-
-    // The browser only reports framesPerSecond once it has a stable estimate,
-    // so derive it from the decode counter as a fallback.
-    let fps: number | undefined = inbound.framesPerSecond;
-    const framesDecoded = inbound.framesDecoded ?? 0;
-    if (fps === undefined && lastAt) {
-      const seconds = (now - lastAt) / 1000;
-      if (seconds > 0) fps = (framesDecoded - lastFramesDecoded) / seconds;
-    }
-
-    lastBytes = bytes;
-    lastAt = now;
-    lastFramesDecoded = framesDecoded;
+    videoStreamId = inbound.id;
+    candidatePair = selectedCandidatePair(report, inbound);
+    const byteRate = rates.rate(inbound, "bytesReceived");
+    const bitrate = byteRate === undefined ? undefined : byteRate * 8;
+    const receivedFps = rates.rate(inbound, "framesReceived");
+    const decodedFps = rates.rate(inbound, "framesDecoded");
+    const renderedFps = rates.rate(inbound, "framesRendered");
+    const displayed = presentation.sample();
 
     const codec = codecs.get(inbound.codecId);
     const received = inbound.packetsReceived ?? 0;
@@ -588,7 +633,8 @@ export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
       received + lost > 0 ? ((lost / (received + lost)) * 100).toFixed(2) : "0";
 
     const jitterBufferMs =
-      inbound.jitterBufferDelay && inbound.jitterBufferEmittedCount
+      inbound.jitterBufferDelay !== undefined &&
+      inbound.jitterBufferEmittedCount > 0
         ? Math.round(
             (inbound.jitterBufferDelay / inbound.jitterBufferEmittedCount) *
               1000,
@@ -602,7 +648,25 @@ export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
           ? `${inbound.frameWidth}x${inbound.frameHeight}`
           : NA,
       },
-      { label: "Frame rate", value: fps ? `${Math.round(fps)} fps` : NA },
+      { label: "Presented FPS (compositor)", value: formatFps(displayed.fps) },
+      {
+        label: "Time since presentation",
+        value:
+          displayed.sinceLastFrameMs === undefined
+            ? NA
+            : `${Math.round(displayed.sinceLastFrameMs)} ms`,
+      },
+      { label: "Received FPS", value: formatFps(receivedFps) },
+      { label: "Decoded FPS", value: formatFps(decodedFps) },
+      { label: "Rendered FPS (RTC)", value: formatFps(renderedFps) },
+      {
+        label: "Browser decode estimate",
+        value: formatFps(inbound.framesPerSecond),
+      },
+      {
+        label: "Stream SSRC",
+        value: inbound.ssrc === undefined ? NA : String(inbound.ssrc),
+      },
       { label: "Bitrate", value: formatBitrate(bitrate) },
       {
         label: "Codec",
@@ -611,11 +675,11 @@ export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
       { label: "Decoder", value: inbound.decoderImplementation ?? NA },
       { label: "Packets lost", value: `${lost} (${lossPct}%)` },
       {
-        label: "Frames dropped",
-        value: `${inbound.framesDropped ?? 0} of ${framesDecoded}`,
+        label: "Frames dropped (lifetime)",
+        value: `${inbound.framesDropped ?? NA}`,
       },
       {
-        label: "Freezes",
+        label: "Freezes (lifetime)",
         value:
           inbound.freezeCount !== undefined
             ? `${inbound.freezeCount} (${(
@@ -631,20 +695,19 @@ export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
             : NA,
       },
       {
-        label: "Jitter buffer",
+        label: "Jitter buffer (lifetime avg)",
         value: jitterBufferMs !== undefined ? `${jitterBufferMs} ms` : NA,
       },
       {
         label: "Round trip",
-        value: candidatePair?.currentRoundTripTime
-          ? `${Math.round(candidatePair.currentRoundTripTime * 1000)} ms`
-          : NA,
+        value:
+          candidatePair?.currentRoundTripTime !== undefined
+            ? `${Math.round(candidatePair.currentRoundTripTime * 1000)} ms`
+            : NA,
       },
       {
         label: "Link capacity",
-        value: candidatePair?.availableIncomingBitrate
-          ? formatBitrate(candidatePair.availableIncomingBitrate)
-          : NA,
+        value: formatBitrate(candidatePair?.availableIncomingBitrate),
       },
       {
         label: "NACK / PLI",
@@ -678,8 +741,10 @@ export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
    */
   const sampleInboundAudio = async (
     pub: TrackPublication | undefined,
+    isCurrent: () => boolean,
   ): Promise<Row[]> => {
     if (!pub) {
+      audioCounters.reset();
       return [{ label: "Audio", value: "not shared" }];
     }
 
@@ -687,21 +752,16 @@ export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
     const receiver: RTCRtpReceiver | undefined = (pub.track as any)?.receiver;
 
     if (!receiver?.getStats) {
-      lastAudioBytes = 0;
-      lastAudioAt = 0;
-      lastInsertedSamplesForDeceleration = 0;
-      lastRemovedSamplesForAcceleration = 0;
+      audioCounters.reset();
       return [{ label: "Audio", value: "not subscribed" }];
     }
 
     let report: RTCStatsReport;
     try {
       report = await receiver.getStats();
+      if (!isCurrent()) return [];
     } catch {
-      lastAudioBytes = 0;
-      lastAudioAt = 0;
-      lastInsertedSamplesForDeceleration = 0;
-      lastRemovedSamplesForAcceleration = 0;
+      if (isCurrent()) audioCounters.reset();
       return [{ label: "Audio", value: "stats unavailable" }];
     }
 
@@ -718,48 +778,20 @@ export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
     if (!inbound) {
       // Subscribed, but no inbound-rtp stat in this report yet -- normal
       // right after subscribing, before the first RTP has been counted.
-      lastAudioBytes = 0;
-      lastAudioAt = 0;
-      lastInsertedSamplesForDeceleration = 0;
-      lastRemovedSamplesForAcceleration = 0;
+      audioCounters.reset();
       return [{ label: "Audio", value: "stats pending" }];
     }
 
-    const now = performance.now();
-    const bytes = inbound.bytesReceived ?? 0;
-    let bitrate = 0;
-    if (lastAudioAt) {
-      const seconds = (now - lastAudioAt) / 1000;
-      if (seconds > 0) bitrate = ((bytes - lastAudioBytes) * 8) / seconds;
-    }
-
-    // NetEq's adaptive-playout counters -- how many samples it has had to
-    // insert (stretching audio to ride out a jitter spike) or drop (catching
-    // back up once the spike passes) since the last tick. Cumulative counts
-    // would just grow for the life of the share; the delta is what says
-    // whether resync is happening *right now*. Kept as `undefined` (rather
-    // than defaulting to 0) whenever the underlying field is absent, so a
-    // browser that doesn't report these counters shows `--` instead of a
-    // resync rate that looks like a real, healthy zero.
-    const insertedForDeceleration: number | undefined =
-      inbound.insertedSamplesForDeceleration;
-    const removedForAcceleration: number | undefined =
-      inbound.removedSamplesForAcceleration;
-    const insertedDelta =
-      lastAudioAt && insertedForDeceleration !== undefined
-        ? insertedForDeceleration - lastInsertedSamplesForDeceleration
-        : undefined;
-    const removedDelta =
-      lastAudioAt && removedForAcceleration !== undefined
-        ? removedForAcceleration - lastRemovedSamplesForAcceleration
-        : undefined;
-
-    lastAudioBytes = bytes;
-    lastAudioAt = now;
-    lastInsertedSamplesForDeceleration =
-      insertedForDeceleration ?? lastInsertedSamplesForDeceleration;
-    lastRemovedSamplesForAcceleration =
-      removedForAcceleration ?? lastRemovedSamplesForAcceleration;
+    if (audioStreamId !== inbound.id) audioCounters.reset();
+    audioStreamId = inbound.id;
+    const rates = audioCounters.read(report.values(), receiver);
+    const byteRate = rates.rate(inbound, "bytesReceived");
+    const bitrate = byteRate === undefined ? undefined : byteRate * 8;
+    const insertedDelta = rates.delta(
+      inbound,
+      "insertedSamplesForDeceleration",
+    );
+    const removedDelta = rates.delta(inbound, "removedSamplesForAcceleration");
 
     const codec = resolveAudioCodec(codecs, inbound.codecId);
     const received = inbound.packetsReceived ?? 0;
@@ -768,7 +800,8 @@ export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
       received + lost > 0 ? ((lost / (received + lost)) * 100).toFixed(2) : "0";
 
     const jitterBufferMs =
-      inbound.jitterBufferDelay && inbound.jitterBufferEmittedCount
+      inbound.jitterBufferDelay !== undefined &&
+      inbound.jitterBufferEmittedCount > 0
         ? Math.round(
             (inbound.jitterBufferDelay / inbound.jitterBufferEmittedCount) *
               1000,
@@ -834,7 +867,7 @@ export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
             : NA,
       },
       {
-        label: "Audio jitter buffer",
+        label: "Audio jitter buffer (lifetime avg)",
         value: jitterBufferMs !== undefined ? `${jitterBufferMs} ms` : NA,
       },
       {
@@ -853,62 +886,81 @@ export function createScreenShareSample(trackRef: Accessor<TrackReference>) {
     ];
   };
 
-  const sample = async () => {
-    // The panel keeps sampling on a 1s timer for as long as it is mounted,
-    // regardless of tab visibility -- `getStats()` on a hidden tab is pure
-    // waste, nobody is reading these numbers. This is about the *sampling*
-    // work only, not the underlying media subscription: unlike the sampling
-    // loop, the tracks themselves must keep decoding while hidden (no
-    // adaptiveStream/visibility-based pausing -- see ParticipantTile.tsx),
-    // so this early return must never be reused for anything beyond stats.
-    if (document.hidden) return;
-
+  // Identity includes the sender/receiver and native MediaStreamTrack because a
+  // publication object can survive a replacement. Visibility invalidates too.
+  const identity = () => {
+    const ref = trackRef();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const video = ref.publication?.track as any;
+    const audioPub = ref.participant.getTrackPublication(
+      Track.Source.ScreenShareAudio,
+    );
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const audio = audioPub?.track as any;
+    return [
+      ref.participant,
+      ref.publication,
+      video,
+      video?.mediaStreamTrack,
+      video?.sender,
+      video?.receiver,
+      audioPub,
+      audio,
+      audio?.sender,
+      audio?.receiver,
+    ];
+  };
+  let previousIdentity: unknown[] = [];
+  const sample = async (valid: () => boolean) => {
+    const currentIdentity = identity();
+    if (currentIdentity.some((item, index) => item !== previousIdentity[index]))
+      reset();
+    previousIdentity = currentIdentity;
+    const isCurrent = () =>
+      valid() &&
+      identity().every((item, index) => item === currentIdentity[index]);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const track = trackRef().publication?.track as any;
+    const element = videoElement?.();
+    presentation.bind(
+      !sending() && element?.isConnected ? element : undefined,
+      track?.mediaStreamTrack,
+    );
     const audioPub = trackRef().participant.getTrackPublication(
       Track.Source.ScreenShareAudio,
     );
-
-    // Audio is sampled alongside video, never gated behind it: every video
-    // early-return above ("no video being sent", "no receiver", ...) used to
-    // call setRows and return before the audio rows were ever computed, which
-    // is exactly backwards -- "video is dead, is audio still flowing?" is a
-    // question this panel needs to answer precisely when video has nothing
-    // to say.
-    // Nothing below may throw out of here. This runs bare off a `setInterval`
-    // tick and from the unawaited call under it, so an escaping rejection is
-    // unhandled -- and since the two halves are gathered with `Promise.all`,
-    // one throw would take the other half's rows down with it. The realistic
-    // thrower is `getParameters()` on a stopped/stopping transceiver (per
-    // spec, InvalidStateError) -- still called outside the try in
-    // `sampleOutboundVideo` -- i.e. the panel being open while a share is
-    // torn down, which the change-source flow does routinely. Holding the
-    // previous rows for one tick and recovering on the next is the right
-    // failure mode for a 1 s diagnostic; going permanently stale is not.
     try {
       if (sending()) {
         const [video, audioRows] = await Promise.all([
-          sampleOutboundVideo(track),
-          sampleOutboundAudio(audioPub),
+          sampleOutboundVideo(track, isCurrent),
+          sampleOutboundAudio(audioPub, isCurrent),
         ]);
+        if (!isCurrent()) return;
         setRows([...video.rows, ...audioRows]);
         setOwnSummary(video.summary);
       } else {
         const [videoRows, audioRows] = await Promise.all([
-          sampleInboundVideo(track),
-          sampleInboundAudio(audioPub),
+          sampleInboundVideo(track, isCurrent),
+          sampleInboundAudio(audioPub, isCurrent),
         ]);
+        if (!isCurrent()) return;
         setRows([...videoRows, ...audioRows]);
         setOwnSummary(undefined);
       }
     } catch {
-      // Leave the last good rows in place; the next tick re-samples.
+      if (isCurrent()) {
+        reset();
+        setRows([{ label: "Status", value: "stats unavailable" }]);
+      }
     }
   };
-
-  sample();
-  const timer = setInterval(sample, 1000);
-  onCleanup(() => clearInterval(timer));
+  const poller = pollScreenShareStats(sample, reset, document);
+  createEffect(() => {
+    identity();
+    videoElement?.();
+    poller.invalidate();
+  });
+  onCleanup(() => poller.stop());
 
   return { rows, sending, ownSummary };
 }
@@ -920,6 +972,7 @@ export function ScreenShareStats(props: {
   trackRef: TrackReference;
   username: string;
   onClose?: () => void;
+  videoElement?: Accessor<HTMLVideoElement | undefined>;
   /**
    * An already-running sample to read instead of starting a new
    * `getStats()` poll on the same sender.
@@ -944,8 +997,13 @@ export function ScreenShareStats(props: {
   // dependency change for no benefit, and `createScreenShareSample` itself
   // must run at most once (it starts an interval and registers its own
   // `onCleanup`), so it cannot live behind a re-run-many-times accessor.
-  // eslint-disable-next-line solid/reactivity
-  const owned = props.sample ?? createScreenShareSample(() => props.trackRef);
+  const owned =
+    // eslint-disable-next-line solid/reactivity
+    props.sample ??
+    createScreenShareSample(
+      () => props.trackRef,
+      () => props.videoElement?.(),
+    );
   const rows = owned.rows;
   const sending = owned.sending;
 
