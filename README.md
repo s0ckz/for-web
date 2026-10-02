@@ -103,3 +103,25 @@ The app currently needs the following routes:
 - `/channel`
 
 This corresponds to [Content.tsx#L33](packages/client/src/index.tsx).
+
+## Screen share sender diagnostics
+
+Every active screen share samples its sender approximately every 10 seconds,
+independently of the on-screen stats panel. `[rtc] screen share sender` console
+messages contain encoded/sent/source FPS where available, interval bitrate,
+mean encoding time, encoder implementation, codec, resolution, sender limits,
+link capacity, RTT, and interval CPU/bandwidth limitation durations. The desktop
+shell forwards these messages into its local `app-audio.log`.
+
+The first sample establishes a baseline; missing measurements are `null`, not
+zero. A new RTP stream, sender replacement, counter reset, or stats failure
+cannot inherit a previous stream's rates. Sampling stops on unpublish, share
+end, or disconnect, including in-flight requests. Logs omit media content,
+participant identities, ICE addresses, and credentials. Sampling changes no
+stream quality, encoder parameters, or publication behavior.
+
+Run the diagnostic unit tests with the project's Node runtime:
+
+```sh
+node --test packages/client/components/rtc/screenShareDiagnostics.test.mjs
+```
