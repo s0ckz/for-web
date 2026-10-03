@@ -121,6 +121,7 @@ export function ParticipantTile() {
   const isFocused = () => voice.isFocus(track);
 
   let videoRef: HTMLVideoElement | undefined;
+  const [videoElement, setVideoElement] = createSignal<HTMLVideoElement>();
   let tileRef: HTMLDivElement | undefined;
 
   const [videoDims, setVideoDims] = createSignal<{
@@ -491,7 +492,11 @@ export function ParticipantTile() {
               // us over it.
               manageSubscription={false}
               ref={videoRef}
-              on:resize={() => {
+              on:loadedmetadata={(event) => {
+                setVideoElement(event.currentTarget);
+              }}
+              on:resize={(event) => {
+                setVideoElement(event.currentTarget);
                 setVideoDims({
                   height: videoRef?.videoHeight || 0,
                   width: videoRef?.videoWidth || 0,
@@ -516,6 +521,7 @@ export function ParticipantTile() {
           <ScreenShareStats
             trackRef={track as TrackReference}
             username={user().username}
+            videoElement={videoElement}
             onClose={() => setShowStats(false)}
           />
         </Show>

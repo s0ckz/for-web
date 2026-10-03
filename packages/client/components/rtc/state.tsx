@@ -52,6 +52,7 @@ import { Device, useDevice } from "@revolt/common";
 import { InRoom } from "./components/InRoom";
 import { RoomAudioManager } from "./components/RoomAudioManager";
 import { setNextScreenShareFrameRate } from "./screenShareCapture";
+import { startSenderDiagnostics } from "./screenShareDiagnostics";
 import {
   browserCaptureOptions,
   classifyCapturedSurface,
@@ -1104,6 +1105,8 @@ class Voice {
    * timer.
    */
   #nativeEncoderLimitsRecheckTimer?: ReturnType<typeof setTimeout>;
+  #stopSenderDiagnostics?: () => void;
+  #diagnosticPublication?: LocalTrackPublication;
 
   /**
    * Whether the one silent re-acquire {@link #recoverScreenShareBrowser}
@@ -1429,8 +1432,20 @@ class Voice {
       this.#setState("CONNECTED");
     });
 
+    room.addListener("localTrackUnpublished", (pub) => {
+      if (pub === this.#diagnosticPublication) this.#clearSenderDiagnostics();
+    });
     room.addListener("localTrackPublished", (pub) => {
       if (pub.source === Track.Source.ScreenShare) {
+        this.#stopSenderDiagnostics?.();
+        this.#diagnosticPublication = pub;
+        this.#stopSenderDiagnostics = startSenderDiagnostics(
+          () => pub.videoTrack?.sender,
+          (summary) =>
+            console.info(
+              "[rtc] screen share sender " + JSON.stringify(summary),
+            ),
+        );
         // LiveKit's `republishAllTracks` (run on a full reconnect via
         // `handleSignalRestarted`) unpublishes and republishes the screen
         // share, creating a brand new `LocalTrackPublication` backed by a
@@ -1592,6 +1607,7 @@ class Voice {
   }
 
   disconnect() {
+    this.#clearSenderDiagnostics();
     this.device.releaseWakeLock();
     try {
       const room = this.room();
@@ -2690,6 +2706,12 @@ class Voice {
     });
   }
 
+  #clearSenderDiagnostics() {
+    this.#stopSenderDiagnostics?.();
+    this.#stopSenderDiagnostics = undefined;
+    this.#diagnosticPublication = undefined;
+  }
+
   /**
    * Self-healing check: a few seconds after publishing, sample the sender's
    * actual encoder once. If we picked h264/h265 because the probe said it
@@ -3075,6 +3097,7 @@ class Voice {
    * for this change.
    */
   async #endScreenShare(room: Room) {
+    this.#clearSenderDiagnostics();
     this.#lastShareChoice = undefined;
     this.#recoveryAttempts = [];
     this.#armedShareEndedPublication = undefined;

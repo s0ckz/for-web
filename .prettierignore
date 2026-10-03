@@ -5,5 +5,9 @@
 # auto-generated files
 **/styled-system/**
 
+# externally maintained asset submodule and its public symlink
+packages/client/assets/**
+packages/client/public/assets/**
+
 # test results
 **/test-results/**
