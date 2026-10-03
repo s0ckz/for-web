@@ -1,4 +1,6 @@
 // Executes the real Solid sampler and presentation helper with fake media and time.
+/* global require, __dirname, console */
+/* eslint @typescript-eslint/no-require-imports: "off" -- Node/CommonJS harness evaluates transpiled TypeScript. */
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
