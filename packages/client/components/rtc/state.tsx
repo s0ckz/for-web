@@ -64,6 +64,7 @@ import {
   viewersAllowH265,
 } from "./screenShareCodecs";
 import { startSenderDiagnostics } from "./screenShareDiagnostics";
+import { publishPickedScreenShare } from "./screenSharePublication";
 import {
   browserCaptureOptions,
   classifyCapturedSurface,
@@ -857,6 +858,7 @@ class Voice {
   #stopSenderDiagnostics?: () => void;
   #diagnosticPublication?: LocalTrackPublication;
   #stopEncoderMonitor?: () => void;
+  #screenShareStart?: symbol;
   #codecDecisionsByTrack = new WeakMap<
     MediaStreamTrack,
     ScreenShareCodecDecision
@@ -1219,7 +1221,7 @@ class Voice {
         //
         // This also fires on two other, harmless paths:
         //  - The *initial* publish from `toggleScreenshare`, which arms the
-        //    listener itself once `setScreenShareEnabled` resolves
+        //    listener itself once publication resolves
         //    (`#armScreenShareEnded` is idempotent per publication, so
         //    re-arming here first is a no-op) and applies the chosen
         //    quality afterwards. `#lastShareChoice` is only ever written by
@@ -1367,6 +1369,7 @@ class Voice {
   }
 
   disconnect() {
+    this.#screenShareStart = undefined;
     this.#clearSenderDiagnostics();
     this.device.releaseWakeLock();
     try {
@@ -1819,10 +1822,9 @@ class Voice {
    * stacked on top of everything else the client is doing at startup, for no
    * wall-clock benefit since nothing here is awaited by a caller anyway.
    * Sequencing keeps the burst to four probes in flight at a time.
-   * `screenShareCodec` caches each quality under its own resolution/
-   * framerate key, so nothing about the eventual cache depends on the order
-   * they were primed in -- only the first `toggleScreenshare` for a
-   * not-yet-primed quality still has to wait its turn.
+   * Capability probes are cached per resolution/framerate. The eventual
+   * publication still selects its codec after the native picker finishes,
+   * using that choice and the current viewer/recovery state.
    */
   #primeScreenShareCodec() {
     const qualities = this.getEnabledScreenShareQualities();
@@ -1845,75 +1847,121 @@ class Voice {
       // Deliberately stopping means there is nothing left to recover.
       await this.#endScreenShare(room);
     } else {
-      const qualities = this.getEnabledScreenShareQualities();
-      let screenPickerQualityName: ScreenShareQualityName | undefined;
-      let screenPickerAudio: boolean | undefined;
-
+      if (this.#screenShareStart) return;
+      const start = Symbol("screen-share-start");
+      this.#screenShareStart = start;
+      const isCurrentStart = () =>
+        this.#screenShareStart === start &&
+        this.room() === room &&
+        room.state === "connected";
       // The desktop picker answers a cancel with `callback({})`, which
       // getDisplayMedia rejects with something other than NotAllowedError, so
       // the generic error modal used to pop up on a plain "never mind".
       let cancelled = false;
-
-      // Register the modal on screen picker handler if it exists
-      if (window.native && window.native.onceScreenPicker) {
-        window.native.onceScreenPicker((sources) => {
-          this.openModal({
-            type: "screen_share_picker",
-            onCancel: () => {
-              cancelled = true;
-              window.native.screenPickerCallback(-1, false);
-            },
-            callback: (
-              idx: number,
-              qualityName: ScreenShareQualityName,
-              audio: boolean,
-            ) => {
-              window.native.screenPickerCallback(idx, audio);
-              screenPickerQualityName = qualityName;
-              screenPickerAudio = audio;
-            },
-            sources: sources,
-            qualities: this.#screenShareQualityOptions(),
-          });
-        });
-      }
-
       try {
-        // The picker can still change this, but capturing at the saved quality
-        // avoids capturing at one resolution/bitrate and then immediately
-        // re-publishing at another once the dialog resolves.
+        const qualities = this.getEnabledScreenShareQualities();
+        const hasNativePicker =
+          typeof window.native?.onceScreenPicker === "function";
+        let screenPickerQualityName: ScreenShareQualityName | undefined;
+        let screenPickerAudio: boolean | undefined;
+        // Register the modal on screen picker handler if it exists
+        if (hasNativePicker) {
+          window.native.onceScreenPicker((sources) => {
+            this.openModal({
+              type: "screen_share_picker",
+              onCancel: () => {
+                cancelled = true;
+                window.native.screenPickerCallback(-1, false);
+              },
+              callback: (
+                idx: number,
+                qualityName: ScreenShareQualityName,
+                audio: boolean,
+              ) => {
+                screenPickerQualityName = qualityName;
+                screenPickerAudio = audio;
+                window.native.screenPickerCallback(idx, audio);
+              },
+              sources: sources,
+              qualities: this.#screenShareQualityOptions(),
+            });
+          });
+        }
+
+        // Acquisition starts at the saved rate; the native picker can choose
+        // another preset before we compute the publication's codec/options.
         const startingQuality =
           qualities[this.#screenShareQuality()] ?? qualities.low!;
-
-        // Keep the publication's decision with its options, independently of
-        // background probes and starts at other presets.
-        const { publishOptions, codecDecision } =
-          await screenSharePublishOptions(startingQuality.resolution, room);
-
-        // Deliberately no `resolution` below: see the comment on
-        // setNextScreenShareFrameRate (screenShareCapture.ts) and the
-        // getDisplayMedia wrapper in index.ts for why the framerate still
-        // has to be threaded in separately once resolution is gone.
-        setNextScreenShareFrameRate(startingQuality.resolution.frameRate ?? 30);
+        const captureOptions: ScreenShareCaptureOptions = {
+          audio: SCREEN_SHARE_AUDIO,
+          ...browserCaptureOptions({
+            screenShareQualityAsk: this.#settings.screenShareQualityAsk,
+            screenShareAudio: this.#settings.screenShareAudio,
+          }),
+        };
         let localTrack: LocalTrackPublication | undefined;
-        try {
-          localTrack = await room.localParticipant.setScreenShareEnabled(
-            true,
-            {
-              audio: SCREEN_SHARE_AUDIO,
-              // Browser-only (returns `{}` on desktop, leaving this
-              // byte-identical to before): see screenShareSurface.ts for
-              // why `video.displaySurface` and `systemAudio` live here
-              // rather than in the getDisplayMedia wrapper in index.ts.
-              ...browserCaptureOptions({
-                screenShareQualityAsk: this.#settings.screenShareQualityAsk,
-                screenShareAudio: this.#settings.screenShareAudio,
-              }),
+        let codecDecision: ScreenShareCodecDecision;
+        if (hasNativePicker) {
+          const result = await publishPickedScreenShare({
+            isCurrent: isCurrentStart,
+            acquire: async () => {
+              // No capture resolution: preserve the getDisplayMedia wrapper's
+              // independent framerate hand-off and existing native acquisition.
+              setNextScreenShareFrameRate(
+                startingQuality.resolution.frameRate ?? 30,
+              );
+              try {
+                return await room.localParticipant.createScreenTracks(
+                  captureOptions,
+                );
+              } finally {
+                setNextScreenShareFrameRate(undefined);
+              }
             },
-            publishOptions,
+            prepare: async (tracks) => {
+              const enabled = this.getEnabledScreenShareQualities();
+              const finalQuality =
+                enabled[screenPickerQualityName ?? startingQuality.name] ??
+                enabled.low!;
+              if (screenPickerQualityName)
+                screenPickerQualityName = finalQuality.name;
+              const video = tracks.find(
+                (track) => track.kind === Track.Kind.Video,
+              );
+              if (!video)
+                throw new Error("Screen capture returned no video track");
+              await this.#applyShareCaptureChoice(
+                video.mediaStreamTrack,
+                finalQuality,
+              );
+              return screenSharePublishOptions(finalQuality.resolution, room);
+            },
+            publish: (track, options) =>
+              room.localParticipant.publishTrack(track, options),
+            unpublish: (track) => room.localParticipant.unpublishTrack(track),
+          });
+          [localTrack] = result.publications;
+          codecDecision = result.codecDecision;
+        } else {
+          // The browser surface/audio dialog remains on its existing path.
+          const selection = await screenSharePublishOptions(
+            startingQuality.resolution,
+            room,
           );
-        } finally {
-          setNextScreenShareFrameRate(undefined);
+          codecDecision = selection.codecDecision;
+          if (!isCurrentStart()) return;
+          setNextScreenShareFrameRate(
+            startingQuality.resolution.frameRate ?? 30,
+          );
+          try {
+            localTrack = await room.localParticipant.setScreenShareEnabled(
+              true,
+              captureOptions,
+              selection.publishOptions,
+            );
+          } finally {
+            setNextScreenShareFrameRate(undefined);
+          }
         }
 
         const screenAudioTrack = room.localParticipant.getTrackPublication(
@@ -1939,7 +1987,7 @@ class Voice {
           ) => this.#applyShareChoice(room, localTrack, qualityName, audio);
 
           if (screenPickerQualityName) {
-            callback(
+            await callback(
               screenPickerQualityName || "low",
               screenPickerAudio || false,
             );
@@ -2025,6 +2073,9 @@ class Voice {
         // `toggleCamera` (which shares `onErr`) still surfaces the same
         // error names when they mean a denied camera permission instead.
         this.onErr(e, ["NotAllowedError", "AbortError"]);
+      } finally {
+        if (this.#screenShareStart === start)
+          this.#screenShareStart = undefined;
       }
     }
   }
@@ -2267,21 +2318,11 @@ class Voice {
     }
   }
 
-  async #applyShareChoice(
-    room: Room,
-    localTrack: LocalTrackPublication,
-    qualityName: ScreenShareQualityName,
-    audio: boolean,
-    announce = true,
+  async #applyShareCaptureChoice(
+    track: MediaStreamTrack,
+    quality: ScreenShareQuality,
   ) {
-    const qualities = this.getEnabledScreenShareQualities();
-    const quality = qualities[qualityName] || qualities.low!;
-
-    this.#lastShareChoice = { qualityName, audio };
-
-    if (!localTrack.videoTrack) return;
-
-    await localTrack.videoTrack.mediaStreamTrack.applyConstraints({
+    await track.applyConstraints({
       // `ideal` as well as `max`: asking only for a ceiling lets the source
       // stay wherever it started rather than being pinned down to it, which
       // matters when `setNextScreenShareFrameRate` only covered the initial
@@ -2326,7 +2367,27 @@ class Voice {
         : {}),
     });
 
-    localTrack.videoTrack.mediaStreamTrack.contentHint = quality.contentHint;
+    track.contentHint = quality.contentHint;
+  }
+
+  async #applyShareChoice(
+    room: Room,
+    localTrack: LocalTrackPublication,
+    qualityName: ScreenShareQualityName,
+    audio: boolean,
+    announce = true,
+  ) {
+    const qualities = this.getEnabledScreenShareQualities();
+    const quality = qualities[qualityName] || qualities.low!;
+
+    this.#lastShareChoice = { qualityName, audio };
+
+    if (!localTrack.videoTrack) return;
+
+    await this.#applyShareCaptureChoice(
+      localTrack.videoTrack.mediaStreamTrack,
+      quality,
+    );
 
     await this.#applyEncoderLimits(localTrack, quality.resolution);
 
@@ -2892,6 +2953,7 @@ class Voice {
    * for this change.
    */
   async #endScreenShare(room: Room) {
+    this.#screenShareStart = undefined;
     this.#clearSenderDiagnostics();
     this.#lastShareChoice = undefined;
     this.#recoveryAttempts = [];

@@ -34,6 +34,26 @@ separate work; neither is justified by a codec mismatch alone.
   disconnect; reconnect republishing re-arms monitoring for the same media track.
   Superseded probe generations cannot overwrite newer capability evidence.
 
+## Initial desktop picker selection
+
+The Valorant validation exposed a saved-preset mismatch: startup selected options
+for 720p30 before the picker chose 720p60. The stream used H.264 and was smooth,
+but runtime monitoring correctly refused to apply 60 FPS software evidence to a
+30 FPS decision. Recovery therefore could not learn about the chosen preset.
+
+Desktop startup now acquires unpublished video/audio tracks through the existing
+native picker, applies its final capture quality, selects codec and publication
+options for that quality, and then publishes. The decision, encoding limits and
+initial monitoring key all use the chosen preset. Warmup probes remain useful
+without committing a publication to the saved preset.
+
+A start guard prevents duplicate pickers. Cancellation, leaving the room, an ended
+track, configuration failure or partial publication failure stops the acquired
+tracks. If one publication fails while the other finishes later, cleanup waits
+for that result and unpublishes any successful track. The browser's existing SDK
+capture and post-publication quality/audio dialog remain on their current path;
+this change targets the desktop picker's initial quality selection.
+
 ## H.265 compatibility
 
 H.265 is eligible when hardware H.264 is unavailable or cooling down, hardware
@@ -47,6 +67,15 @@ connect/reconnect, using `RTCRtpReceiver.getCapabilities`. This is a browser
 capability hint, not proof of successful decoding at every resolution. It carries
 no device identifier or hardware inventory. HEVC Main defaults follow
 [RFC 7798](https://www.rfc-editor.org/rfc/rfc7798.html).
+
+The tested production voice token does not allow participant attribute updates:
+LiveKit rejected both the existing deafen attribute and the new receive-capability
+attribute with `does not have permission to update own metadata`. The issuer used
+by `POST /channels/{id}/join_call` must grant `canUpdateOwnMetadata` in its LiveKit
+video grant for this advertisement to work. A client cannot grant itself that
+permission; users must rejoin with newly issued tokens after the server change.
+The backend source/configuration is not present in the two local repositories, so
+this server change is still pending. Missing advertisements keep H.265 ineligible.
 
 HEVC publications request LiveKit's `REGRESSION` backup policy: when a compatible
 backup is activated, the server should move subscribers to it rather than retain
@@ -71,7 +100,17 @@ and interval bandwidth limitation.
 Automated regression tests cover cooldown expiry, preset isolation, unknown
 viewers, HEVC profiles, concurrent callers, timeout/hung/rejected probes, stale
 observations, unknown/inactive encoders and negotiated codec changes. CI runs
-the codec tests alongside the TypeScript check.
+the codec and picker-publication tests alongside the TypeScript check. The latter
+exercise the actual `Voice.toggleScreenshare` action with RTC/modal dependencies
+replaced, including a saved 30 FPS preset followed by a 60 FPS picker choice,
+duplicate starts, cancellation, leaving during acquisition, partial publication
+cleanup and preservation of the browser SDK path.
+
+The approximately 27-minute Valorant 720p60 run averaged 57.4 sent FPS (57.5 at
+full resolution), with viewer-confirmed smoothness. H.264 remained the codec and
+its negotiated constrained-baseline profile matched the probe. Encoder identity
+and power-efficiency stats were absent, so this does not confirm NVENC or validate
+software cooldown/H.265 recovery. It is also not a controlled LMU rain comparison.
 
 Before production rollout, use the local web build through the desktop shell
 with the production backend configuration and record:
