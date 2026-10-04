@@ -63,6 +63,9 @@ jobs:
       - run: mise build:deps
       - run: mise build:check
 
+      - name: Check screen share codec recovery and publication
+        run: mise exec -- node --test --test-timeout=10000 packages/client/components/rtc/screenShareCodecs.test.mjs packages/client/components/rtc/screenSharePublication.test.mjs
+
   lint-format:
     name: Lint & Format
     runs-on: ubuntu-latest
