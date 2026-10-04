@@ -10,7 +10,10 @@ import type { TrackReference } from "solid-livekit-components";
 
 import { useLingui } from "@lingui/solid/macro";
 import { isLocal } from "@livekit/components-core";
-import { isScreenShareLinkWeak } from "@revolt/rtc";
+import {
+  screenShareBandwidthConfiguration,
+  ScreenShareBandwidthObserver,
+} from "@revolt/rtc/screenShareBandwidth";
 import {
   pollScreenShareStats,
   selectedCandidatePair,
@@ -128,12 +131,14 @@ export function createScreenShareSample(
 
   const videoCounters = new StatsCounters();
   const audioCounters = new StatsCounters();
+  const bandwidth = new ScreenShareBandwidthObserver();
   const presentation = new VideoPresentation();
   let videoStreamId: string | undefined;
   let audioStreamId: string | undefined;
   const reset = () => {
     videoCounters.reset();
     audioCounters.reset();
+    bandwidth.reset();
     videoStreamId = undefined;
     audioStreamId = undefined;
     presentation.reset();
@@ -158,6 +163,7 @@ export function createScreenShareSample(
 
     if (!sender?.getStats) {
       videoCounters.reset();
+      bandwidth.reset();
       return { rows: [{ label: "Status", value: "not publishing" }] };
     }
 
@@ -166,7 +172,10 @@ export function createScreenShareSample(
       report = await sender.getStats();
       if (!isCurrent()) return { rows: [] };
     } catch {
-      if (isCurrent()) videoCounters.reset();
+      if (isCurrent()) {
+        videoCounters.reset();
+        bandwidth.reset();
+      }
       return { rows: [{ label: "Status", value: "stats unavailable" }] };
     }
 
@@ -201,6 +210,7 @@ export function createScreenShareSample(
 
     if (!outbound) {
       videoCounters.reset();
+      bandwidth.reset();
       return { rows: [{ label: "Status", value: "no video being sent" }] };
     }
 
@@ -282,14 +292,18 @@ export function createScreenShareSample(
       return frameRateConstraint?.max ?? frameRateConstraint?.ideal;
     })();
 
-    // The encoder's actual bitrate ceiling in force, for the "Weak link" row
-    // below -- read the same way as targetFrameRate above, straight off the
-    // sender's own parameters rather than re-derived from the quality name.
-    const maxBitrate: number | undefined =
-      parameters?.encodings?.[0]?.maxBitrate;
+    const recentBandwidth = bandwidth.read(
+      [...report.values()].filter(
+        (stat) => stat.type !== "outbound-rtp" || stat.id === outbound.id,
+      ),
+      sender,
+      screenShareBandwidthConfiguration(parameters?.encodings),
+      !document.hidden,
+    );
 
     // Where the time went while quality was limited -- `cpu` here means the
-    // encoder could not keep up, `bandwidth` means the network could not.
+    // encoder could not keep up; `bandwidth` is the browser's media allocation
+    // verdict, not proof that the user's internet connection is too slow.
     const durations = outbound.qualityLimitationDurations ?? {};
     const limitBreakdown = ["cpu", "bandwidth", "other"]
       .filter((k) => (durations[k] ?? 0) > 0.1)
@@ -395,27 +409,15 @@ export function createScreenShareSample(
               : NA,
         },
         {
-          label: "Link capacity",
+          label: "Transport bandwidth estimate",
           value: formatBitrate(candidatePair?.availableOutgoingBitrate),
         },
         {
-          // Same check as the one-time weak-link warning in rtc/state.tsx
-          // (see isScreenShareLinkWeak), kept visible here for as long as the
-          // share runs rather than shown once and then gone. Reads only stats
-          // already sampled above -- the bitrate ceiling from the sender's own
-          // parameters (the actual ceiling in force, not just what the current
-          // ScreenShareQualityName implies), "Link capacity", and the
-          // bandwidth-limited share of "Limited for".
-          label: "Weak link",
-          value: maxBitrate
-            ? isScreenShareLinkWeak(
-                maxBitrate,
-                candidatePair?.availableOutgoingBitrate,
-                durations.bandwidth,
-              )
-              ? "yes"
-              : "no"
-            : NA,
+          label: "Bandwidth limited (recent)",
+          value:
+            recentBandwidth.limitedSeconds !== undefined
+              ? `${recentBandwidth.limitedSeconds.toFixed(1)}s / ${recentBandwidth.intervalSeconds!.toFixed(1)}s`
+              : NA,
         },
         {
           label: "NACK / PLI",

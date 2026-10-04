@@ -15,6 +15,7 @@ import {
   useTracks,
 } from "solid-livekit-components";
 
+import { t } from "@lingui/core/macro";
 import {
   AudioPresets,
   BackupCodecPolicy,
@@ -51,6 +52,10 @@ import { VoiceCallCardContext } from "@revolt/ui/components/features/voice/callC
 import { Device, useDevice } from "@revolt/common";
 import { InRoom } from "./components/InRoom";
 import { RoomAudioManager } from "./components/RoomAudioManager";
+import {
+  screenShareBandwidthConfiguration,
+  ScreenShareBandwidthObserver,
+} from "./screenShareBandwidth";
 import { setNextScreenShareFrameRate } from "./screenShareCapture";
 import {
   codecKey,
@@ -159,13 +164,11 @@ type ScreenShareQuality = {
  * used here -- it stops at `h720fps30`/`h1080fps30` -- so `low60` and
  * `high60` are both hand-built to match the same `VideoResolution` shape the
  * presets use. Both are offered ungated, on every platform, by deliberate
- * product decision: 60fps is only actually reachable on Windows window
- * shares through the native GPU capture path in `for-desktop`, which does
- * not run through Chromium's capture governor. Everywhere else (other
- * platforms, or a whole-screen share even on Windows) picking either just
- * raises the bitrate ceiling (see `screenShareEncoding`) without the capture
- * pipeline producing any extra frames to spend it on -- see
- * `#watchForWeakLink` for the mitigation.
+ * product decision. The native Windows GPU capture path in `for-desktop`
+ * avoids Chromium's capture governor for supported windows and monitors,
+ * but the chosen frame rate remains a ceiling: source, GPU and media
+ * allocation can all reduce the actual send rate. A bandwidth advisory uses
+ * recent stream evidence, not the preset's bitrate ceiling alone.
  */
 const ALL_SCREEN_SHARE_QUALITIES: Record<
   ScreenShareQualityName,
@@ -253,7 +256,7 @@ const SCREEN_SHARE_AUDIO: ScreenShareCaptureOptions["audio"] = {
  * it is the ungated top preset offered everywhere, and sizing it to one
  * user's uplink would degrade it for everyone with more headroom. That
  * preset staying above a marginal link is expected and left to {@link
- * Voice.#watchForWeakLink}'s advisory warning; what makes overshooting it
+ * Voice.#startScreenShareDiagnostics}'s advisory warning; what makes overshooting it
  * survivable rather than a repeated visible stop/start is the rest of this
  * PR -- re-applying encoder limits and re-arming the ended listener after a
  * republish (see the `localTrackPublished` handler in `connect()`).
@@ -520,57 +523,10 @@ async function screenSharePublishOptions(
   return { publishOptions, codecDecision: decision };
 }
 
-/** How long to wait after applying a quality choice before checking the link. */
-const WEAK_LINK_CHECK_DELAY_MS = 5_000;
-
 /**
- * Whether the network looks unable to sustain a chosen screen-share bitrate
- * ceiling.
- *
- * Either signal alone is enough: a link whose current headroom already sits
- * under the ceiling is obviously too weak for it, but a link that measures
- * enough headroom *right now* while the encoder has already spent real time
- * bandwidth-limited recently is still one that could not hold the ceiling
- * moment to moment (`availableOutgoingBitrate` is an instantaneous BWE
- * estimate, so it can look fine between the congestion events that produced
- * that time).
- *
- * Exported so {@link ScreenShareStats} can show the same verdict as a
- * persistent row, computed from stats it already reads, without duplicating
- * the threshold logic.
- *
- * Gated on `document.visibilityState` and a higher bandwidth-limited
- * threshold (2s, up from a hair-trigger 0.1s): a backgrounded/minimised
- * sharer's encoder can look bandwidth-limited for reasons that have nothing
- * to do with the actual link -- Chromium throttles a hidden tab's encode
- * pace -- and that used to be enough on its own to pop the weak-link modal
- * on a perfectly fine connection. Requiring the page to be visible when the
- * sample is taken keeps this verdict about the link, not about whether the
- * sharer alt-tabbed a moment ago.
- * @param maxBitrate The encoder's bitrate ceiling for the chosen quality
- * @param availableOutgoingBitrate `candidate-pair.availableOutgoingBitrate`, if reported
- * @param bandwidthLimitedSeconds `outbound-rtp.qualityLimitationDurations.bandwidth`, if reported
- * @returns Whether the link looks too weak for `maxBitrate`
+ * At most one bandwidth advisory per page, even across shares/quality changes.
  */
-export function isScreenShareLinkWeak(
-  maxBitrate: number,
-  availableOutgoingBitrate: number | undefined,
-  bandwidthLimitedSeconds: number | undefined,
-): boolean {
-  if (document.visibilityState !== "visible") return false;
-
-  const belowCeiling =
-    availableOutgoingBitrate !== undefined &&
-    availableOutgoingBitrate < maxBitrate;
-  const bandwidthLimited = (bandwidthLimitedSeconds ?? 0) > 2;
-  return belowCeiling || bandwidthLimited;
-}
-
-/**
- * Surfaced at most once per session (see {@link Voice.#watchForWeakLink}) so
- * a link that stays weak across several shares does not nag on every one.
- */
-let weakLinkWarningShown = false;
+let bandwidthAdvisoryShown = false;
 
 /** At most this many automatic share recoveries ... */
 const MAX_RECOVERIES = 3;
@@ -1197,13 +1153,7 @@ class Voice {
       if (pub.source === Track.Source.ScreenShare) {
         this.#clearSenderDiagnostics();
         this.#diagnosticPublication = pub;
-        this.#stopSenderDiagnostics = startSenderDiagnostics(
-          () => pub.videoTrack?.sender,
-          (summary) =>
-            console.info(
-              "[rtc] screen share sender " + JSON.stringify(summary),
-            ),
-        );
+        this.#startScreenShareDiagnostics(room, pub);
         const decision =
           pub.videoTrack &&
           this.#codecDecisionsByTrack.get(pub.videoTrack.mediaStreamTrack);
@@ -2380,7 +2330,14 @@ class Voice {
     const qualities = this.getEnabledScreenShareQualities();
     const quality = qualities[qualityName] || qualities.low!;
 
-    this.#lastShareChoice = { qualityName, audio };
+    const choice = { qualityName, audio };
+    this.#lastShareChoice = choice;
+    // Cancel pending stats before changing capture/encoder configuration.
+    // The replacement poll starts with fresh counters and startup settling.
+    if (this.#diagnosticPublication === localTrack) {
+      this.#stopSenderDiagnostics?.();
+      this.#stopSenderDiagnostics = undefined;
+    }
 
     if (!localTrack.videoTrack) return;
 
@@ -2391,12 +2348,12 @@ class Voice {
 
     await this.#applyEncoderLimits(localTrack, quality.resolution);
 
-    // Only the 60fps qualities (low60, high60) raise the bitrate ceiling
-    // without the capture pipeline necessarily producing any more frames to
-    // spend it on -- see getEnabledScreenShareQualities and
-    // #watchForWeakLink.
-    if ((quality.resolution.frameRate ?? 30) > 30) {
-      this.#watchForWeakLink(localTrack, quality);
+    if (
+      this.#lastShareChoice === choice &&
+      this.#diagnosticPublication === localTrack &&
+      this.room() === room
+    ) {
+      this.#startScreenShareDiagnostics(room, localTrack);
     }
 
     if (!audio) {
@@ -2618,82 +2575,66 @@ class Voice {
     });
   }
 
-  /**
-   * A few seconds after applying a 60fps quality choice, check whether the
-   * link can actually carry the bitrate ceiling that comes with it.
-   *
-   * Sample `getStats()` once on a delay and act on what it finds. The 60fps
-   * qualities (`low60`, `high60`) are the only ones this runs for (see the
-   * call site in `#applyShareChoice`) because they are the only ones whose
-   * ceiling can rise with no extra frames to show for it on a non-native
-   * capture path -- see getEnabledScreenShareQualities -- which is exactly
-   * what makes a marginal uplink worse off for having picked one: more bits
-   * chasing the same frame rate means more congestion, not more motion.
-   *
-   * Surfaced through the existing `error2` modal (same pattern as
-   * `#onCameraErr`, a plain `Error` with a human message rather than an API
-   * error) and at most once per session -- this is advisory, not a failure,
-   * so it should be seen once and then get out of the way rather than
-   * reappearing on every share. `ScreenShareStats`'s "Weak link" row uses the
-   * same {@link isScreenShareLinkWeak} check to stay visible for as long as
-   * the share runs, without repeating the modal.
-   * @param localTrack The publication the quality choice was just applied to
-   * @param quality The quality that was just applied, whose ceiling and name
-   * are both named in the warning
-   */
-  #watchForWeakLink(
-    localTrack: LocalTrackPublication,
-    quality: ScreenShareQuality,
-  ) {
-    if (weakLinkWarningShown) return;
-    const maxBitrate = screenShareEncoding(quality.resolution).maxBitrate;
-
-    setTimeout(async () => {
-      try {
-        if (weakLinkWarningShown) return;
-
-        const sender = localTrack.videoTrack?.sender;
-        if (!sender?.getStats) return;
-
-        const report = await sender.getStats();
-        let availableOutgoingBitrate: number | undefined;
-        let bandwidthLimitedSeconds: number | undefined;
-
-        report.forEach((stat) => {
-          if (stat.type === "candidate-pair" && stat.nominated) {
-            availableOutgoingBitrate = stat.availableOutgoingBitrate;
-          }
-          if (stat.type === "outbound-rtp" && stat.kind === "video") {
-            bandwidthLimitedSeconds =
-              stat.qualityLimitationDurations?.bandwidth;
-          }
-        });
-
-        if (
-          !isScreenShareLinkWeak(
-            maxBitrate,
-            availableOutgoingBitrate,
-            bandwidthLimitedSeconds,
-          )
-        ) {
-          return;
-        }
-
-        weakLinkWarningShown = true;
-        console.warn(
-          `[rtc] screen share link looks too weak for the ${quality.fullName} bitrate ceiling (${maxBitrate} bps): available outgoing bitrate ${availableOutgoingBitrate ?? "unknown"} bps, ${bandwidthLimitedSeconds ?? 0}s bandwidth-limited`,
+  /** Publication-owned diagnostics and a nonblocking, recent-bandwidth advisory. */
+  #startScreenShareDiagnostics(room: Room, pub: LocalTrackPublication) {
+    this.#stopSenderDiagnostics?.();
+    const bandwidth = new ScreenShareBandwidthObserver();
+    const resetBandwidth = () => bandwidth.reset();
+    document.addEventListener("visibilitychange", resetBandwidth);
+    const stop = startSenderDiagnostics(
+      () =>
+        this.room() === room &&
+        this.#diagnosticPublication === pub &&
+        room.localParticipant.getTrackPublication(Track.Source.ScreenShare) ===
+          pub &&
+        pub.videoTrack?.mediaStreamTrack.readyState !== "ended"
+          ? pub.videoTrack?.sender
+          : undefined,
+      (summary) => {
+        if (summary.status) bandwidth.reset();
+        console.info("[rtc] screen share sender " + JSON.stringify(summary));
+      },
+      10_000,
+      (report, sender) => {
+        const choice = this.#lastShareChoice;
+        const qualities = this.getEnabledScreenShareQualities();
+        const quality =
+          choice && (qualities[choice.qualityName] || qualities.low);
+        const sample = bandwidth.read(
+          report.values(),
+          sender,
+          choice?.qualityName +
+            ":" +
+            screenShareBandwidthConfiguration(sender.getParameters().encodings),
+          document.visibilityState === "visible",
         );
-
-        this.openModal({
-          type: "error2",
-          error: new Error(
-            `Your connection looks too weak for ${quality.fullName} screen sharing -- try a 30FPS quality instead for a smoother stream.`,
-          ),
-        });
-      } catch {
-        // Best-effort: the share is already up either way.
-      }
-    }, WEAK_LINK_CHECK_DELAY_MS);
+        if (
+          !bandwidthAdvisoryShown &&
+          sample.sustained &&
+          quality &&
+          (quality.resolution.frameRate ?? 30) > 30
+        ) {
+          bandwidthAdvisoryShown = true;
+          console.info(
+            "[rtc] screen share bandwidth advisory " +
+              JSON.stringify({
+                quality: choice?.qualityName,
+                ...sample,
+              }),
+          );
+          this.snackbar.show({
+            message: t`Screen sharing has been bandwidth limited. Try a lower quality or 30 FPS for a smoother stream.`,
+            closeable: true,
+            autoCloseDelay: 8_000,
+          });
+        }
+      },
+    );
+    this.#stopSenderDiagnostics = () => {
+      stop();
+      document.removeEventListener("visibilitychange", resetBandwidth);
+      bandwidth.reset();
+    };
   }
 
   /**

@@ -2665,6 +2665,10 @@ msgstr "Configurações de compartilhamento de tela"
 msgid "Screen Share Volume"
 msgstr "Volume do compartilhamento de tela"
 
+#: components/rtc/state.tsx
+msgid "Screen sharing has been bandwidth limited. Try a lower quality or 30 FPS for a smoother stream."
+msgstr "O compartilhamento de tela está limitado pela largura de banda. Tente uma qualidade menor ou 30 FPS para uma transmissão mais fluida."
+
 #: src/interface/channels/ChannelHeader.tsx
 msgid "Search"
 msgstr "Buscar"

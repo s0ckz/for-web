@@ -31,6 +31,7 @@ function harness(local = false) {
   let pending;
   let reads = 0;
   let extraStats = [];
+  let encodings = [{ maxFramerate: 30 }];
   let videoStat = {
     id: "v",
     type: local ? "outbound-rtp" : "inbound-rtp",
@@ -54,7 +55,7 @@ function harness(local = false) {
         )
       );
     },
-    getParameters: () => ({ encodings: [{ maxFramerate: 30 }] }),
+    getParameters: () => ({ encodings }),
   };
   let track = { mediaStreamTrack: {}, sender: owner, receiver: owner };
   const participant = { getTrackPublication: () => undefined };
@@ -94,6 +95,7 @@ function harness(local = false) {
     return module.exports;
   }
   const telemetry = load(path.join(__dirname, "screenShareTelemetry.ts"));
+  const bandwidth = load(path.join(__dirname, "screenShareBandwidth.ts"));
   const solid = {
     createSignal: (initial) => {
       let value = initial;
@@ -116,7 +118,7 @@ function harness(local = false) {
       "solid-js": solid,
       "@lingui/solid/macro": {},
       "@livekit/components-core": { isLocal: () => local },
-      "@revolt/rtc": { isScreenShareLinkWeak: () => false },
+      "@revolt/rtc/screenShareBandwidth": bandwidth,
       "@revolt/rtc/screenShareTelemetry": telemetry,
       "@solid-primitives/keyed": {},
       "livekit-client": { Track: { Source: { ScreenShareAudio: "audio" } } },
@@ -139,6 +141,9 @@ function harness(local = false) {
     },
     setExtraStats: (stats) => {
       extraStats = stats;
+    },
+    setEncodings: (value) => {
+      encodings = value;
     },
     delay: (promise) => {
       pending = promise;
@@ -204,6 +209,51 @@ test("sender badge uses sent counter rather than encoded/browser FPS", async () 
     assert.equal(h.row("Sent FPS"), "10.0 fps");
     assert.equal(h.row("Encoded FPS"), "15.0 fps");
     assert.equal(h.sampler.ownSummary().fps, 10);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("sender telemetry shows recent deltas instead of historical weak-link verdicts", async () => {
+  const h = harness(true);
+  try {
+    h.setEncodings([{ maxFramerate: 60, maxBitrate: 6000000 }]);
+    h.setStat({
+      qualityLimitationDurations: { bandwidth: 318.203 },
+      qualityLimitationReason: "none",
+    });
+    await h.tick();
+    assert.equal(h.row("Bandwidth limited (recent)"), "--");
+    assert.equal(h.row("Weak link"), undefined);
+    h.setStat({ timestamp: 2000, framesSent: 160 });
+    await h.tick(1000);
+    assert.equal(h.row("Bandwidth limited (recent)"), "0.0s / 1.0s");
+    h.setStat({
+      timestamp: 3000,
+      framesSent: 220,
+      qualityLimitationDurations: { bandwidth: 319.003 },
+      qualityLimitationReason: "bandwidth",
+    });
+    await h.tick(1000);
+    assert.equal(h.row("Bandwidth limited (recent)"), "0.8s / 1.0s");
+    h.setStat({
+      timestamp: 4000,
+      framesSent: 280,
+      qualityLimitationReason: "none",
+    });
+    await h.tick(1000);
+    assert.equal(h.row("Bandwidth limited (recent)"), "0.0s / 1.0s");
+    h.setEncodings([{ maxFramerate: 30, maxBitrate: 4000000 }]);
+    h.setStat({ timestamp: 5000, framesSent: 310 });
+    await h.tick(1000);
+    assert.equal(h.row("Bandwidth limited (recent)"), "--");
+    h.setStat({
+      timestamp: 6000,
+      framesSent: 340,
+      qualityLimitationDurations: { bandwidth: 0 },
+    });
+    await h.tick(1000);
+    assert.equal(h.row("Bandwidth limited (recent)"), "--");
   } finally {
     h.cleanup();
   }

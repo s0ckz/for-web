@@ -2780,6 +2780,10 @@ msgstr "Screen Share Settings"
 msgid "Screen Share Volume"
 msgstr "Screen Share Volume"
 
+#: components/rtc/state.tsx
+msgid "Screen sharing has been bandwidth limited. Try a lower quality or 30 FPS for a smoother stream."
+msgstr "Screen sharing has been bandwidth limited. Try a lower quality or 30 FPS for a smoother stream."
+
 #: src/interface/channels/ChannelHeader.tsx
 msgid "Search"
 msgstr "Search"

@@ -92,10 +92,42 @@ test("selected candidate pair overrides a stale nominated pair", () => {
   );
   assert.equal(result.availableOutgoingBitrate, 6000000);
 });
+
+test("diagnostics follow the flowing video's transport and leave ambiguous estimates unknown", () => {
+  const stats = [
+    outbound(1000, { transportId: "video-transport" }),
+    {
+      id: "audio-transport",
+      type: "transport",
+      selectedCandidatePairId: "audio-pair",
+    },
+    {
+      id: "video-transport",
+      type: "transport",
+      selectedCandidatePairId: "video-pair",
+    },
+    { id: "audio-pair", type: "candidate-pair", availableOutgoingBitrate: 1 },
+    {
+      id: "video-pair",
+      type: "candidate-pair",
+      availableOutgoingBitrate: 9000000,
+    },
+  ];
+  assert.equal(
+    summarizeSenderDiagnostics(stats, new Map()).availableOutgoingBitrate,
+    9000000,
+  );
+  assert.equal(
+    summarizeSenderDiagnostics(stats.slice(1), new Map())
+      .availableOutgoingBitrate,
+    null,
+  );
+});
 test("cleanup prevents an in-flight sample from logging or rescheduling", async () => {
   let resolve;
   let calls = 0;
   let logs = 0;
+  let observations = 0;
   const sender = {
     getStats: () => {
       calls++;
@@ -109,12 +141,14 @@ test("cleanup prevents an in-flight sample from logging or rescheduling", async 
     () => sender,
     () => logs++,
     1,
+    () => observations++,
   );
   stop();
   resolve(new Map());
   await new Promise((r) => setTimeout(r, 20));
   assert.equal(logs, 0);
   assert.equal(calls, 1);
+  assert.equal(observations, 0);
 });
 test("a sender replaced while getStats is pending cannot emit stale results", async () => {
   let resolve;

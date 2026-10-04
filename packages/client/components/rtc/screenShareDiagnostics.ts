@@ -25,6 +25,8 @@ export interface SenderDiagnosticStat {
   currentRoundTripTime?: number;
   nominated?: boolean;
   state?: string;
+  transportId?: string;
+  active?: boolean;
 }
 
 function delta(current?: number, previous?: number): number | null {
@@ -47,17 +49,38 @@ export function summarizeSenderDiagnostics(
   previous: Map<string, SenderDiagnosticStat>,
 ) {
   const byId = new Map(stats.map((stat) => [stat.id, stat]));
-  const selectedPairId = stats.find(
-    (stat) => stat.type === "transport",
-  )?.selectedCandidatePairId;
+  const video = stats
+    .filter(
+      (stat) =>
+        stat.type === "outbound-rtp" &&
+        (stat.kind ?? stat.mediaType) === "video" &&
+        stat.active !== false,
+    )
+    .sort(
+      (a, b) =>
+        Number((delta(b.framesSent, previous.get(b.id)?.framesSent) ?? 0) > 0) -
+          Number(
+            (delta(a.framesSent, previous.get(a.id)?.framesSent) ?? 0) > 0,
+          ) || (b.frameWidth ?? 0) - (a.frameWidth ?? 0),
+    )[0];
+  const transports = stats.filter((stat) => stat.type === "transport");
+  const transport = video?.transportId
+    ? byId.get(video.transportId)
+    : transports.length === 1
+      ? transports[0]
+      : undefined;
+  const selectedPairId = transport?.selectedCandidatePairId;
+  const nominated = stats.filter(
+    (stat) =>
+      stat.type === "candidate-pair" &&
+      stat.nominated &&
+      stat.state === "succeeded",
+  );
   const pair = selectedPairId
     ? byId.get(selectedPairId)
-    : stats.find(
-        (stat) =>
-          stat.type === "candidate-pair" &&
-          stat.nominated &&
-          stat.state === "succeeded",
-      );
+    : nominated.length === 1
+      ? nominated[0]
+      : undefined;
   const streams = stats
     .filter(
       (stat) =>
@@ -126,6 +149,7 @@ export function startSenderDiagnostics(
   getSender: () => RTCRtpSender | undefined,
   log: (summary: Record<string, unknown>) => void,
   intervalMs = 10_000,
+  onSample?: (report: RTCStatsReport, sender: RTCRtpSender) => void,
 ) {
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -151,6 +175,7 @@ export function startSenderDiagnostics(
         report.forEach((stat) => stats.push(stat));
         const settings = sender.track?.getSettings();
         const parameters = sender.getParameters();
+        onSample?.(report, sender);
         log({
           ...summarizeSenderDiagnostics(stats, previous),
           capture: {
