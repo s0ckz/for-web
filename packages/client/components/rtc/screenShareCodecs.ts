@@ -26,7 +26,16 @@ export type ScreenShareCodecDecision = {
   h265Allowed: boolean;
   bitrate: number;
   requestedCodec: "auto" | "h264" | "h265";
+  viewerSupport?: H265ViewerSupport;
   experiment?: ScreenShareExperiment;
+};
+
+export type H265ViewerSupport = {
+  total: number;
+  supported: number;
+  unsupported: number;
+  unknown: number;
+  allowed: boolean;
 };
 
 export const H265_RECEIVE_ATTRIBUTE = "stoat:h265-receive";
@@ -62,15 +71,34 @@ export function supportsH265Receive(
   });
 }
 
+/** Anonymous counts include every remote participant, even those not watching. */
+export function h265ViewerSupport(
+  attributes: Iterable<Readonly<Record<string, string>>>,
+): H265ViewerSupport {
+  let total = 0;
+  let supported = 0;
+  let unsupported = 0;
+  let unknown = 0;
+  for (const value of attributes) {
+    ++total;
+    if (value[H265_RECEIVE_ATTRIBUTE] === "1") ++supported;
+    else if (value[H265_RECEIVE_ATTRIBUTE] === "0") ++unsupported;
+    else ++unknown;
+  }
+  return {
+    total,
+    supported,
+    unsupported,
+    unknown,
+    allowed: total > 0 && supported === total,
+  };
+}
+
 /** Unknown/older clients keep recovery on the broadly compatible fallback. */
 export function viewersAllowH265(
   attributes: Iterable<Readonly<Record<string, string>>>,
 ) {
-  const viewers = Array.from(attributes);
-  return (
-    viewers.length > 0 &&
-    viewers.every((value) => value[H265_RECEIVE_ATTRIBUTE] === "1")
-  );
+  return h265ViewerSupport(attributes).allowed;
 }
 
 export function codecKey(request: {

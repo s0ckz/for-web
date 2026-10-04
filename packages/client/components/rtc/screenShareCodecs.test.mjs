@@ -7,6 +7,7 @@ import {
   H265_RECEIVE_ATTRIBUTE,
   ScreenShareCodecSelector,
   codecProfile,
+  h265ViewerSupport,
   matchesPrimarySoftware,
   startScreenShareEncoderMonitor,
   supportsH265Receive,
@@ -92,6 +93,32 @@ test("H.265 recovery needs affirmative current-viewer receive support", async ()
   );
   assert.equal(viewersAllowH265([{ [H265_RECEIVE_ATTRIBUTE]: "0" }]), false);
   assert.equal(viewersAllowH265([{ [H265_RECEIVE_ATTRIBUTE]: "1" }]), true);
+});
+
+test("HEVC support counts distinguish missing announcements from explicit incompatibility", () => {
+  assert.deepEqual(h265ViewerSupport([]), {
+    total: 0,
+    supported: 0,
+    unsupported: 0,
+    unknown: 0,
+    allowed: false,
+  });
+  const attributes = [
+    { [H265_RECEIVE_ATTRIBUTE]: "1" },
+    { [H265_RECEIVE_ATTRIBUTE]: "0" },
+    {},
+    { [H265_RECEIVE_ATTRIBUTE]: "true", private: "never-log-this" },
+  ];
+  const counts = h265ViewerSupport(attributes.values());
+  assert.deepEqual(counts, {
+    total: 4,
+    supported: 1,
+    unsupported: 1,
+    unknown: 2,
+    allowed: false,
+  });
+  assert.equal(JSON.stringify(counts).includes("never-log-this"), false);
+  assert.equal(h265ViewerSupport(attributes.slice(0, 1)).allowed, true);
 });
 
 test("HEVC receive advertisement requires the Main profile and single-stream RTP", () => {

@@ -61,12 +61,12 @@ import {
   codecKey,
   codecProfile,
   H265_RECEIVE_ATTRIBUTE,
+  h265ViewerSupport,
   matchesPrimarySoftware,
   ScreenShareCodecDecision,
   ScreenShareCodecSelector,
   startScreenShareEncoderMonitor,
   supportsH265Receive,
-  viewersAllowH265,
 } from "./screenShareCodecs";
 import { startSenderDiagnostics } from "./screenShareDiagnostics";
 import { getScreenShareExperiment } from "./ScreenShareExperimentControls";
@@ -398,6 +398,7 @@ async function screenShareCodec(
   const width = resolution?.width || 1920;
   const height = resolution?.height || 1080;
   const frameRate = resolution?.frameRate || 30;
+  let viewerSupport = h265ViewerSupport([]);
   const decision = await screenShareCodecSelector.select(
     {
       width,
@@ -406,15 +407,19 @@ async function screenShareCodec(
       bitrate: screenShareEncoding({ width, height, frameRate }, experiment)
         .maxBitrate,
     },
-    () =>
-      viewersAllowH265(
+    () => {
+      // Take the diagnostic snapshot at the same post-probe eligibility check.
+      viewerSupport = h265ViewerSupport(
         Array.from(
           room?.remoteParticipants.values() ?? [],
           (participant) => participant.attributes,
         ),
-      ),
+      );
+      return viewerSupport.allowed;
+    },
     experiment?.codec,
   );
+  decision.viewerSupport = viewerSupport;
   if (experiment) decision.experiment = experiment;
   lastScreenShareCodecDecision = decision;
   console.info("[rtc] screen share codec decision " + JSON.stringify(decision));
@@ -2525,16 +2530,25 @@ class Voice {
 
   /** Advertise receive support only; no device, identity, address or captured data. */
   async #publishScreenShareCodecSupport(room: Room) {
+    let h265: boolean | null = null;
     try {
-      const h265 =
+      h265 =
         typeof RTCRtpReceiver !== "undefined" &&
         supportsH265Receive(RTCRtpReceiver.getCapabilities?.("video")?.codecs);
       await room.localParticipant.setAttributes({
         [H265_RECEIVE_ATTRIBUTE]: h265 ? "1" : "0",
       });
+      if (this.room() === room) {
+        console.info(
+          "[rtc] H.265 receive capability " +
+            JSON.stringify({ supported: h265, advertised: true }),
+        );
+      }
     } catch {
+      if (this.room() !== room) return;
       console.info(
-        "[rtc] H.265 receive capability could not be advertised; peers retain compatible recovery",
+        "[rtc] H.265 receive capability could not be advertised; peers retain compatible recovery " +
+          JSON.stringify({ supported: h265, advertised: false }),
       );
     }
   }

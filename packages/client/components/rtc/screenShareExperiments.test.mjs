@@ -9,7 +9,8 @@ import {
   CODEC_CONTENT_TYPES,
   H265_RECEIVE_ATTRIBUTE,
   ScreenShareCodecSelector,
-  viewersAllowH265,
+  h265ViewerSupport,
+  supportsH265Receive,
 } from "./screenShareCodecs.ts";
 import {
   screenShareExperiment,
@@ -129,7 +130,10 @@ test("different ceilings have separate capability evidence and share software co
 });
 
 // Execute production option/limit methods rather than reproduce their policy.
-function voiceHarness(timers = { setTimeout, clearTimeout }) {
+function voiceHarness(
+  timers = { setTimeout, clearTimeout },
+  codecOptions = {},
+) {
   const ts = createRequire(import.meta.url)("typescript");
   const source = readFileSync(
     new URL("./state.tsx", import.meta.url),
@@ -161,12 +165,18 @@ function voiceHarness(timers = { setTimeout, clearTimeout }) {
     assert.ok(begin >= 0 && finish > begin);
     return source.slice(begin, finish);
   };
-  const codecs = selector();
+  const codecs = selector(codecOptions);
+  const logs = [];
   const context = vm.createContext({
-    console: { info() {}, warn() {} },
+    console: { info: (value) => logs.push(value), warn() {} },
     ...timers,
     screenShareCodecSelector: codecs,
-    viewersAllowH265,
+    h265ViewerSupport,
+    supportsH265Receive,
+    H265_RECEIVE_ATTRIBUTE,
+    RTCRtpReceiver: {
+      getCapabilities: () => ({ codecs: [{ mimeType: "video/H265" }] }),
+    },
     AudioPresets: { musicStereo: {} },
     BackupCodecPolicy: { REGRESSION: "regression" },
     isNativeDesktop: () => true,
@@ -188,6 +198,8 @@ function voiceHarness(timers = { setTimeout, clearTimeout }) {
       get choice() {return this.#lastShareChoice;}
       apply(pub, name) {return this.#applyShareChoice(this.activeRoom,pub,name,true,false);}
       clear() {this.#clearNativeEncoderLimitsRecheck();}
+      announce(room) {return this.#publishScreenShareCodecSupport(room);}
+      ${method("  async #publishScreenShareCodecSupport(")}
       ${method("  async #applyEncoderLimits(")}
       ${method("  #scheduleNativeEncoderLimitsRecheck(")}
       ${method("  #clearNativeEncoderLimitsRecheck()")}
@@ -202,8 +214,93 @@ function voiceHarness(timers = { setTimeout, clearTimeout }) {
     }).outputText,
     context,
   );
-  return { context, codecs };
+  return { context, codecs, logs };
 }
+
+test("actual publish decision logs the audience used after the probe without identities", async () => {
+  let finish;
+  const pending = new Promise((resolve) => {
+    finish = resolve;
+  });
+  const { context, logs } = voiceHarness(undefined, {
+    probe: async (contentType) => {
+      await pending;
+      return { contentType, supported: true, powerEfficient: true };
+    },
+  });
+  const room = {
+    remoteParticipants: new Map([
+      ["private-viewer-id", { attributes: { [H265_RECEIVE_ATTRIBUTE]: "1" } }],
+    ]),
+  };
+  const publication = context.publishOptions(request, room, { codec: "h265" });
+  room.remoteParticipants.set("private-newcomer-id", { attributes: {} });
+  room.remoteParticipants.set("private-unsupported-id", {
+    attributes: { [H265_RECEIVE_ATTRIBUTE]: "0" },
+  });
+  finish();
+  const result = await publication;
+  assert.equal(result.publishOptions.videoCodec, "h264");
+  assert.equal(result.codecDecision.h265Allowed, false);
+  assert.deepEqual(result.codecDecision.viewerSupport, {
+    total: 3,
+    supported: 1,
+    unsupported: 1,
+    unknown: 1,
+    allowed: false,
+  });
+  const logged = JSON.parse(logs[0].slice(logs[0].indexOf("{")));
+  assert.deepEqual(logged.viewerSupport, result.codecDecision.viewerSupport);
+  assert.equal(logs.join().includes("private-"), false);
+});
+
+test("actual receive announcement distinguishes decoder support and rejected updates", async () => {
+  const { context, logs } = voiceHarness();
+  const voice = new context.Harness();
+  const updates = [];
+  const room = {
+    localParticipant: { setAttributes: async (value) => updates.push(value) },
+  };
+  voice.activeRoom = room;
+  await voice.announce(room);
+  assert.equal(updates[0][H265_RECEIVE_ATTRIBUTE], "1");
+  assert.match(logs[0], /"supported":true,"advertised":true/);
+  context.RTCRtpReceiver.getCapabilities = () => ({
+    codecs: [{ mimeType: "video/H264" }],
+  });
+  await voice.announce(room);
+  assert.equal(updates[1][H265_RECEIVE_ATTRIBUTE], "0");
+  assert.match(logs[1], /"supported":false,"advertised":true/);
+  room.localParticipant.setAttributes = async () => {
+    throw new Error("private-error");
+  };
+  await voice.announce(room);
+  assert.match(logs[2], /"supported":false,"advertised":false/);
+  context.RTCRtpReceiver.getCapabilities = () => {
+    throw new Error("private-probe-error");
+  };
+  await voice.announce(room);
+  assert.match(logs[3], /"supported":null,"advertised":false/);
+  assert.equal(logs.join().includes("private-"), false);
+});
+
+test("a receive announcement finishing after leaving does not log current-room success or failure", async () => {
+  for (const rejected of [false, true]) {
+    const { context, logs } = voiceHarness();
+    const voice = new context.Harness();
+    let finish;
+    const update = new Promise((resolve, reject) => {
+      finish = rejected ? reject : resolve;
+    });
+    const room = { localParticipant: { setAttributes: () => update } };
+    voice.activeRoom = room;
+    const announcement = voice.announce(room);
+    voice.activeRoom = undefined;
+    finish();
+    await announcement;
+    assert.deepEqual(logs, []);
+  }
+});
 
 test("actual publish options preserve defaults and pair test preference with its ceiling", async () => {
   const { context } = voiceHarness();

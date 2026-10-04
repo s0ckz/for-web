@@ -31,6 +31,20 @@ automatic fallback. A later incompatible viewer retains LiveKit's compatible
 backup regression policy. Inspect the logged decision and actual negotiated
 codec: selecting H.265 in the controls does not prove H.265 was used.
 
+The codec-decision log includes anonymous `viewerSupport` counts from the same
+post-probe audience check: `total`, `supported` (`1`), `unsupported` (`0`),
+`unknown` (missing or unrecognized announcement), and `allowed`. These include
+every remote participant, even someone who is not watching. Zero participants
+also leaves HEVC disabled. No participant identities or raw attributes are
+logged. A warm-up decision without a room has zero participants; inspect the
+decision for the actual share start.
+
+On voice connection/reconnection, the local receive-capability log separates
+`supported` from `advertised`. A successful attribute update does not prove that
+every peer has received it. A rejected update keeps the compatible fallback;
+a capability-query failure logs support as unknown. These logs explain a blocked
+comparison without forcing H.265 or changing a live share.
+
 Capability results are cached separately by bitrate. Runtime software evidence
 still applies across bitrate choices for the same resolution/frame-rate preset,
 so changing a test ceiling cannot bypass that cooldown.
