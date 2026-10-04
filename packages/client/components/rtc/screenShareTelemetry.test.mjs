@@ -58,7 +58,7 @@ test("missing counters, equal/backward timestamps and late optional counters sta
   assert.equal(counters.read([next], "owner").rate(next, "frames"), undefined);
 });
 
-test("SSRC or codec replacement resets a reused stats ID", () => {
+test("SSRC, codec or transport replacement resets a reused stats ID", () => {
   const counters = new StatsCounters();
   const first = {
     id: "video",
@@ -76,6 +76,11 @@ test("SSRC or codec replacement resets a reused stats ID", () => {
   next = { ...next, timestamp: 3000, framesDecoded: 180 };
   assert.equal(counters.read([next], "owner").rate(next, "framesDecoded"), 30);
   next = { ...next, timestamp: 4000, framesDecoded: 220, codecId: "vp9" };
+  assert.equal(
+    counters.read([next], "owner").rate(next, "framesDecoded"),
+    undefined,
+  );
+  next = { ...next, timestamp: 5000, framesDecoded: 250, transportId: "new" };
   assert.equal(
     counters.read([next], "owner").rate(next, "framesDecoded"),
     undefined,

@@ -259,6 +259,56 @@ test("sender telemetry shows recent deltas instead of historical weak-link verdi
   }
 });
 
+test("sender quality diagnostics distinguish ceiling, target and recent counters", async () => {
+  const h = harness(true);
+  try {
+    h.setEncodings([{ maxBitrate: 8_000_000, maxFramerate: 65 }]);
+    h.setStat({
+      qpSum: 2000,
+      packetsSent: 100,
+      retransmittedBytesSent: 1000,
+      totalPacketSendDelay: 0.2,
+      qualityLimitationResolutionChanges: 8,
+      nackCount: 10,
+      pliCount: 1,
+    });
+    await h.tick();
+    assert.equal(h.row("Mean QP (codec-specific)"), "--");
+    assert.equal(h.row("Encoder target bitrate"), "--");
+    h.setStat({
+      timestamp: 2000,
+      framesEncoded: 130,
+      framesSent: 130,
+      qpSum: 2900,
+      packetsSent: 200,
+      retransmittedBytesSent: 6000,
+      totalPacketSendDelay: 0.4,
+      qualityLimitationResolutionChanges: 9,
+      nackCount: 12,
+      pliCount: 1,
+      targetBitrate: 4_500_000,
+    });
+    await h.tick(1000);
+    assert.equal(h.row("Bitrate ceiling"), "8.00 Mbps");
+    assert.equal(h.row("Encoder target bitrate"), "4.50 Mbps");
+    assert.equal(h.row("Mean QP (codec-specific)"), "30.0");
+    assert.equal(h.row("Packet send delay"), "2.0 ms");
+    assert.equal(h.row("Retransmission bitrate"), "40 kbps");
+    assert.equal(h.row("Resolution changes (recent)"), "1");
+    assert.equal(h.row("NACK / PLI (recent)"), "2 / 0");
+    h.setStat({
+      timestamp: 3000,
+      codecId: "different",
+      framesEncoded: 160,
+      qpSum: 3800,
+    });
+    await h.tick(1000);
+    assert.equal(h.row("Mean QP (codec-specific)"), "--");
+  } finally {
+    h.cleanup();
+  }
+});
+
 test("stale larger sender stream cannot hide a flowing layer; receiver ignores repair RTP", async () => {
   const h = harness(true);
   try {

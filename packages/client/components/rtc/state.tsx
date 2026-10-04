@@ -69,6 +69,8 @@ import {
   viewersAllowH265,
 } from "./screenShareCodecs";
 import { startSenderDiagnostics } from "./screenShareDiagnostics";
+import { getScreenShareExperiment } from "./ScreenShareExperimentControls";
+import type { ScreenShareExperiment } from "./screenShareExperiments";
 import { publishPickedScreenShare } from "./screenSharePublication";
 import {
   browserCaptureOptions,
@@ -263,7 +265,10 @@ const SCREEN_SHARE_AUDIO: ScreenShareCaptureOptions["audio"] = {
  * @param resolution Target resolution, or undefined to use the 720p ceiling
  * @returns Publish options
  */
-function screenShareEncoding(resolution: VideoResolution | undefined) {
+function screenShareEncoding(
+  resolution: VideoResolution | undefined,
+  experiment?: ScreenShareExperiment,
+) {
   const height = resolution?.height ?? 720;
   const frameRate = resolution?.frameRate ?? 30;
 
@@ -280,7 +285,7 @@ function screenShareEncoding(resolution: VideoResolution | undefined) {
     // This is a ceiling, not a target -- a hardware H.26x encoder settles
     // well under it, so the extra headroom just leaves it room to breathe
     // rather than forcing it there.
-    maxBitrate,
+    maxBitrate: experiment?.maxBitrate ?? maxBitrate,
     // Deliberately above the source's own cap (`frameRate`, applied via
     // `applyConstraints` in #applyShareChoice/#recoverScreenShare), not equal
     // to it. The source is the real limiter; this is a second, independent
@@ -388,6 +393,7 @@ let lastScreenShareCodecDecision: ScreenShareCodecDecision | undefined;
 async function screenShareCodec(
   resolution: VideoResolution | undefined,
   room?: Room,
+  experiment?: ScreenShareExperiment,
 ) {
   const width = resolution?.width || 1920;
   const height = resolution?.height || 1080;
@@ -397,7 +403,8 @@ async function screenShareCodec(
       width,
       height,
       frameRate,
-      bitrate: screenShareEncoding({ width, height, frameRate }).maxBitrate,
+      bitrate: screenShareEncoding({ width, height, frameRate }, experiment)
+        .maxBitrate,
     },
     () =>
       viewersAllowH265(
@@ -406,7 +413,9 @@ async function screenShareCodec(
           (participant) => participant.attributes,
         ),
       ),
+    experiment?.codec,
   );
+  if (experiment) decision.experiment = experiment;
   lastScreenShareCodecDecision = decision;
   console.info("[rtc] screen share codec decision " + JSON.stringify(decision));
   return decision;
@@ -420,14 +429,15 @@ export function getScreenShareCodecDecision() {
 async function screenSharePublishOptions(
   resolution: VideoResolution | undefined,
   room: Room,
+  experiment?: ScreenShareExperiment,
 ): Promise<{
   publishOptions: TrackPublishOptions;
   codecDecision: ScreenShareCodecDecision;
 }> {
-  const decision = await screenShareCodec(resolution, room);
+  const decision = await screenShareCodec(resolution, room, experiment);
   const videoCodec = decision.codec;
   const publishOptions: TrackPublishOptions = {
-    screenShareEncoding: screenShareEncoding(resolution),
+    screenShareEncoding: screenShareEncoding(resolution, experiment),
     videoCodec,
     // vp8 and h264 are the only codecs LiveKit accepts as a backup. Reaching
     // for h264 just because it's "probably hardware" was the exact mistake
@@ -629,7 +639,11 @@ const ENDED_NOTICE_MS = 4_000;
 
 /** What a screen share was started with, remembered so a capture that dies
  * can be recovered with the same quality/audio rather than the saved default. */
-type ShareChoice = { qualityName: ScreenShareQualityName; audio: boolean };
+type ShareChoice = {
+  qualityName: ScreenShareQualityName;
+  audio: boolean;
+  experiment?: ScreenShareExperiment;
+};
 
 class Voice {
   #settings: VoiceSettings;
@@ -1884,7 +1898,11 @@ class Voice {
                 video.mediaStreamTrack,
                 finalQuality,
               );
-              return screenSharePublishOptions(finalQuality.resolution, room);
+              return screenSharePublishOptions(
+                finalQuality.resolution,
+                room,
+                getScreenShareExperiment(),
+              );
             },
             publish: (track, options) =>
               room.localParticipant.publishTrack(track, options),
@@ -1897,6 +1915,7 @@ class Voice {
           const selection = await screenSharePublishOptions(
             startingQuality.resolution,
             room,
+            getScreenShareExperiment(),
           );
           codecDecision = selection.codecDecision;
           if (!isCurrentStart()) return;
@@ -2154,6 +2173,8 @@ class Voice {
       sender,
       resolution,
       scaleResolutionDownBy,
+      this.#codecDecisionsByTrack.get(localTrack.videoTrack!.mediaStreamTrack)
+        ?.experiment,
     );
   }
 
@@ -2203,6 +2224,8 @@ class Voice {
         sender,
         resolution,
         scaleResolutionDownBy,
+        this.#codecDecisionsByTrack.get(localTrack.videoTrack!.mediaStreamTrack)
+          ?.experiment,
       );
     }, 1000);
   }
@@ -2223,12 +2246,16 @@ class Voice {
     sender: RTCRtpSender,
     resolution: VideoResolution,
     scaleResolutionDownBy: number,
+    experiment?: ScreenShareExperiment,
   ) {
     try {
       const params = sender.getParameters();
       if (!params.encodings?.length) return;
 
-      const { maxBitrate, maxFramerate } = screenShareEncoding(resolution);
+      const { maxBitrate, maxFramerate } = screenShareEncoding(
+        resolution,
+        experiment,
+      );
 
       let changed = false;
 
@@ -2330,7 +2357,15 @@ class Voice {
     const qualities = this.getEnabledScreenShareQualities();
     const quality = qualities[qualityName] || qualities.low!;
 
-    const choice = { qualityName, audio };
+    const experiment =
+      localTrack.videoTrack &&
+      this.#codecDecisionsByTrack.get(localTrack.videoTrack.mediaStreamTrack)
+        ?.experiment;
+    const choice = {
+      qualityName,
+      audio,
+      ...(experiment ? { experiment } : {}),
+    };
     this.#lastShareChoice = choice;
     // Cancel pending stats before changing capture/encoder configuration.
     // The replacement poll starts with fresh counters and startup settling.
@@ -2592,7 +2627,23 @@ class Voice {
           : undefined,
       (summary) => {
         if (summary.status) bandwidth.reset();
-        console.info("[rtc] screen share sender " + JSON.stringify(summary));
+        const decision =
+          pub.videoTrack &&
+          this.#codecDecisionsByTrack.get(pub.videoTrack.mediaStreamTrack);
+        console.info(
+          "[rtc] screen share sender " +
+            JSON.stringify({
+              ...summary,
+              selection: decision
+                ? {
+                    requestedCodec: decision.requestedCodec,
+                    selectedCodec: decision.codec,
+                    probedBitrate: decision.bitrate,
+                    experiment: decision.experiment ?? null,
+                  }
+                : null,
+            }),
+        );
       },
       10_000,
       (report, sender) => {
@@ -3035,6 +3086,7 @@ class Voice {
       const { publishOptions, codecDecision } = await screenSharePublishOptions(
         recoveredQuality?.resolution,
         room,
+        choice.experiment,
       );
 
       // Same "no resolution, thread the framerate separately" shape as
@@ -3152,6 +3204,7 @@ class Voice {
       const { publishOptions, codecDecision } = await screenSharePublishOptions(
         quality?.resolution,
         room,
+        choice.experiment,
       );
 
       setNextScreenShareFrameRate(quality?.resolution.frameRate ?? 30);
@@ -3374,6 +3427,7 @@ class Voice {
       const selection = await screenSharePublishOptions(
         finalQuality.resolution,
         room,
+        choice.experiment,
       );
       const publishOptions = selection.publishOptions;
       codecDecision = selection.codecDecision;

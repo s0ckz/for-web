@@ -28,6 +28,7 @@ export class StatsCounters {
           "codecId",
           "trackIdentifier",
           "mediaSourceId",
+          "transportId",
         ].some((key) => before[key] !== stat[key])
       )
         return undefined;

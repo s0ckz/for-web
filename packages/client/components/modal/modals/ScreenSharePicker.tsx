@@ -7,6 +7,7 @@ import { Avatar, Column, Dialog, DialogProps, Form2, Ripple } from "@revolt/ui";
 
 import { createMemo } from "solid-js";
 import { styled } from "styled-system/jsx";
+import { ScreenShareExperimentControls } from "../../rtc/ScreenShareExperimentControls";
 import { Modals } from "../types";
 
 export function ScreenSharePickerModal(
@@ -101,6 +102,7 @@ export function ScreenSharePickerModal(
           <Form2.Checkbox control={group.controls.audio}>
             <Trans>Share audio</Trans>
           </Form2.Checkbox>
+          <ScreenShareExperimentControls />
         </Column>
       </form>
     </Dialog>

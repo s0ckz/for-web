@@ -29,6 +29,7 @@ test("computes interval rates and limitation deltas, not lifetime durations", ()
     bytesSent: 1000,
     totalEncodeTime: 0.15,
     qualityLimitationDurations: { bandwidth: 20 },
+    codecId: "codec",
   });
   const now = outbound(11000, {
     framesEncoded: 330,
@@ -181,4 +182,159 @@ test("an idle sender reports zero FPS rather than an unknown rate", () => {
   assert.equal(result.streams[0].encodedFps, 0);
   assert.equal(result.streams[0].sentFps, 0);
   assert.equal(result.streams[0].meanEncodeMs, null);
+});
+
+test("optional quality, adaptation and packet metrics use interval deltas", () => {
+  const before = outbound(1000, {
+    framesEncoded: 30,
+    packetsSent: 100,
+    retransmittedBytesSent: 500,
+    totalPacketSendDelay: 0.1,
+    qpSum: 600,
+    qualityLimitationResolutionChanges: 4,
+    nackCount: 10,
+    pliCount: 1,
+    firCount: 0,
+    remoteId: "receiver",
+  });
+  const current = outbound(11000, {
+    framesEncoded: 330,
+    packetsSent: 1100,
+    retransmittedBytesSent: 50500,
+    totalPacketSendDelay: 2.1,
+    qpSum: 9600,
+    qualityLimitationResolutionChanges: 6,
+    nackCount: 13,
+    pliCount: 2,
+    firCount: 0,
+    remoteId: "receiver",
+    targetBitrate: 4_500_000,
+  });
+  const receiver = (timestamp, packetsLost) => ({
+    id: "receiver",
+    type: "remote-inbound-rtp",
+    timestamp,
+    ssrc: 9,
+    packetsLost,
+    fractionLost: 0.01,
+    roundTripTime: 0.05,
+  });
+  const stream = summarizeSenderDiagnostics(
+    [current, receiver(11000, 12)],
+    new Map([
+      [before.id, before],
+      ["receiver", receiver(1000, 10)],
+    ]),
+  ).streams[0];
+  assert.equal(stream.targetBitrateBps, 4_500_000);
+  assert.equal(stream.retransmissionBitrateBps, 40000);
+  assert.equal(stream.meanPacketSendDelayMs, 2);
+  assert.equal(stream.meanQp, 30);
+  assert.equal(stream.resolutionChanges, 2);
+  assert.deepEqual(stream.feedback, { nack: 3, pli: 1, fir: 0 });
+  assert.deepEqual(stream.receiverReport, {
+    intervalSeconds: 10,
+    packetsLostDelta: 2,
+    reportedFractionLost: 0.01,
+    roundTripTimeMs: 50,
+  });
+  const absent = summarizeSenderDiagnostics(
+    [outbound(11000)],
+    new Map([[before.id, before]]),
+  ).streams[0];
+  for (const key of [
+    "targetBitrateBps",
+    "meanQp",
+    "resolutionChanges",
+    "meanPacketSendDelayMs",
+    "retransmissionBitrateBps",
+    "receiverReport",
+  ])
+    assert.equal(absent[key], null);
+});
+
+test("SSRC, codec, source and transport replacement reset reused RTP IDs", () => {
+  const before = outbound(1000, {
+    ssrc: 1,
+    codecId: "h264",
+    mediaSourceId: "source",
+    transportId: "transport",
+    qpSum: 100,
+  });
+  for (const changed of [
+    { ssrc: 2 },
+    { codecId: "vp9" },
+    { mediaSourceId: "other" },
+    { transportId: "other" },
+  ]) {
+    const current = {
+      ...before,
+      timestamp: 11000,
+      framesEncoded: 300,
+      qpSum: 10000,
+      ...changed,
+    };
+    const stream = summarizeSenderDiagnostics(
+      [current],
+      new Map([[before.id, before]]),
+    ).streams[0];
+    assert.equal(stream.intervalSeconds, null);
+    assert.equal(stream.encodedFps, null);
+    assert.equal(stream.meanQp, null);
+  }
+});
+
+test("receiver loss correction may be negative but a replaced/stale report has no delta", () => {
+  const before = outbound(1000, { remoteId: "receiver" });
+  const current = outbound(11000, { remoteId: "receiver" });
+  const oldRemote = {
+    id: "receiver",
+    type: "remote-inbound-rtp",
+    timestamp: 1000,
+    ssrc: 1,
+    packetsLost: 10,
+  };
+  const previous = new Map([
+    [before.id, before],
+    [oldRemote.id, oldRemote],
+  ]);
+  const read = (changes) =>
+    summarizeSenderDiagnostics(
+      [current, { ...oldRemote, timestamp: 11000, packetsLost: 8, ...changes }],
+      previous,
+    ).streams[0].receiverReport;
+  assert.equal(read({}).packetsLostDelta, -2);
+  assert.equal(read({ ssrc: 2 }).packetsLostDelta, null);
+  assert.equal(read({ timestamp: 1000 }).packetsLostDelta, null);
+  assert.equal(read({ type: "codec" }), null);
+});
+
+test("poll logs the effective degradation policy and content hint", async () => {
+  let captured;
+  let stop;
+  const sender = {
+    track: {
+      contentHint: "motion",
+      getSettings: () => ({ width: 1280, height: 720, frameRate: 60 }),
+    },
+    getStats: async () => new Map(),
+    getParameters: () => ({
+      degradationPreference: "maintain-framerate",
+      encodings: [{ maxBitrate: 8_000_000 }],
+    }),
+  };
+  await new Promise((resolve) => {
+    stop = startSenderDiagnostics(
+      () => sender,
+      (summary) => {
+        captured = summary;
+        resolve();
+      },
+      10000,
+    );
+  });
+  stop();
+  assert.equal(captured.degradationPreference, "maintain-framerate");
+  assert.equal(captured.capture.contentHint, "motion");
+  assert.equal(captured.limits[0].maxBitrate, 8_000_000);
 });

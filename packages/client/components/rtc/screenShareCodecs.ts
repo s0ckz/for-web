@@ -1,3 +1,5 @@
+import type { ScreenShareExperiment } from "./screenShareExperiments";
+
 /** Codec capability hints and runtime recovery, independent of capture/RTC ownership. */
 export type ScreenShareCodec = "h264" | "h265" | "vp9";
 export type CodecProbe = {
@@ -22,6 +24,9 @@ export type ScreenShareCodecDecision = {
   at: number;
   retryAt: number | null;
   h265Allowed: boolean;
+  bitrate: number;
+  requestedCodec: "auto" | "h264" | "h265";
+  experiment?: ScreenShareExperiment;
 };
 
 export const H265_RECEIVE_ATTRIBUTE = "stoat:h265-receive";
@@ -92,6 +97,7 @@ type Slot = {
 /** Share starts return their own snapshot; background warming cannot swap it. */
 export class ScreenShareCodecSelector {
   private slots = new Map<string, Slot>();
+  private blockedByPreset = new Map<string, Slot["blocked"]>();
   private dependencies: {
     probe: (contentType: string, request: CodecRequest) => Promise<CodecProbe>;
     negotiable: () => string[];
@@ -110,12 +116,17 @@ export class ScreenShareCodecSelector {
   async select(
     request: CodecRequest,
     allowH265: () => boolean = () => false,
+    preference: "auto" | "h264" | "h265" = "auto",
   ): Promise<ScreenShareCodecDecision> {
     const key = codecKey(request);
-    let slot = this.slots.get(key);
+    // A capability probe describes its bitrate as well as resolution/cadence.
+    const cacheKey = `${key}:${request.bitrate}`;
+    let slot = this.slots.get(cacheKey);
     if (!slot) {
-      slot = { revision: 0, blocked: {} };
-      this.slots.set(key, slot);
+      const blocked = this.blockedByPreset.get(key) ?? {};
+      this.blockedByPreset.set(key, blocked);
+      slot = { revision: 0, blocked };
+      this.slots.set(cacheKey, slot);
     }
     const current = slot;
     const now = this.now();
@@ -161,7 +172,12 @@ export class ScreenShareCodecSelector {
             revision,
             probes,
             negotiable,
-            expiresAt: this.now() + CAPABILITY_TTL_MS,
+            expiresAt: Math.min(
+              this.now() + CAPABILITY_TTL_MS,
+              ...Object.values(current.blocked).filter(
+                (until): until is number => !!until && until > this.now(),
+              ),
+            ),
           };
           // A rejected codec can be transient; don't cache the batch indefinitely.
           if (!probes.some((probe) => probe.error)) current.capability = value;
@@ -194,40 +210,52 @@ export class ScreenShareCodecSelector {
       !!capability?.negotiable.has("video/h265") &&
       hardwareHint(0) &&
       !blocked("h265");
-    const codec = cbpHardware
+    const automatic = cbpHardware
       ? "h264"
       : h265Hardware && h265Allowed
         ? "h265"
         : "vp9";
+    const preferredEligible =
+      preference === "h264"
+        ? cbpHardware
+        : preference === "h265" && h265Hardware && h265Allowed;
+    const codec =
+      preferredEligible && preference !== "auto" ? preference : automatic;
     const retryAt = Math.min(
       ...Object.values(current.blocked).filter(
         (until): until is number => !!until && until > at,
       ),
     );
+    const reason = !capability
+      ? "probe timed out or superseded; compatible fallback for this share"
+      : codec === "h264"
+        ? "H.264 constrained-baseline hardware capability reported; runtime verification pending"
+        : codec === "h265"
+          ? "H.265 hardware capability reported; current viewers advertise H.265 reception"
+          : h265Hardware && !h265Allowed
+            ? "H.264 unavailable or cooling down; H.265 held for unknown/incompatible viewers"
+            : "no eligible H.26x hardware candidate; compatible VP9 fallback";
     return {
       key,
       revision: capability?.revision ?? current.revision,
       codec,
-      reason: !capability
-        ? "probe timed out or superseded; compatible fallback for this share"
-        : codec === "h264"
-          ? "H.264 constrained-baseline hardware capability reported; runtime verification pending"
-          : codec === "h265"
-            ? "H.265 hardware capability reported; current viewers advertise H.265 reception"
-            : h265Hardware && !h265Allowed
-              ? "H.264 unavailable or cooling down; H.265 held for unknown/incompatible viewers"
-              : "no eligible H.26x hardware candidate; compatible VP9 fallback",
+      reason:
+        preference === "auto"
+          ? reason
+          : `test preference ${preference} ${preferredEligible ? "eligible" : "unavailable; automatic fallback"}; ${reason}`,
       probes,
       cbpHardware,
       at,
       retryAt: Number.isFinite(retryAt) ? retryAt : null,
       h265Allowed,
+      bitrate: request.bitrate,
+      requestedCodec: preference,
     };
   }
 
   /** Call only for active primary-codec software evidence from the owning publication. */
   recordSoftware(decision: ScreenShareCodecDecision) {
-    const slot = this.slots.get(decision.key);
+    const slot = this.slots.get(`${decision.key}:${decision.bitrate}`);
     if (
       !slot ||
       slot.revision !== decision.revision ||
@@ -236,9 +264,19 @@ export class ScreenShareCodecSelector {
       return undefined;
     const retryAt = this.now() + CODEC_SOFTWARE_COOLDOWN_MS;
     slot.blocked[decision.codec] = retryAt;
-    ++slot.revision; // late probes and older observations cannot overwrite recovery
-    slot.pending = undefined;
-    if (slot.capability) slot.capability.revision = slot.revision;
+    // Changing a test ceiling must not bypass software evidence for this preset.
+    for (const [key, affected] of this.slots) {
+      if (!key.startsWith(`${decision.key}:`)) continue;
+      ++affected.revision;
+      affected.pending = undefined;
+      if (affected.capability) {
+        affected.capability.revision = affected.revision;
+        affected.capability.expiresAt = Math.min(
+          affected.capability.expiresAt,
+          retryAt,
+        );
+      }
+    }
     return retryAt;
   }
 }

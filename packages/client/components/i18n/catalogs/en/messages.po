@@ -3806,3 +3806,27 @@ msgstr "Your role ranking is too low to take this action."
 #: components/i18n/errors.tsx
 msgid "Your user has already been created? Try logging in again or refreshing the app."
 msgstr "Your user has already been created? Try logging in again or refreshing the app."
+
+#: components/rtc/ScreenShareExperimentControls.tsx
+msgid "Screen share performance test"
+msgstr "Screen share performance test"
+
+#: components/rtc/ScreenShareExperimentControls.tsx
+msgid "Applies to the next share. Unsupported codecs still fall back automatically."
+msgstr "Applies to the next share. Unsupported codecs still fall back automatically."
+
+#: components/rtc/ScreenShareExperimentControls.tsx
+msgid "Preferred test codec"
+msgstr "Preferred test codec"
+
+#: components/rtc/ScreenShareExperimentControls.tsx
+msgid "Automatic"
+msgstr "Automatic"
+
+#: components/rtc/ScreenShareExperimentControls.tsx
+msgid "Test bitrate ceiling"
+msgstr "Test bitrate ceiling"
+
+#: components/rtc/ScreenShareExperimentControls.tsx
+msgid "Preset default"
+msgstr "Preset default"

@@ -267,6 +267,7 @@ function voiceHarness(t, frameRate = 60) {
   });
   const fixture = `let bandwidthAdvisoryShown = false;
     class Harness {
+      #codecDecisionsByTrack = new WeakMap();
       #stopSenderDiagnostics;
       #stopEncoderMonitor;
       #diagnosticPublication;

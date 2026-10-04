@@ -250,6 +250,25 @@ export function createScreenShareSample(
     // budget one frame has at the current framerate.
     const encodeSeconds = rates.delta(outbound, "totalEncodeTime");
     const framesEncodedDelta = rates.delta(outbound, "framesEncoded");
+    const qpDelta = rates.delta(outbound, "qpSum");
+    const meanQp =
+      qpDelta !== undefined &&
+      framesEncodedDelta !== undefined &&
+      framesEncodedDelta > 0
+        ? qpDelta / framesEncodedDelta
+        : undefined;
+    const sendDelay = rates.delta(outbound, "totalPacketSendDelay");
+    const packetsSentDelta = rates.delta(outbound, "packetsSent");
+    const meanSendDelayMs =
+      sendDelay !== undefined &&
+      packetsSentDelta !== undefined &&
+      packetsSentDelta > 0
+        ? (sendDelay * 1000) / packetsSentDelta
+        : undefined;
+    const retransmittedByteRate = rates.rate(
+      outbound,
+      "retransmittedBytesSent",
+    );
     let encodeTimeMs: number | undefined;
     if (
       encodeSeconds !== undefined &&
@@ -347,6 +366,22 @@ export function createScreenShareSample(
         },
         { label: "Stream bitrate", value: formatBitrate(bitrate) },
         {
+          label: "Bitrate ceiling",
+          value: formatBitrate(parameters?.encodings?.[0]?.maxBitrate),
+        },
+        {
+          label: "Encoder target bitrate",
+          value: formatBitrate(outbound.targetBitrate),
+        },
+        {
+          label: "Retransmission bitrate",
+          value: formatBitrate(
+            retransmittedByteRate === undefined
+              ? undefined
+              : retransmittedByteRate * 8,
+          ),
+        },
+        {
           label: "Codec",
           value: codec?.mimeType ? codec.mimeType.replace("video/", "") : NA,
         },
@@ -356,6 +391,18 @@ export function createScreenShareSample(
         // asked for.
         { label: "Codec params", value: codec?.sdpFmtpLine ?? NA },
         { label: "Encoder", value: outbound.encoderImplementation ?? NA },
+        { label: "Mean QP (codec-specific)", value: meanQp?.toFixed(1) ?? NA },
+        {
+          label: "Packet send delay",
+          value:
+            meanSendDelayMs === undefined
+              ? NA
+              : `${meanSendDelayMs.toFixed(1)} ms`,
+        },
+        {
+          label: "Degradation preference",
+          value: parameters?.degradationPreference ?? NA,
+        },
         {
           label: "Encode time",
           value:
@@ -377,11 +424,17 @@ export function createScreenShareSample(
             : NA,
         },
         {
-          label: "Resolution changes",
+          label: "Resolution changes (lifetime)",
           value:
             outbound.qualityLimitationResolutionChanges !== undefined
               ? `${outbound.qualityLimitationResolutionChanges}`
               : NA,
+        },
+        {
+          label: "Resolution changes (recent)",
+          value: String(
+            rates.delta(outbound, "qualityLimitationResolutionChanges") ?? NA,
+          ),
         },
         {
           label: "Frames sent",
@@ -420,8 +473,8 @@ export function createScreenShareSample(
               : NA,
         },
         {
-          label: "NACK / PLI",
-          value: `${outbound.nackCount ?? 0} / ${outbound.pliCount ?? 0}`,
+          label: "NACK / PLI (recent)",
+          value: `${rates.delta(outbound, "nackCount") ?? NA} / ${rates.delta(outbound, "pliCount") ?? NA}`,
         },
       ],
       summary: {

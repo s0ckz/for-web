@@ -3813,3 +3813,27 @@ msgstr ""
 #~ msgstr ""
 #~ "Você também pode clicar com o botão direito no ícone do usuário no canto "
 #~ "superior esquerdo ou clicar com o botão esquerdo se já estiver no início."
+
+#: components/rtc/ScreenShareExperimentControls.tsx
+msgid "Screen share performance test"
+msgstr "Teste de desempenho do compartilhamento de tela"
+
+#: components/rtc/ScreenShareExperimentControls.tsx
+msgid "Applies to the next share. Unsupported codecs still fall back automatically."
+msgstr "Aplica-se ao próximo compartilhamento. Codecs incompatíveis ainda são substituídos automaticamente."
+
+#: components/rtc/ScreenShareExperimentControls.tsx
+msgid "Preferred test codec"
+msgstr "Codec preferido para o teste"
+
+#: components/rtc/ScreenShareExperimentControls.tsx
+msgid "Automatic"
+msgstr "Automático"
+
+#: components/rtc/ScreenShareExperimentControls.tsx
+msgid "Test bitrate ceiling"
+msgstr "Limite de bitrate do teste"
+
+#: components/rtc/ScreenShareExperimentControls.tsx
+msgid "Preset default"
+msgstr "Padrão da qualidade selecionada"
