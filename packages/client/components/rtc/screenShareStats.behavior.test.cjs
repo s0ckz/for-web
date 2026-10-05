@@ -94,7 +94,10 @@ function harness(local = false) {
     vm.runInContext(output, context, { filename: file });
     return module.exports;
   }
-  const telemetry = load(path.join(__dirname, "screenShareTelemetry.ts"));
+  const resolution = load(path.join(__dirname, "screenShareResolution.ts"));
+  const telemetry = load(path.join(__dirname, "screenShareTelemetry.ts"), {
+    "./screenShareResolution.ts": resolution,
+  });
   const bandwidth = load(path.join(__dirname, "screenShareBandwidth.ts"));
   const solid = {
     createSignal: (initial) => {
@@ -294,7 +297,7 @@ test("sender quality diagnostics distinguish ceiling, target and recent counters
     assert.equal(h.row("Mean QP (codec-specific)"), "30.0");
     assert.equal(h.row("Packet send delay"), "2.0 ms");
     assert.equal(h.row("Retransmission bitrate"), "40 kbps");
-    assert.equal(h.row("Resolution changes (recent)"), "1");
+    assert.equal(h.row("Browser resolution changes (recent)"), "1");
     assert.equal(h.row("NACK / PLI (recent)"), "2 / 0");
     h.setStat({
       timestamp: 3000,
@@ -304,6 +307,52 @@ test("sender quality diagnostics distinguish ceiling, target and recent counters
     });
     await h.tick(1000);
     assert.equal(h.row("Mean QP (codec-specific)"), "--");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("sender panel observes resolution switches and resets after hidden, missing and replaced samples", async () => {
+  const h = harness(true);
+  try {
+    h.setStat({
+      frameWidth: 1280,
+      frameHeight: 720,
+      qualityLimitationResolutionChanges: 0,
+    });
+    await h.tick();
+    assert.equal(h.row("Observed resolution changes (recent)"), "--");
+    h.setStat({
+      timestamp: 2000,
+      frameWidth: 960,
+      frameHeight: 540,
+      framesSent: 130,
+    });
+    await h.tick(1000);
+    assert.equal(h.row("Browser resolution changes (recent)"), "0");
+    assert.equal(h.row("Observed resolution changes (recent)"), "1");
+    h.setStat({ timestamp: 3000 });
+    await h.tick(1000);
+    assert.equal(h.row("Observed resolution changes (recent)"), "0");
+    h.setStat({ timestamp: 4000, frameHeight: undefined });
+    await h.tick(1000);
+    assert.equal(h.row("Observed resolution changes (recent)"), "--");
+    h.setStat({ timestamp: 5000, frameWidth: 640, frameHeight: 360 });
+    await h.tick(1000);
+    assert.equal(h.row("Observed resolution changes (recent)"), "--");
+    await h.visible(true);
+    h.setStat({ timestamp: 6000, frameWidth: 1280, frameHeight: 720 });
+    await h.visible(false);
+    await h.tick();
+    assert.equal(h.row("Observed resolution changes (recent)"), "--");
+    h.setStat({
+      timestamp: 7000,
+      codecId: "new",
+      frameWidth: 960,
+      frameHeight: 540,
+    });
+    await h.tick(1000);
+    assert.equal(h.row("Observed resolution changes (recent)"), "--");
   } finally {
     h.cleanup();
   }

@@ -424,17 +424,21 @@ export function createScreenShareSample(
             : NA,
         },
         {
-          label: "Resolution changes (lifetime)",
+          label: "Browser resolution changes (lifetime)",
           value:
             outbound.qualityLimitationResolutionChanges !== undefined
               ? `${outbound.qualityLimitationResolutionChanges}`
               : NA,
         },
         {
-          label: "Resolution changes (recent)",
+          label: "Browser resolution changes (recent)",
           value: String(
             rates.delta(outbound, "qualityLimitationResolutionChanges") ?? NA,
           ),
+        },
+        {
+          label: "Observed resolution changes (recent)",
+          value: String(rates.resolutionChange(outbound)?.changes ?? NA),
         },
         {
           label: "Frames sent",

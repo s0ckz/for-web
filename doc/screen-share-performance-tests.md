@@ -81,6 +81,14 @@ The existing publication-owned, non-overlapping ten-second sender poll logs:
   and mean encode time per encoded frame.
 - Optional encoder target bitrate, mean quantizer, resolution-change count,
   retransmission bitrate, mean packet send delay and NACK/PLI/FIR deltas.
+- Separate `observedResolutionChanges` (0 or 1 per valid adjacent sample) and
+  `resolutionTransition` with the RTP timestamp and previous/current dimensions.
+  This remains available when the browser's resolution-change counter stays
+  zero. Missing dimensions, changed stream identity or a reset leave the
+  observation unknown; do not infer changes across that gap. Changes between
+  polls may be missed, so this is not an exact lifetime adaptation count or
+  time spent at each quality. The panel labels browser and observed counts
+  separately, and clears its observation baseline on visibility/owner changes.
 - Optional remote receiver-report loss deltas, reported fraction lost and RTT.
   These describe the sender-to-SFU leg, not every viewer's downstream path.
 - Recent quality-limitation durations and the selected video transport's

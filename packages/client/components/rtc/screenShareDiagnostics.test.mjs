@@ -338,3 +338,82 @@ test("poll logs the effective degradation policy and content hint", async () => 
   assert.equal(captured.capture.contentHint, "motion");
   assert.equal(captured.limits[0].maxBitrate, 8_000_000);
 });
+
+test("sampled dimension changes remain visible when the browser adaptation counter stays zero", () => {
+  const before = outbound(1000, {
+    frameWidth: 1280,
+    frameHeight: 720,
+    qualityLimitationResolutionChanges: 0,
+  });
+  const current = outbound(2000, {
+    framesSent: 60,
+    frameWidth: 960,
+    frameHeight: 540,
+    qualityLimitationResolutionChanges: 0,
+  });
+  const stream = summarizeSenderDiagnostics(
+    [current],
+    new Map([[before.id, before]]),
+  ).streams[0];
+  assert.equal(stream.resolutionChanges, 0);
+  assert.equal(stream.observedResolutionChanges, 1);
+  assert.deepEqual(stream.resolutionTransition, {
+    changes: 1,
+    timestampMs: 2000,
+    from: [1280, 720],
+    to: [960, 540],
+  });
+  const same = { ...current, timestamp: 3000 };
+  const unchanged = summarizeSenderDiagnostics(
+    [same],
+    new Map([[current.id, current]]),
+  ).streams[0];
+  assert.equal(unchanged.observedResolutionChanges, 0);
+  assert.equal(unchanged.resolutionTransition, null);
+});
+
+test("resolution observations never bridge missing dimensions, resets or replaced streams", () => {
+  const before = outbound(1000, {
+    frameWidth: 1280,
+    frameHeight: 720,
+    framesSent: 100,
+    ssrc: 1,
+  });
+  const current = {
+    ...before,
+    timestamp: 2000,
+    frameWidth: 960,
+    frameHeight: 540,
+    framesSent: 160,
+  };
+  const read = (now, old = before) =>
+    summarizeSenderDiagnostics([now], new Map([[old.id, old]])).streams[0];
+  for (const changes of [
+    { frameWidth: undefined },
+    { frameHeight: 0 },
+    { frameWidth: Infinity },
+    { frameHeight: -1 },
+    { frameWidth: 960.5 },
+    { ssrc: 2 },
+    { codecId: "new" },
+    { framesSent: 5 },
+    { timestamp: 1000 },
+    { timestamp: 500 },
+  ]) {
+    assert.equal(
+      read({ ...current, ...changes }).observedResolutionChanges,
+      null,
+    );
+    assert.equal(read({ ...current, ...changes }).resolutionTransition, null);
+  }
+  assert.equal(
+    read(current, { ...before, frameHeight: undefined })
+      .observedResolutionChanges,
+    null,
+  );
+  assert.equal(
+    summarizeSenderDiagnostics([current], new Map()).streams[0]
+      .observedResolutionChanges,
+    null,
+  );
+});

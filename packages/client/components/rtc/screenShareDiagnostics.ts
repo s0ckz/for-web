@@ -1,3 +1,5 @@
+import { observeResolutionChange } from "./screenShareResolution.ts";
+
 /** Local diagnostics only: no addresses, participant IDs, or media content. */
 export interface SenderDiagnosticStat {
   id: string;
@@ -191,6 +193,7 @@ export function summarizeSenderDiagnostics(
         ? delta(source.timestamp, previousSource?.timestamp)
         : null;
       const limitedFor: Record<string, number | null> = {};
+      const resolutionObservation = observeResolutionChange(stat, before);
       for (const key of ["cpu", "bandwidth", "none", "other"]) {
         limitedFor[key] = delta(
           stat.qualityLimitationDurations?.[key],
@@ -225,6 +228,10 @@ export function summarizeSenderDiagnostics(
           stat.qualityLimitationResolutionChanges,
           before?.qualityLimitationResolutionChanges,
         ),
+        observedResolutionChanges: resolutionObservation?.changes ?? null,
+        resolutionTransition: resolutionObservation?.changes
+          ? resolutionObservation
+          : null,
         feedback: {
           nack: delta(stat.nackCount, before?.nackCount),
           pli: delta(stat.pliCount, before?.pliCount),
