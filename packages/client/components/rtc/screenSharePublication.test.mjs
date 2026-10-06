@@ -342,6 +342,7 @@ function startHarness({ native = true, audio = true } = {}) {
   const calls = [];
   const publications = new Map();
   let pickerListener;
+  let experiment;
   const participant = {
     isScreenShareEnabled: false,
     createScreenTracks: async () => {
@@ -350,7 +351,11 @@ function startHarness({ native = true, audio = true } = {}) {
       return captured.promise;
     },
     publishTrack: async (track, options) => {
-      calls.push({ publish: track.name, frameRate: options.frameRate });
+      calls.push({
+        publish: track.name,
+        frameRate: options.frameRate,
+        maxBitrate: options.maxBitrate,
+      });
       const pub = track.name === "video" ? { videoTrack: track } : { track };
       publications.set(track.name, pub);
       participant.isScreenShareEnabled = true;
@@ -393,16 +398,27 @@ function startHarness({ native = true, audio = true } = {}) {
       Source: { ScreenShare: "screen", ScreenShareAudio: "audio" },
     },
     publishPickedScreenShare,
-    screenSharePublishOptions: async (resolution) => {
+    getScreenShareExperiment: () => experiment,
+    screenSharePublishOptions: async (
+      resolution,
+      _room,
+      selectedExperiment,
+    ) => {
       calls.push({ probe: resolution.frameRate });
-      const codecDecision = await selector.select({
-        ...resolution,
-        bitrate: 6_000_000,
-      });
+      const codecDecision = await selector.select(
+        {
+          ...resolution,
+          bitrate: selectedExperiment?.maxBitrate ?? 6_000_000,
+        },
+        () => false,
+        selectedExperiment?.codec,
+      );
+      codecDecision.experiment = selectedExperiment;
       return {
         publishOptions: {
           videoCodec: codecDecision.codec,
           frameRate: resolution.frameRate,
+          maxBitrate: codecDecision.bitrate,
         },
         codecDecision,
       };
@@ -447,7 +463,16 @@ function startHarness({ native = true, audio = true } = {}) {
   const voice = new context.StartHarness();
   voice.activeRoom = { state: "connected", localParticipant: participant };
   voice.onPicker = () => ready.resolve();
-  return { voice, ready, calls, tracks, publications };
+  return {
+    voice,
+    ready,
+    calls,
+    tracks,
+    publications,
+    setExperiment(value) {
+      experiment = value;
+    },
+  };
 }
 
 test("Voice native start publishes the picker's 60 FPS choice, including audio, and blocks duplicate starts", async () => {
@@ -485,6 +510,22 @@ test("Voice picker cancellation releases the start guard without publishing or r
   assert.equal(env.voice.starting, false);
   assert.equal(env.publications.size, 0);
   assert.equal(env.voice.errors.length, 0);
+});
+
+test("Voice native picker snapshots test choices before probing and publishing", async () => {
+  const env = startHarness();
+  const start = env.voice.toggleScreenshare();
+  await env.ready.promise;
+  const experiment = Object.freeze({ codec: "h264", maxBitrate: 8_000_000 });
+  env.setExperiment(experiment);
+  env.voice.picker.callback(0, "low60", true);
+  await start;
+  assert.equal(env.voice.decision.experiment, experiment);
+  assert.equal(env.voice.decision.bitrate, 8_000_000);
+  assert.deepEqual(
+    env.calls.filter((call) => call.publish).map((call) => call.maxBitrate),
+    [8_000_000, 8_000_000],
+  );
 });
 
 test("Voice leaving during a native picker cannot publish its later selection", async () => {

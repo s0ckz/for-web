@@ -11,6 +11,7 @@ import {
   Text,
 } from "@revolt/ui";
 import { Symbol } from "@revolt/ui/components/utils/Symbol";
+import { ScreenShareExperimentControls } from "../../../../../rtc/ScreenShareExperimentControls";
 
 export function ScreenShareOptions() {
   const { voice } = useState();
@@ -50,6 +51,7 @@ export function ScreenShareOptions() {
           <Trans>Always Ask for Screen Share Quality</Trans>
         </CategoryButton>
       </CategoryButton.Group>
+      <ScreenShareExperimentControls />
     </Column>
   );
 }

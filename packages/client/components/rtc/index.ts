@@ -6,7 +6,7 @@ export { isSoundboardPublication, useIsMicMuted } from "./soundboard";
 export { useSoundboardLibrary } from "./soundboardLibrary";
 export type { SoundboardEntry } from "./soundboardLibrary";
 export { useIsSpeakingFast } from "./speaking";
-export { isScreenShareLinkWeak, useVoice, VoiceContext } from "./state";
+export { useVoice, VoiceContext } from "./state";
 
 export { InRoom } from "./components/InRoom";
 export { stoatSinkName } from "./virtualMic";

@@ -1,3 +1,5 @@
+import { observeResolutionChange } from "./screenShareResolution.ts";
+
 /** Local diagnostics only: no addresses, participant IDs, or media content. */
 export interface SenderDiagnosticStat {
   id: string;
@@ -25,6 +27,22 @@ export interface SenderDiagnosticStat {
   currentRoundTripTime?: number;
   nominated?: boolean;
   state?: string;
+  transportId?: string;
+  active?: boolean;
+  ssrc?: number;
+  packetsSent?: number;
+  retransmittedBytesSent?: number;
+  totalPacketSendDelay?: number;
+  targetBitrate?: number;
+  qpSum?: number;
+  qualityLimitationResolutionChanges?: number;
+  nackCount?: number;
+  pliCount?: number;
+  firCount?: number;
+  remoteId?: string;
+  packetsLost?: number;
+  fractionLost?: number;
+  roundTripTime?: number;
 }
 
 function delta(current?: number, previous?: number): number | null {
@@ -41,23 +59,83 @@ function rate(value: number | null, seconds: number | null): number | null {
     : null;
 }
 
+function baseline(
+  stat: SenderDiagnosticStat,
+  previous: Map<string, SenderDiagnosticStat>,
+) {
+  const before = previous.get(stat.id);
+  if (
+    !before ||
+    stat.type !== before.type ||
+    (stat.kind ?? stat.mediaType) !== (before.kind ?? before.mediaType) ||
+    stat.timestamp <= before.timestamp ||
+    stat.ssrc !== before.ssrc ||
+    stat.codecId !== before.codecId ||
+    stat.mediaSourceId !== before.mediaSourceId ||
+    stat.transportId !== before.transportId ||
+    ["framesEncoded", "framesSent", "bytesSent", "packetsSent"].some((key) => {
+      const current = stat[key as keyof SenderDiagnosticStat];
+      const old = before[key as keyof SenderDiagnosticStat];
+      return (
+        typeof current === "number" && typeof old === "number" && current < old
+      );
+    })
+  )
+    return undefined;
+  return before;
+}
+
+function bitsPerSecond(
+  current: number | undefined,
+  previous: number | undefined,
+  seconds: number | null,
+) {
+  const bytes = delta(current, previous);
+  return bytes !== null && seconds !== null && seconds > 0
+    ? Math.round((bytes * 8) / seconds)
+    : null;
+}
+
 /** Keep a baseline per RTP stream; never subtract across a sender/reset. */
 export function summarizeSenderDiagnostics(
   stats: SenderDiagnosticStat[],
   previous: Map<string, SenderDiagnosticStat>,
 ) {
   const byId = new Map(stats.map((stat) => [stat.id, stat]));
-  const selectedPairId = stats.find(
-    (stat) => stat.type === "transport",
-  )?.selectedCandidatePairId;
+  const video = stats
+    .filter(
+      (stat) =>
+        stat.type === "outbound-rtp" &&
+        (stat.kind ?? stat.mediaType) === "video" &&
+        stat.active !== false,
+    )
+    .sort(
+      (a, b) =>
+        Number(
+          (delta(b.framesSent, baseline(b, previous)?.framesSent) ?? 0) > 0,
+        ) -
+          Number(
+            (delta(a.framesSent, baseline(a, previous)?.framesSent) ?? 0) > 0,
+          ) || (b.frameWidth ?? 0) - (a.frameWidth ?? 0),
+    )[0];
+  const transports = stats.filter((stat) => stat.type === "transport");
+  const transport = video?.transportId
+    ? byId.get(video.transportId)
+    : transports.length === 1
+      ? transports[0]
+      : undefined;
+  const selectedPairId = transport?.selectedCandidatePairId;
+  const nominated = stats.filter(
+    (stat) =>
+      stat.type === "candidate-pair" &&
+      stat.nominated &&
+      stat.state === "succeeded",
+  );
   const pair = selectedPairId
     ? byId.get(selectedPairId)
-    : stats.find(
-        (stat) =>
-          stat.type === "candidate-pair" &&
-          stat.nominated &&
-          stat.state === "succeeded",
-      );
+    : nominated.length === 1
+      ? nominated[0]
+      : undefined;
   const streams = stats
     .filter(
       (stat) =>
@@ -65,11 +143,48 @@ export function summarizeSenderDiagnostics(
         (stat.kind ?? stat.mediaType) === "video",
     )
     .map((stat) => {
-      const before = previous.get(stat.id);
+      const before = baseline(stat, previous);
       const elapsed = delta(stat.timestamp, before?.timestamp);
       const seconds = elapsed !== null && elapsed > 0 ? elapsed / 1000 : null;
       const framesEncoded = delta(stat.framesEncoded, before?.framesEncoded);
       const encodeTime = delta(stat.totalEncodeTime, before?.totalEncodeTime);
+      const qp = delta(stat.qpSum, before?.qpSum);
+      const packets = delta(stat.packetsSent, before?.packetsSent);
+      const sendDelay = delta(
+        stat.totalPacketSendDelay,
+        before?.totalPacketSendDelay,
+      );
+      const referencedRemote = stat.remoteId
+        ? byId.get(stat.remoteId)
+        : undefined;
+      const remote =
+        referencedRemote?.type === "remote-inbound-rtp"
+          ? referencedRemote
+          : undefined;
+      const oldRemote =
+        before?.remoteId === remote?.id && remote
+          ? previous.get(remote.id)
+          : undefined;
+      const remoteElapsed =
+        remote &&
+        oldRemote &&
+        oldRemote.type === remote.type &&
+        remote.ssrc === oldRemote.ssrc &&
+        remote.codecId === oldRemote.codecId
+          ? delta(remote.timestamp, oldRemote.timestamp)
+          : null;
+      const remoteSeconds =
+        remoteElapsed !== null && remoteElapsed > 0
+          ? remoteElapsed / 1000
+          : null;
+      // Receiver reports may correct loss downwards after late packets arrive.
+      const lost =
+        remoteSeconds !== null &&
+        remoteSeconds > 0 &&
+        Number.isFinite(remote?.packetsLost) &&
+        Number.isFinite(oldRemote?.packetsLost)
+          ? remote!.packetsLost! - oldRemote!.packetsLost!
+          : null;
       const source = stat.mediaSourceId
         ? byId.get(stat.mediaSourceId)
         : undefined;
@@ -78,6 +193,7 @@ export function summarizeSenderDiagnostics(
         ? delta(source.timestamp, previousSource?.timestamp)
         : null;
       const limitedFor: Record<string, number | null> = {};
+      const resolutionObservation = observeResolutionChange(stat, before);
       for (const key of ["cpu", "bandwidth", "none", "other"]) {
         limitedFor[key] = delta(
           stat.qualityLimitationDurations?.[key],
@@ -93,12 +209,46 @@ export function summarizeSenderDiagnostics(
           sourceElapsed !== null ? sourceElapsed / 1000 : null,
         ),
         reportedFps: stat.framesPerSecond ?? null,
-        bitrateBps:
-          rate(delta(stat.bytesSent, before?.bytesSent), seconds) === null
-            ? null
-            : Math.round(
-                ((stat.bytesSent! - before!.bytesSent!) * 8) / seconds!,
-              ),
+        bitrateBps: bitsPerSecond(stat.bytesSent, before?.bytesSent, seconds),
+        targetBitrateBps: stat.targetBitrate ?? null,
+        retransmissionBitrateBps: bitsPerSecond(
+          stat.retransmittedBytesSent,
+          before?.retransmittedBytesSent,
+          seconds,
+        ),
+        meanPacketSendDelayMs:
+          sendDelay !== null && packets !== null && packets > 0
+            ? Math.round(((sendDelay * 1000) / packets) * 100) / 100
+            : null,
+        meanQp:
+          qp !== null && framesEncoded !== null && framesEncoded > 0
+            ? Math.round((qp / framesEncoded) * 100) / 100
+            : null,
+        resolutionChanges: delta(
+          stat.qualityLimitationResolutionChanges,
+          before?.qualityLimitationResolutionChanges,
+        ),
+        observedResolutionChanges: resolutionObservation?.changes ?? null,
+        resolutionTransition: resolutionObservation?.changes
+          ? resolutionObservation
+          : null,
+        feedback: {
+          nack: delta(stat.nackCount, before?.nackCount),
+          pli: delta(stat.pliCount, before?.pliCount),
+          fir: delta(stat.firCount, before?.firCount),
+        },
+        receiverReport:
+          remote?.type === "remote-inbound-rtp"
+            ? {
+                intervalSeconds: remoteSeconds,
+                packetsLostDelta: lost,
+                reportedFractionLost: remote.fractionLost ?? null,
+                roundTripTimeMs:
+                  remote.roundTripTime !== undefined
+                    ? remote.roundTripTime * 1000
+                    : null,
+              }
+            : null,
         meanEncodeMs:
           encodeTime !== null && framesEncoded !== null && framesEncoded > 0
             ? Math.round(((encodeTime * 1000) / framesEncoded) * 100) / 100
@@ -126,6 +276,7 @@ export function startSenderDiagnostics(
   getSender: () => RTCRtpSender | undefined,
   log: (summary: Record<string, unknown>) => void,
   intervalMs = 10_000,
+  onSample?: (report: RTCStatsReport, sender: RTCRtpSender) => void,
 ) {
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -151,13 +302,16 @@ export function startSenderDiagnostics(
         report.forEach((stat) => stats.push(stat));
         const settings = sender.track?.getSettings();
         const parameters = sender.getParameters();
+        onSample?.(report, sender);
         log({
           ...summarizeSenderDiagnostics(stats, previous),
           capture: {
             width: settings?.width ?? null,
             height: settings?.height ?? null,
             requestedFps: settings?.frameRate ?? null,
+            contentHint: sender.track?.contentHint ?? null,
           },
+          degradationPreference: parameters.degradationPreference ?? null,
           limits: parameters.encodings?.map((encoding) => ({
             maxBitrate: encoding.maxBitrate ?? null,
             maxFramerate: encoding.maxFramerate ?? null,
@@ -165,7 +319,17 @@ export function startSenderDiagnostics(
             active: encoding.active ?? null,
           })),
         });
-        previous = new Map(stats.map((stat) => [stat.id, stat]));
+        previous = new Map(
+          stats.map((stat) => [
+            stat.id,
+            {
+              ...stat,
+              qualityLimitationDurations: stat.qualityLimitationDurations && {
+                ...stat.qualityLimitationDurations,
+              },
+            },
+          ]),
+        );
       }
     } catch {
       previous.clear();

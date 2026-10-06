@@ -31,6 +31,7 @@ function harness(local = false) {
   let pending;
   let reads = 0;
   let extraStats = [];
+  let encodings = [{ maxFramerate: 30 }];
   let videoStat = {
     id: "v",
     type: local ? "outbound-rtp" : "inbound-rtp",
@@ -54,7 +55,7 @@ function harness(local = false) {
         )
       );
     },
-    getParameters: () => ({ encodings: [{ maxFramerate: 30 }] }),
+    getParameters: () => ({ encodings }),
   };
   let track = { mediaStreamTrack: {}, sender: owner, receiver: owner };
   const participant = { getTrackPublication: () => undefined };
@@ -93,7 +94,11 @@ function harness(local = false) {
     vm.runInContext(output, context, { filename: file });
     return module.exports;
   }
-  const telemetry = load(path.join(__dirname, "screenShareTelemetry.ts"));
+  const resolution = load(path.join(__dirname, "screenShareResolution.ts"));
+  const telemetry = load(path.join(__dirname, "screenShareTelemetry.ts"), {
+    "./screenShareResolution.ts": resolution,
+  });
+  const bandwidth = load(path.join(__dirname, "screenShareBandwidth.ts"));
   const solid = {
     createSignal: (initial) => {
       let value = initial;
@@ -116,7 +121,7 @@ function harness(local = false) {
       "solid-js": solid,
       "@lingui/solid/macro": {},
       "@livekit/components-core": { isLocal: () => local },
-      "@revolt/rtc": { isScreenShareLinkWeak: () => false },
+      "@revolt/rtc/screenShareBandwidth": bandwidth,
       "@revolt/rtc/screenShareTelemetry": telemetry,
       "@solid-primitives/keyed": {},
       "livekit-client": { Track: { Source: { ScreenShareAudio: "audio" } } },
@@ -139,6 +144,9 @@ function harness(local = false) {
     },
     setExtraStats: (stats) => {
       extraStats = stats;
+    },
+    setEncodings: (value) => {
+      encodings = value;
     },
     delay: (promise) => {
       pending = promise;
@@ -204,6 +212,147 @@ test("sender badge uses sent counter rather than encoded/browser FPS", async () 
     assert.equal(h.row("Sent FPS"), "10.0 fps");
     assert.equal(h.row("Encoded FPS"), "15.0 fps");
     assert.equal(h.sampler.ownSummary().fps, 10);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("sender telemetry shows recent deltas instead of historical weak-link verdicts", async () => {
+  const h = harness(true);
+  try {
+    h.setEncodings([{ maxFramerate: 60, maxBitrate: 6000000 }]);
+    h.setStat({
+      qualityLimitationDurations: { bandwidth: 318.203 },
+      qualityLimitationReason: "none",
+    });
+    await h.tick();
+    assert.equal(h.row("Bandwidth limited (recent)"), "--");
+    assert.equal(h.row("Weak link"), undefined);
+    h.setStat({ timestamp: 2000, framesSent: 160 });
+    await h.tick(1000);
+    assert.equal(h.row("Bandwidth limited (recent)"), "0.0s / 1.0s");
+    h.setStat({
+      timestamp: 3000,
+      framesSent: 220,
+      qualityLimitationDurations: { bandwidth: 319.003 },
+      qualityLimitationReason: "bandwidth",
+    });
+    await h.tick(1000);
+    assert.equal(h.row("Bandwidth limited (recent)"), "0.8s / 1.0s");
+    h.setStat({
+      timestamp: 4000,
+      framesSent: 280,
+      qualityLimitationReason: "none",
+    });
+    await h.tick(1000);
+    assert.equal(h.row("Bandwidth limited (recent)"), "0.0s / 1.0s");
+    h.setEncodings([{ maxFramerate: 30, maxBitrate: 4000000 }]);
+    h.setStat({ timestamp: 5000, framesSent: 310 });
+    await h.tick(1000);
+    assert.equal(h.row("Bandwidth limited (recent)"), "--");
+    h.setStat({
+      timestamp: 6000,
+      framesSent: 340,
+      qualityLimitationDurations: { bandwidth: 0 },
+    });
+    await h.tick(1000);
+    assert.equal(h.row("Bandwidth limited (recent)"), "--");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("sender quality diagnostics distinguish ceiling, target and recent counters", async () => {
+  const h = harness(true);
+  try {
+    h.setEncodings([{ maxBitrate: 8_000_000, maxFramerate: 65 }]);
+    h.setStat({
+      qpSum: 2000,
+      packetsSent: 100,
+      retransmittedBytesSent: 1000,
+      totalPacketSendDelay: 0.2,
+      qualityLimitationResolutionChanges: 8,
+      nackCount: 10,
+      pliCount: 1,
+    });
+    await h.tick();
+    assert.equal(h.row("Mean QP (codec-specific)"), "--");
+    assert.equal(h.row("Encoder target bitrate"), "--");
+    h.setStat({
+      timestamp: 2000,
+      framesEncoded: 130,
+      framesSent: 130,
+      qpSum: 2900,
+      packetsSent: 200,
+      retransmittedBytesSent: 6000,
+      totalPacketSendDelay: 0.4,
+      qualityLimitationResolutionChanges: 9,
+      nackCount: 12,
+      pliCount: 1,
+      targetBitrate: 4_500_000,
+    });
+    await h.tick(1000);
+    assert.equal(h.row("Bitrate ceiling"), "8.00 Mbps");
+    assert.equal(h.row("Encoder target bitrate"), "4.50 Mbps");
+    assert.equal(h.row("Mean QP (codec-specific)"), "30.0");
+    assert.equal(h.row("Packet send delay"), "2.0 ms");
+    assert.equal(h.row("Retransmission bitrate"), "40 kbps");
+    assert.equal(h.row("Browser resolution changes (recent)"), "1");
+    assert.equal(h.row("NACK / PLI (recent)"), "2 / 0");
+    h.setStat({
+      timestamp: 3000,
+      codecId: "different",
+      framesEncoded: 160,
+      qpSum: 3800,
+    });
+    await h.tick(1000);
+    assert.equal(h.row("Mean QP (codec-specific)"), "--");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("sender panel observes resolution switches and resets after hidden, missing and replaced samples", async () => {
+  const h = harness(true);
+  try {
+    h.setStat({
+      frameWidth: 1280,
+      frameHeight: 720,
+      qualityLimitationResolutionChanges: 0,
+    });
+    await h.tick();
+    assert.equal(h.row("Observed resolution changes (recent)"), "--");
+    h.setStat({
+      timestamp: 2000,
+      frameWidth: 960,
+      frameHeight: 540,
+      framesSent: 130,
+    });
+    await h.tick(1000);
+    assert.equal(h.row("Browser resolution changes (recent)"), "0");
+    assert.equal(h.row("Observed resolution changes (recent)"), "1");
+    h.setStat({ timestamp: 3000 });
+    await h.tick(1000);
+    assert.equal(h.row("Observed resolution changes (recent)"), "0");
+    h.setStat({ timestamp: 4000, frameHeight: undefined });
+    await h.tick(1000);
+    assert.equal(h.row("Observed resolution changes (recent)"), "--");
+    h.setStat({ timestamp: 5000, frameWidth: 640, frameHeight: 360 });
+    await h.tick(1000);
+    assert.equal(h.row("Observed resolution changes (recent)"), "--");
+    await h.visible(true);
+    h.setStat({ timestamp: 6000, frameWidth: 1280, frameHeight: 720 });
+    await h.visible(false);
+    await h.tick();
+    assert.equal(h.row("Observed resolution changes (recent)"), "--");
+    h.setStat({
+      timestamp: 7000,
+      codecId: "new",
+      frameWidth: 960,
+      frameHeight: 540,
+    });
+    await h.tick(1000);
+    assert.equal(h.row("Observed resolution changes (recent)"), "--");
   } finally {
     h.cleanup();
   }

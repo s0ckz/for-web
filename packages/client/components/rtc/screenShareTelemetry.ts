@@ -1,3 +1,5 @@
+import { observeResolutionChange } from "./screenShareResolution.ts";
+
 /** Rates from matching RTCStats timestamps, never from a requested FPS. */
 type CounterStat = { id: string; timestamp: number; [field: string]: unknown };
 
@@ -28,6 +30,7 @@ export class StatsCounters {
           "codecId",
           "trackIdentifier",
           "mediaSourceId",
+          "transportId",
         ].some((key) => before[key] !== stat[key])
       )
         return undefined;
@@ -52,6 +55,8 @@ export class StatsCounters {
     };
     return {
       delta,
+      resolutionChange: (stat: CounterStat) =>
+        observeResolutionChange(stat, previous.get(stat.id)),
       rate: (stat: CounterStat, field: string) => {
         const change = delta(stat, field);
         const elapsed = seconds(stat);
