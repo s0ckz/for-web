@@ -16,9 +16,15 @@ const enabled = screenShareExperimentsEnabled(
 // Page memory only. A running share keeps its own snapshot until it ends.
 const [codec, setCodec] = createSignal("auto");
 const [bitrate, setBitrate] = createSignal("default");
+const [trace, setTrace] = createSignal("off");
 
 export function getScreenShareExperiment() {
-  return screenShareExperiment(enabled, codec(), Number(bitrate()));
+  return screenShareExperiment(
+    enabled,
+    codec(),
+    Number(bitrate()),
+    trace() === "90",
+  );
 }
 
 /** Offered before capture starts, never as a live quality/codec switch. */
@@ -57,6 +63,16 @@ export function ScreenShareExperimentControls() {
               "4500000": { title: "4.5 Mbps" },
               "6000000": { title: "6 Mbps" },
               "8000000": { title: "8 Mbps" },
+            }}
+          />
+          <CategoryButton.Select
+            icon="blank"
+            title={<Trans>Frame flow trace</Trans>}
+            value={trace()}
+            onUpdate={setTrace}
+            options={{
+              off: { title: <Trans>Off</Trans> },
+              "90": { title: <Trans>90 seconds</Trans> },
             }}
           />
         </CategoryButton.Group>

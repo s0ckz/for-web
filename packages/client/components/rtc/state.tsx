@@ -71,6 +71,7 @@ import {
 import { startSenderDiagnostics } from "./screenShareDiagnostics";
 import { getScreenShareExperiment } from "./ScreenShareExperimentControls";
 import type { ScreenShareExperiment } from "./screenShareExperiments";
+import { startScreenShareFlowTrace } from "./screenShareFlowTrace";
 import { publishPickedScreenShare } from "./screenSharePublication";
 import {
   browserCaptureOptions,
@@ -831,6 +832,8 @@ class Voice {
    */
   #nativeEncoderLimitsRecheckTimer?: ReturnType<typeof setTimeout>;
   #stopSenderDiagnostics?: () => void;
+  #stopFlowTrace?: () => void;
+  #tracedFlowTracks = new WeakSet<MediaStreamTrack>();
   #diagnosticPublication?: LocalTrackPublication;
   #stopEncoderMonitor?: () => void;
   #screenShareStart?: symbol;
@@ -2521,6 +2524,8 @@ class Voice {
   }
 
   #clearSenderDiagnostics() {
+    this.#stopFlowTrace?.();
+    this.#stopFlowTrace = undefined;
     this.#stopSenderDiagnostics?.();
     this.#stopSenderDiagnostics = undefined;
     this.#stopEncoderMonitor?.();
@@ -2563,6 +2568,31 @@ class Voice {
       localTrack.videoTrack.mediaStreamTrack,
       decision,
     );
+    const track = localTrack.videoTrack.mediaStreamTrack;
+    const traceRoom = this.room();
+    if (
+      decision.experiment?.traceSeconds === 90 &&
+      !this.#tracedFlowTracks.has(track)
+    ) {
+      this.#tracedFlowTracks.add(track);
+      this.#stopFlowTrace?.();
+      this.#stopFlowTrace = startScreenShareFlowTrace({
+        experiment: decision.experiment,
+        getSender: () =>
+          traceRoom &&
+          this.room() === traceRoom &&
+          this.#diagnosticPublication === localTrack &&
+          traceRoom.localParticipant.getTrackPublication(
+            Track.Source.ScreenShare,
+          ) === localTrack
+            ? localTrack.videoTrack?.sender
+            : undefined,
+        log: (record) =>
+          console.info(
+            "[rtc] screen share flow trace " + JSON.stringify(record),
+          ),
+      });
+    }
     this.#stopEncoderMonitor?.();
     const room = this.room();
     let previousDiagnostic = "";

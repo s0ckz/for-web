@@ -269,6 +269,7 @@ function voiceHarness(t, frameRate = 60) {
     class Harness {
       #codecDecisionsByTrack = new WeakMap();
       #stopSenderDiagnostics;
+      #stopFlowTrace;
       #stopEncoderMonitor;
       #diagnosticPublication;
       #lastShareChoice = {qualityName: "selected", audio: true};
