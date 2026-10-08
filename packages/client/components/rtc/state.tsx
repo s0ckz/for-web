@@ -229,8 +229,7 @@ const SCREEN_SHARE_AUDIO: ScreenShareCaptureOptions["audio"] = {
  * LiveKit's h1080fps30 preset caps the stream at roughly 2.5 Mbps. 1080p
  * screen content cannot hold 30fps within that, so the encoder trades frames
  * away and settles around 10-12fps even on a connection with plenty of
- * headroom. Give it room, and tell it to protect the framerate rather than the
- * resolution.
+ * headroom. Give it room without changing the resolution the user selected.
  *
  * The ceiling used to be keyed on resolution alone, justified by both presets
  * running at 30fps -- that premise is gone now that 1080p60 ("high60", see
@@ -470,7 +469,10 @@ async function screenSharePublishOptions(
     ...(videoCodec === "h265"
       ? { backupCodecPolicy: BackupCodecPolicy.REGRESSION }
       : {}),
-    degradationPreference: "maintain-framerate",
+    // Preserve the user's selected dimensions. Motion is still the content
+    // hint, but the explicit preference overrides its resolution adaptation.
+    // Under pressure, bitrate/quantization and FPS may fall instead.
+    degradationPreference: "maintain-resolution",
     // The fields below are meant for the *audio* half of the share, but
     // LocalParticipant's setTrackEnabled loop calls
     // publishTrack(track, publishOptions) once per acquired track using this
@@ -2265,7 +2267,10 @@ class Voice {
         experiment,
       );
 
-      let changed = false;
+      // Quality changes and replacement senders must retain the same policy
+      // as initial publication, including when encoding ceilings already match.
+      let changed = params.degradationPreference !== "maintain-resolution";
+      params.degradationPreference = "maintain-resolution";
 
       for (const encoding of params.encodings) {
         if (encoding.maxFramerate !== maxFramerate) {

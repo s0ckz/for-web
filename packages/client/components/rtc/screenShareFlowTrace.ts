@@ -15,7 +15,16 @@ export interface CaptureFlowSnapshot {
     native: Record<string, number | null>;
     delivery: Record<string, number | boolean>;
   } | null;
-  timings: Record<string, { count: number; totalMs: number; maxMs: number }>;
+  timings: Record<
+    string,
+    {
+      count: number;
+      totalMs: number;
+      maxMs: number;
+      minMs?: number;
+      buckets?: number[];
+    }
+  >;
 }
 
 /** Older desktop builds and Chromium tracks have no native diagnostic hook. */
@@ -44,6 +53,8 @@ const RENDERER_COUNTERS = [
 ];
 /** Only bounded numeric timing aggregates may be logged. */
 const TIMINGS = ["arrivalGap", "captureTimestampGap", "construction", "write"];
+/** Desktop's frame-gap buckets, in ms; the final bucket contains values >100. */
+const GAP_UPPER_MS = [8, 12, 16, 20, 25, 33, 50, 100];
 /** Missing, negative and non-finite counters are unknown. */
 const finite = (value: unknown): value is number =>
   typeof value === "number" && Number.isFinite(value) && value >= 0;
@@ -139,6 +150,30 @@ export function summarizeCaptureFlow(
           now && before && now.totalMs >= before.totalMs
             ? now.totalMs - before.totalMs
             : null;
+        // Older desktop snapshots have no buckets. Reject reset/malformed
+        // histograms rather than turning missing cadence evidence into zero.
+        const bucketDelta =
+          (name === "arrivalGap" || name === "captureTimestampGap") &&
+          count !== null &&
+          now?.buckets?.length === GAP_UPPER_MS.length + 1 &&
+          before?.buckets?.length === GAP_UPPER_MS.length + 1
+            ? now.buckets.map((value, index) => {
+                const old = before.buckets![index];
+                return finite(value) &&
+                  finite(old) &&
+                  Number.isInteger(value) &&
+                  Number.isInteger(old) &&
+                  value >= old
+                  ? value - old
+                  : null;
+              })
+            : null;
+        const buckets =
+          bucketDelta &&
+          bucketDelta.every(finite) &&
+          bucketDelta.reduce((sum, value) => sum + (value ?? 0), 0) === count
+            ? bucketDelta
+            : null;
         return [
           name,
           {
@@ -147,6 +182,12 @@ export function summarizeCaptureFlow(
             maxSinceFirstTraceMs: finite(now?.maxMs)
               ? rounded(now.maxMs)
               : null,
+            minSinceFirstTraceMs: finite(now?.minMs)
+              ? rounded(now.minMs)
+              : null,
+            ...(name === "arrivalGap" || name === "captureTimestampGap"
+              ? { gapUpperMs: GAP_UPPER_MS, gapBuckets: buckets }
+              : {}),
           },
         ];
       }),
@@ -251,7 +292,9 @@ export function startScreenShareFlowTrace(options: {
         return;
       }
       const settings = track?.getSettings();
-      const limits = sender.getParameters().encodings?.map((value) => ({
+      const parameters = sender.getParameters();
+      const degradationPreference = parameters.degradationPreference ?? null;
+      const limits = parameters.encodings?.map((value) => ({
         maxBitrate: value.maxBitrate ?? null,
         maxFramerate: value.maxFramerate ?? null,
         scaleResolutionDownBy: value.scaleResolutionDownBy ?? null,
@@ -263,6 +306,7 @@ export function startScreenShareFlowTrace(options: {
         settings?.width,
         settings?.height,
         settings?.frameRate,
+        degradationPreference,
         limits,
       ]);
       if (key !== previousKey) {
@@ -290,6 +334,7 @@ export function startScreenShareFlowTrace(options: {
           fps: settings?.frameRate ?? null,
         },
         limits,
+        degradationPreference,
       });
       previousCapture = capture;
       previous = new Map(

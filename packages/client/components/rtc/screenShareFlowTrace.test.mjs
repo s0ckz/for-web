@@ -164,7 +164,10 @@ test("one-second trace distinguishes native, browser source, encoding and sendin
   };
   const sender = {
     track,
-    getParameters: () => ({ encodings: [{ maxBitrate: 6_000_000 }] }),
+    getParameters: () => ({
+      degradationPreference: "maintain-resolution",
+      encodings: [{ maxBitrate: 6_000_000 }],
+    }),
     getStats: async () => {
       const report = stats(time.now() + 1000, frames, sourceFrames);
       report.set("ip", {
@@ -193,10 +196,101 @@ test("one-second trace distinguishes native, browser source, encoding and sendin
   assert.equal(latest.sender.streams[0].sentFps, 54);
   assert.equal(latest.sender.streams[0].sourceFps, 55);
   assert.equal(latest.limits[0].maxBitrate, 6_000_000);
+  assert.equal(latest.degradationPreference, "maintain-resolution");
   assert.equal(JSON.stringify(events).includes("PRIVATE_ADDRESS"), false);
   stop();
   assert.equal(time.tasks.size, 0);
   assert.equal(events.at(-1).reason, "stopped");
+});
+
+test("frame-gap buckets expose interval cadence and retain unknown/reset histograms", () => {
+  const timing = (count, buckets) => ({
+    count,
+    totalMs: count * 17,
+    minMs: 6,
+    maxMs: 36,
+    buckets,
+  });
+  const before = capture(1000, 2, {
+    timings: { arrivalGap: timing(2, [0, 0, 0, 2, 0, 0, 0, 0, 0]) },
+  });
+  const current = capture(2000, 7, {
+    timings: { arrivalGap: timing(7, [1, 0, 0, 4, 1, 0, 1, 0, 0]) },
+  });
+  const result = summarizeCaptureFlow(current, before).timings.arrivalGap;
+  assert.deepEqual(result.gapUpperMs, [8, 12, 16, 20, 25, 33, 50, 100]);
+  assert.deepEqual(result.gapBuckets, [1, 0, 0, 2, 1, 0, 1, 0, 0]);
+  assert.equal(result.minSinceFirstTraceMs, 6);
+  assert.equal(
+    summarizeCaptureFlow(capture(2000, 7), capture(1000, 2)).timings.arrivalGap
+      .gapBuckets,
+    null,
+  );
+  assert.equal(
+    summarizeCaptureFlow(current, null).timings.arrivalGap.gapBuckets,
+    null,
+  );
+  for (const invalid of [
+    undefined,
+    [],
+    [1, 0, 0, 1, 0, 0, 0, 0, 0],
+    [1, 0, 0, 4, 1, 0, NaN, 0, 0],
+    [1, 0, 0, 4, 1, 0, 0.5, 0, 0],
+    [1, 0, 0, 1, 1, 0, 4, 0, 0],
+  ]) {
+    const bad = capture(2000, 7, {
+      timings: { arrivalGap: timing(7, invalid) },
+    });
+    assert.equal(
+      summarizeCaptureFlow(bad, before).timings.arrivalGap.gapBuckets,
+      null,
+    );
+  }
+  assert.equal(
+    summarizeCaptureFlow({ ...current, configurationVersion: 2 }, before)
+      .timings.arrivalGap.gapBuckets,
+    null,
+  );
+});
+
+test("a resolution adaptation policy change resets trace baselines", async () => {
+  const time = clock(),
+    events = [];
+  let preference = "maintain-framerate";
+  const track = {
+    readyState: "live",
+    getSettings: () => ({ width: 1280, height: 720, frameRate: 60 }),
+    getCaptureDiagnostics: async () =>
+      capture(time.now() + 1000, time.now() * 0.06),
+  };
+  const sender = {
+    track,
+    getParameters: () => ({
+      degradationPreference: preference,
+      encodings: [{ maxBitrate: 6_000_000 }],
+    }),
+    getStats: async () => stats(time.now() + 1000, time.now() * 0.06),
+  };
+  const stop = startScreenShareFlowTrace({
+    getSender: () => sender,
+    experiment: { codec: "h264", traceSeconds: 90 },
+    clock: time,
+    log: (record) => events.push(record),
+  });
+  await flush();
+  time.advance(1000);
+  await flush();
+  assert.equal(events.at(-1).sender.streams[0].sentFps, 60);
+  preference = "maintain-resolution";
+  time.advance(1000);
+  await flush();
+  assert.equal(events.at(-1).degradationPreference, "maintain-resolution");
+  assert.equal(events.at(-1).sender.streams[0].sentFps, null);
+  assert.equal(events.at(-1).capture.renderer.rates.written, null);
+  time.advance(1000);
+  await flush();
+  assert.equal(events.at(-1).sender.streams[0].sentFps, 60);
+  stop();
 });
 
 test("hung reads never overlap and the hard deadline prevents late publication", async () => {

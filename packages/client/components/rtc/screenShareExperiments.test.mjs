@@ -312,6 +312,10 @@ test("actual publish options preserve defaults and pair test preference with its
   const normal = await context.publishOptions(request, room);
   assert.equal(normal.publishOptions.videoCodec, "h264");
   assert.equal(normal.publishOptions.screenShareEncoding.maxBitrate, 6_000_000);
+  assert.equal(
+    normal.publishOptions.degradationPreference,
+    "maintain-resolution",
+  );
   assert.equal(normal.codecDecision.experiment, undefined);
   const experiment = screenShareExperiment(true, "h265", 8_000_000);
   const preferred = await context.publishOptions(request, room, experiment);
@@ -323,6 +327,92 @@ test("actual publish options preserve defaults and pair test preference with its
   );
   assert.equal(preferred.publishOptions.backupCodecPolicy, "regression");
   assert.equal(preferred.publishOptions.simulcast, false);
+  assert.equal(
+    preferred.publishOptions.degradationPreference,
+    "maintain-resolution",
+  );
+});
+
+test("every screen share preset preserves resolution with H.264, H.265 and VP9 fallback", async () => {
+  const room = {
+    remoteParticipants: new Map([
+      ["viewer", { attributes: { [H265_RECEIVE_ATTRIBUTE]: "1" } }],
+    ]),
+  };
+  for (const codec of ["h264", "h265", "vp9"]) {
+    const { context } = voiceHarness(
+      undefined,
+      codec === "vp9" ? { negotiable: () => [] } : {},
+    );
+    for (const height of [720, 1080]) {
+      for (const frameRate of [30, 60]) {
+        const resolution = {
+          width: height === 720 ? 1280 : 1920,
+          height,
+          frameRate,
+        };
+        const result = await context.publishOptions(
+          resolution,
+          room,
+          codec === "vp9" ? undefined : { codec },
+        );
+        assert.equal(result.publishOptions.videoCodec, codec);
+        assert.equal(
+          result.publishOptions.degradationPreference,
+          "maintain-resolution",
+        );
+        assert.equal(result.publishOptions.simulcast, false);
+        assert.equal(
+          result.publishOptions.screenShareEncoding.maxFramerate,
+          frameRate + 5,
+        );
+      }
+    }
+  }
+});
+
+test("a republished sender restores resolution preference even when every encoding limit already matches", async () => {
+  const { context } = voiceHarness();
+  const voice = new context.Harness();
+  voice.activeRoom = { remoteParticipants: new Map(), localParticipant: {} };
+  let writes = 0;
+  let parameters = {
+    degradationPreference: "maintain-framerate",
+    encodings: [
+      {
+        maxBitrate: 6_000_000,
+        maxFramerate: 65,
+        scaleResolutionDownBy: 1,
+        active: true,
+      },
+    ],
+  };
+  const pub = {
+    videoTrack: {
+      mediaStreamTrack: { getSettings: () => ({ width: 1280, height: 720 }) },
+      sender: {
+        getParameters: () => structuredClone(parameters),
+        setParameters: async (value) => {
+          writes++;
+          parameters = value;
+        },
+      },
+    },
+  };
+  await voice.apply(pub, "low60");
+  assert.equal(writes, 1);
+  assert.equal(parameters.degradationPreference, "maintain-resolution");
+  assert.deepEqual(parameters.encodings, [
+    {
+      maxBitrate: 6_000_000,
+      maxFramerate: 65,
+      scaleResolutionDownBy: 1,
+      active: true,
+    },
+  ]);
+  await voice.apply(pub, "low60");
+  assert.equal(writes, 1, "Do not repeatedly write unchanged parameters");
+  voice.clear();
 });
 
 test("quality changes and recovered publications retain the owning experiment instead of defaults", async () => {
@@ -356,6 +446,7 @@ test("quality changes and recovered publications retain the owning experiment in
   await voice.apply(first, "low");
   assert.equal(parameters.encodings[0].maxBitrate, 8_000_000);
   assert.equal(parameters.encodings[0].maxFramerate, 35);
+  assert.equal(parameters.degradationPreference, "maintain-resolution");
   assert.equal(voice.choice.experiment, experiment);
   // The recovery calls pass this snapshot, even when the next-share UI changes.
   const recovery = await context.publishOptions(
@@ -367,6 +458,7 @@ test("quality changes and recovered publications retain the owning experiment in
   voice.bind(second, recovery.codecDecision);
   await voice.apply(second, "low60");
   assert.equal(parameters.encodings[0].maxBitrate, 8_000_000);
+  assert.equal(parameters.degradationPreference, "maintain-resolution");
   assert.equal(voice.choice.experiment, experiment);
   voice.clear();
 });
