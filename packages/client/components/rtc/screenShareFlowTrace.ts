@@ -168,13 +168,15 @@ export function startScreenShareFlowTrace(options: {
   if (options.experiment.traceSeconds !== 90) return () => {};
   const clock = options.clock ?? {
     now: () => performance.now(),
-    setTimeout,
-    clearTimeout,
+    // Web IDL timers require the Window receiver, even through a clock object.
+    setTimeout: globalThis.setTimeout.bind(globalThis),
+    clearTimeout: globalThis.clearTimeout.bind(globalThis),
   };
   const startedAt = clock.now();
   let stopped = false,
     samples = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let deadline: ReturnType<typeof setTimeout> | undefined;
   let previous = new Map<string, SenderDiagnosticStat>();
   let previousCapture: CaptureFlowSnapshot | null = null;
   let previousKey: string | undefined;
@@ -194,13 +196,24 @@ export function startScreenShareFlowTrace(options: {
   const finish = (reason: string) => {
     if (stopped) return;
     stopped = true;
-    clock.clearTimeout(timer);
-    clock.clearTimeout(deadline);
+    for (const pending of [timer, deadline]) {
+      if (pending === undefined) continue;
+      try {
+        clock.clearTimeout(pending);
+      } catch {
+        /* stopped also rejects pending callbacks and late reads */
+      }
+    }
     previous.clear();
     previousCapture = null;
     emit({ event: "end", reason, samples });
   };
-  const deadline = clock.setTimeout(() => finish("completed"), 90_000);
+  try {
+    deadline = clock.setTimeout(() => finish("completed"), 90_000);
+  } catch {
+    finish("timer-unavailable");
+    return () => {};
+  }
   emit({
     event: "start",
     durationSeconds: 90,
@@ -212,8 +225,8 @@ export function startScreenShareFlowTrace(options: {
   });
   const sample = async () => {
     if (stopped) return;
-    const readStarted = clock.now();
     try {
+      const readStarted = clock.now();
       const sender = options.getSender();
       const track = sender?.track as DiagnosticTrack | null | undefined;
       if (!sender || !track || track.readyState === "ended") {
@@ -297,7 +310,13 @@ export function startScreenShareFlowTrace(options: {
         emit({ event: "unavailable" });
       }
     } finally {
-      if (!stopped) timer = clock.setTimeout(() => void sample(), 1000);
+      if (!stopped) {
+        try {
+          timer = clock.setTimeout(() => void sample(), 1000);
+        } catch {
+          finish("timer-unavailable");
+        }
+      }
     }
   };
   void sample();

@@ -279,6 +279,59 @@ test("capture read failures retain browser statistics and diagnostic failures st
   assert.equal(time.tasks.size, 0);
 });
 
+test("timer failures stop optional diagnostics without throwing into sharing", async () => {
+  for (const failure of ["deadline", "sample", "cleanup"]) {
+    const time = clock(),
+      events = [];
+    const schedule = time.setTimeout,
+      cancel = time.clearTimeout;
+    time.setTimeout = (fn, ms) => {
+      if (
+        (failure === "deadline" && ms === 90_000) ||
+        (failure === "sample" && ms === 1000)
+      )
+        throw Error("timer unavailable");
+      return schedule(fn, ms);
+    };
+    time.clearTimeout = (id) => {
+      if (failure === "cleanup") throw Error("timer cleanup unavailable");
+      cancel(id);
+    };
+    let reads = 0;
+    const track = {
+      readyState: "live",
+      getSettings: () => ({ frameRate: 60 }),
+    };
+    const sender = {
+      track,
+      getParameters: () => ({}),
+      getStats: async () => {
+        reads++;
+        return stats(time.now() + 1000, 0);
+      },
+    };
+    const stop = startScreenShareFlowTrace({
+      getSender: () => sender,
+      experiment: { codec: "h264", traceSeconds: 90 },
+      log: (r) => events.push(r),
+      clock: time,
+    });
+    await flush();
+    assert.equal(reads, failure === "deadline" ? 0 : 1);
+    stop();
+    const count = events.length;
+    time.advance(90_000);
+    await flush();
+    assert.equal(events.length, count);
+    assert.equal(track.readyState, "live");
+    assert.equal(events.at(-1).event, "end");
+    assert.equal(
+      events.at(-1).reason,
+      failure === "cleanup" ? "stopped" : "timer-unavailable",
+    );
+  }
+});
+
 test("a ceiling change resets baselines and replacing the track ends the trace", async () => {
   const time = clock(),
     events = [];
