@@ -510,3 +510,52 @@ test("deferred native scaling correction preserves the owning test ceiling", asy
   assert.equal(parameters.encodings[0].scaleResolutionDownBy, 1.5);
   voice.clear();
 });
+
+test("an acknowledged native resize is not downscaled twice when a static source delays new pixels", async () => {
+  let correction;
+  const { context } = voiceHarness({
+    setTimeout: (fn) => {
+      correction = fn;
+      return 1;
+    },
+    clearTimeout() {},
+  });
+  const voice = new context.Harness();
+  voice.activeRoom = { remoteParticipants: new Map(), localParticipant: {} };
+  let parameters = {
+    encodings: [
+      { maxBitrate: 6_000_000, maxFramerate: 65, scaleResolutionDownBy: 1 },
+    ],
+  };
+  let writes = 0,
+    width = 1920,
+    height = 1080;
+  const pub = {
+    videoTrack: {
+      mediaStreamTrack: {
+        getSettings: () => ({ width, height }),
+        getCaptureTarget: () => ({ width: 1280, height: 720 }),
+      },
+      sender: {
+        getParameters: () => structuredClone(parameters),
+        setParameters: async (value) => {
+          writes++;
+          parameters = value;
+        },
+      },
+    },
+  };
+  await voice.apply(pub, "low60");
+  assert.equal(writes, 1);
+  correction();
+  await Promise.resolve();
+  assert.equal(writes, 1);
+  assert.equal(parameters.encodings[0].scaleResolutionDownBy, 1);
+  width = 1280;
+  height = 720;
+  await voice.apply(pub, "low60");
+  correction();
+  await Promise.resolve();
+  assert.equal(writes, 1);
+  voice.clear();
+});

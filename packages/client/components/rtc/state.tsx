@@ -2153,11 +2153,10 @@ class Voice {
       // self-correction for exactly that case, once a real frame has had
       // time to land.
       //
-      // The durable fix is for for-desktop's `applyConstraints` patch to
-      // report the target size from `getSettings()` synchronously instead
-      // of the last delivered frame's -- out of scope here since it needs
-      // an app release; trusting the target and self-correcting keeps
-      // for-web correct in the meantime regardless of when that ships.
+      // Current native builds expose the acknowledged target separately via
+      // getCaptureTarget(), without disguising last delivered dimensions in
+      // getSettings(). The deferred correction trusts that acknowledgement;
+      // older desktop builds retain the observed-size fallback.
       scaleResolutionDownBy = 1;
 
       console.info(
@@ -2215,6 +2214,26 @@ class Voice {
 
       const sender = localTrack.videoTrack?.sender;
       if (!sender?.getParameters) return;
+
+      // New native builds expose the accepted target separately from the last
+      // delivered frame. A static surface can delay its first resized frame
+      // beyond this timer; treating that delay as a refusal would downscale
+      // again once the native pixels finally reach the selected dimensions.
+      const track = localTrack.videoTrack?.mediaStreamTrack as
+        | (MediaStreamTrack & {
+            getCaptureTarget?: () => { width: number; height: number } | null;
+          })
+        | undefined;
+      try {
+        const target = track?.getCaptureTarget?.();
+        if (
+          target?.width === resolution.width &&
+          target.height === resolution.height
+        )
+          return;
+      } catch {
+        // Older/fallback tracks still use the observed-size correction below.
+      }
 
       const captured = localTrack.videoTrack?.mediaStreamTrack.getSettings();
       const scaleResolutionDownBy = screenShareScaleFactor(
