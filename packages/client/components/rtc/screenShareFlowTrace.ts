@@ -23,12 +23,15 @@ type DiagnosticTrack = MediaStreamTrack & {
   getCaptureDiagnostics?: () => Promise<CaptureFlowSnapshot | null>;
 };
 
+/** Native packing attempts and successful main JS delivery are distinct stages. */
 const NATIVE_COUNTERS = [
   "incomingFrames",
   "emittedFrames",
   "jsDeliveredFrames",
 ];
+/** Port traffic includes coalescing separately from transport failures. */
 const DELIVERY_COUNTERS = ["posted", "acknowledged", "coalesced", "failures"];
+/** Browser writes and canvas draws retain their separate success counters. */
 const RENDERER_COUNTERS = [
   "received",
   "constructed",
@@ -39,9 +42,12 @@ const RENDERER_COUNTERS = [
   "canvasDrawn",
   "drawFailures",
 ];
+/** Only bounded numeric timing aggregates may be logged. */
 const TIMINGS = ["arrivalGap", "captureTimestampGap", "construction", "write"];
+/** Missing, negative and non-finite counters are unknown. */
 const finite = (value: unknown): value is number =>
   typeof value === "number" && Number.isFinite(value) && value >= 0;
+/** Keep trace output readable without implying sub-millisecond precision. */
 const rounded = (value: number) => Math.round(value * 100) / 100;
 
 /** Missing/reset counters stay unknown; each stage uses its own sample clock. */
