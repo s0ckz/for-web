@@ -1088,13 +1088,21 @@ export function ScreenShareStats(props: {
   };
 
   return (
-    <Panel onClick={(e) => e.stopPropagation()}>
+    <Panel
+      role="region"
+      aria-label="Screen share statistics"
+      onClick={(e) => e.stopPropagation()}
+    >
       <Header>
         <Title>stats for nerds{sending() ? " -- your share" : ""}</Title>
         <Buttons>
-          <Action onClick={copy}>{copied() ? "copied" : "copy"}</Action>
+          <Action type="button" onClick={copy}>
+            {copied() ? "copied" : "copy"}
+          </Action>
           <Show when={props.onClose}>
-            <Action onClick={() => props.onClose?.()}>close</Action>
+            <Action type="button" onClick={() => props.onClose?.()}>
+              close
+            </Action>
           </Show>
         </Buttons>
       </Header>
@@ -1108,12 +1116,22 @@ export function ScreenShareStats(props: {
          * instead, so only rows whose *value* actually changed re-render.
          */}
         <Key each={rows()} by="label">
-          {(row) => (
-            <>
-              <Label>{row().label}</Label>
-              <Value>{row().value}</Value>
-            </>
-          )}
+          {(row) => {
+            // Give protocol parameters and long descriptions the full width;
+            // short measurements keep their units together in the value column.
+            const multiline = () =>
+              row().label.endsWith("params") || row().value.length > 16;
+            return (
+              <>
+                <Label multiline={multiline()}>{row().label}</Label>
+                <Value multiline={multiline()}>
+                  {row().label.endsWith("params")
+                    ? row().value.replaceAll(";", "; ")
+                    : row().value}
+                </Value>
+              </>
+            );
+          }}
         </Key>
       </Grid>
     </Panel>
@@ -1329,8 +1347,7 @@ export function ScreenShareBadge(props: { sample: ScreenShareSample }) {
  * `focus: true` variant sets `position: absolute` with an inline `height`
  * from `getHeight()` -- still a definite height on the *same* element this
  * panel is now positioned against). `top`/`left` replace the old
- * `margin: var(--gap-md)` + grid alignment for placement; `maxWidth` is
- * unchanged, since the horizontal case was never the problem.
+ * `margin: var(--gap-md)` + grid alignment for placement.
  */
 const Panel = styled("div", {
   base: {
@@ -1352,7 +1369,8 @@ const Panel = styled("div", {
     display: "flex",
     flexDirection: "column",
 
-    maxWidth: "min(320px, 90%)",
+    width: "480px",
+    maxWidth: "calc(100% - 2 * var(--gap-md))",
     // The actual "too tall for its tile" fix: caps the panel at the tile's
     // height minus a `--gap-md` margin on both the top (the panel's own
     // `top` offset above) and bottom, so it can never grow past the tile
@@ -1368,68 +1386,50 @@ const Panel = styled("div", {
     pointerEvents: "auto",
 
     borderRadius: "var(--borderRadius-md)",
-    background: "#000000cc",
+    background: "#101218f2",
+    border: "1px solid #ffffff26",
+    boxShadow: "0 8px 24px #00000040",
     color: "#fff",
     backdropFilter: "blur(4px)",
 
     fontFamily: "var(--fonts-monospace, monospace)",
-    fontSize: "11px",
+    fontSize: "12px",
+    fontWeight: 400,
     lineHeight: 1.5,
     cursor: "default",
   },
 });
 
 /**
- * No `position: sticky` here, deliberately. The obvious way to keep
- * `copy`/`close` reachable while the rows scroll is a sticky header with an
- * opaque background masking whatever passes underneath it -- and that was
- * tried first, but it does not actually work against this panel's
- * translucent design: `Panel`'s own background is `#000000cc` (80% alpha),
- * so matching it on the sticky header still lets 20% of scrolled-under row
- * text show through as visible ghosting, and the header ends up compositing
- * to a visibly different (darker) shade than the rest of the panel. Patching
- * the alpha upward just trades one visible artifact for another (a
- * header/body seam), and an opaque header would abandon the panel's
- * translucent look outright.
- *
- * The actual fix is to remove the need for a mask at all: `Panel` is a flex
- * column, `Header` here is a fixed-size flex item (`flexShrink: 0`), and
- * only `Grid` below -- the rows -- scrolls. Content that never shares
- * `Header`'s box in the first place can't show through it, at any scroll
- * offset, with no background/alpha/margin tricks required.
+ * The header stays outside the scrolling metrics, keeping Copy and Close
+ * reachable without scrolling content behind the translucent header.
  */
 const Header = styled("div", {
   base: {
     flexShrink: 0,
 
     display: "flex",
+    flexWrap: "wrap",
     alignItems: "center",
     justifyContent: "space-between",
     gap: "var(--gap-md)",
-    marginBottom: "var(--gap-sm)",
+    marginBottom: "var(--gap-md)",
+    paddingBottom: "var(--gap-sm)",
+    borderBottom: "1px solid #ffffff26",
     textTransform: "uppercase",
     letterSpacing: "0.06em",
-    opacity: 0.7,
   },
 });
 
 /**
- * The "stats for nerds" title. `min-width: 0` overrides a flex item's
- * default `min-width: auto`, which would otherwise floor this span's width
- * at its own content size and let that content keep shoving `Buttons`
- * sideways no matter how little room `Header` has -- only with the floor
- * removed can `overflow: hidden` + `text-overflow: ellipsis` actually clip
- * the text instead of losing the fight for space against `copy`/`close`.
- * This was the most plausible "can't close it" path: `justify-content:
- * space-between` with no shrink control on either side let the uppercase
- * title push `close` right off the panel's edge on a narrow tile.
+ * The title can wrap on narrow tiles while the action buttons retain
+ * enough room for their labels.
  */
 const Title = styled("span", {
   base: {
     minWidth: 0,
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-    whiteSpace: "nowrap",
+    flex: "1 1 160px",
+    fontWeight: 600,
   },
 });
 
@@ -1444,20 +1444,28 @@ const Action = styled("button", {
   base: {
     all: "unset",
     cursor: "pointer",
-    padding: "0 4px",
-    borderRadius: "3px",
+    padding: "3px 7px",
+    borderRadius: "4px",
     border: "1px solid #fff4",
-    fontSize: "10px",
+    fontSize: "11px",
     textTransform: "uppercase",
     _hover: { background: "#fff2" },
+    _focusVisible: { outline: "2px solid #fff", outlineOffset: "2px" },
   },
 });
 
 const Grid = styled("div", {
   base: {
     display: "grid",
-    gridTemplateColumns: "auto 1fr",
+    // Reserve space for short values while labels can wrap on narrow tiles.
+    gridTemplateColumns: "minmax(0, 1fr) minmax(96px, max-content)",
     columnGap: "var(--gap-md)",
+    rowGap: "4px",
+    alignItems: "start",
+    scrollbarGutter: "stable",
+    scrollbarColor: "#647083 transparent",
+    scrollbarWidth: "thin",
+    paddingRight: "var(--gap-sm)",
 
     // This is where `Panel`'s old `overflowY`/`overscrollBehavior` moved to
     // (see `Header`'s doc comment for why): the rows are the only thing
@@ -1473,27 +1481,40 @@ const Grid = styled("div", {
     // to fit its content, which for a scroll container means "big enough
     // that nothing needs to scroll" -- exactly defeating the point of
     // `overflowY: auto` above. Zeroing it lets `Grid` actually shrink below
-    // its content height and hand the excess to the scrollbar. Grid layout
-    // itself (the `auto 1fr` columns) is unaffected: a flex/grid item's
-    // min-size axis and its own internal `display: grid` formatting are
-    // independent, so this only changes how much vertical space `Grid` is
-    // willing to be squeezed into, not how its two columns lay out.
+    // its content height and hand the excess to the scrollbar.
     minHeight: 0,
   },
 });
 
-const Label = styled("div", { base: { opacity: 0.6, whiteSpace: "nowrap" } });
+const Label = styled("div", {
+  base: { color: "#c1c7d0", minWidth: 0, overflowWrap: "anywhere" },
+  variants: {
+    multiline: {
+      true: {
+        gridColumn: "1 / -1",
+        marginTop: "4px",
+      },
+    },
+  },
+});
 
 const Value = styled("div", {
   base: {
     textAlign: "right",
     fontVariantNumeric: "tabular-nums",
-    // Codec rows (`sdpFmtpLine`, see e.g. the outbound/inbound sample
-    // builders above) can be long enough to run past `Panel`'s 320px cap
-    // with nowhere to break -- `anywhere` allows a break at any character
-    // once there is no better (word/hyphen) opportunity, wrapping the value
-    // inside the panel instead of overflowing its edge.
-    overflowWrap: "anywhere",
+    minWidth: 0,
+    whiteSpace: "nowrap",
+  },
+  variants: {
+    multiline: {
+      true: {
+        gridColumn: "1 / -1",
+        textAlign: "left",
+        whiteSpace: "normal",
+        overflowWrap: "anywhere",
+        marginBottom: "4px",
+      },
+    },
   },
 });
 
