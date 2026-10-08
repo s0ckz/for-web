@@ -391,7 +391,7 @@ test("a republished sender restores resolution preference even when every encodi
     videoTrack: {
       mediaStreamTrack: { getSettings: () => ({ width: 1280, height: 720 }) },
       sender: {
-        getParameters: () => structuredClone(parameters),
+        getParameters: () => globalThis.structuredClone(parameters),
         setParameters: async (value) => {
           writes++;
           parameters = value;
@@ -537,7 +537,7 @@ test("an acknowledged native resize is not downscaled twice when a static source
         getCaptureTarget: () => ({ width: 1280, height: 720 }),
       },
       sender: {
-        getParameters: () => structuredClone(parameters),
+        getParameters: () => globalThis.structuredClone(parameters),
         setParameters: async (value) => {
           writes++;
           parameters = value;
