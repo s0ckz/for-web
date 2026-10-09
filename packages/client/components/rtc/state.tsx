@@ -1854,6 +1854,10 @@ class Voice {
               ) => {
                 screenPickerQualityName = qualityName;
                 screenPickerAudio = audio;
+                console.error(
+                  "[rtc] screen share picker choice",
+                  JSON.stringify({ qualityName }),
+                );
                 window.native.screenPickerCallback(idx, audio);
               },
               sources: sources,
@@ -1894,9 +1898,35 @@ class Voice {
             },
             prepare: async (tracks) => {
               const enabled = this.getEnabledScreenShareQualities();
+              // The picker made an explicit choice. A changed instance limit
+              // must not silently replace it with the saved/default 720p preset.
+              if (
+                screenPickerQualityName &&
+                !enabled[screenPickerQualityName]
+              ) {
+                console.error(
+                  "[rtc] screen share quality unavailable",
+                  JSON.stringify({
+                    requestedQuality: screenPickerQualityName,
+                    enabledQualities: Object.keys(enabled),
+                  }),
+                );
+                throw new Error(
+                  "The selected screen share quality is no longer available. Please choose a quality again.",
+                );
+              }
               const finalQuality =
                 enabled[screenPickerQualityName ?? startingQuality.name] ??
                 enabled.low!;
+              console.error(
+                "[rtc] screen share quality resolved",
+                JSON.stringify({
+                  requestedQuality:
+                    screenPickerQualityName ?? startingQuality.name,
+                  resolvedQuality: finalQuality.name,
+                  resolution: finalQuality.resolution,
+                }),
+              );
               if (screenPickerQualityName)
                 screenPickerQualityName = finalQuality.name;
               const video = tracks.find(
