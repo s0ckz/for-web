@@ -439,7 +439,7 @@ function startHarness({ native = true, audio = true } = {}) {
     #watchForSoftwareFallback = (_, decision) => { this.decision = decision; };
     #screenShareQualityOptions = () => [];
     #endScreenShare = async () => {};
-    #applyShareCaptureChoice = async (_, quality) => { this.preparedRate = quality.resolution.frameRate; };
+    #applyShareCaptureChoice = async (_, quality) => { this.preparedRate = quality.resolution.frameRate; this.preparedResolution = quality.resolution; };
     #applyShareChoice = async (_, __, qualityName, audio) => { this.choice = { qualityName, audio }; };
     activeRoom;
     shared = false;
@@ -447,10 +447,13 @@ function startHarness({ native = true, audio = true } = {}) {
     get starting() { return this.#screenShareStart !== undefined; }
     room() { return this.activeRoom; }
     screenshare() { return this.shared; }
-    getEnabledScreenShareQualities() { return {
+    qualities = {
       low: { name: "low", resolution: {width: 1280, height: 720, frameRate: 30} },
       low60: { name: "low60", resolution: {width: 1280, height: 720, frameRate: 60} },
-    }; }
+      high: { name: "high", resolution: {width: 1920, height: 1080, frameRate: 30} },
+      high60: { name: "high60", resolution: {width: 1920, height: 1080, frameRate: 60} },
+    };
+    getEnabledScreenShareQualities() { return this.qualities; }
     openModal(value) { this.picker = value; this.onPicker(); }
     onErr(error, ignored) { if (!ignored.includes(error.name)) this.errors.push(error); }
     ${method}
@@ -525,6 +528,50 @@ test("Voice native picker snapshots test choices before probing and publishing",
   assert.deepEqual(
     env.calls.filter((call) => call.publish).map((call) => call.maxBitrate),
     [8_000_000, 8_000_000],
+  );
+});
+
+test("Voice preserves explicit 1080p choices with the 8 Mbps experiment", async () => {
+  for (const [qualityName, fps] of [
+    ["high", 30],
+    ["high60", 60],
+  ]) {
+    const env = startHarness();
+    const start = env.voice.toggleScreenshare();
+    await env.ready.promise;
+    env.setExperiment(Object.freeze({ codec: "h264", maxBitrate: 8_000_000 }));
+    env.voice.picker.callback(0, qualityName, true);
+    await start;
+    assert.equal(env.voice.decision.key, `1920x1080@${fps}`);
+    assert.deepEqual(JSON.parse(JSON.stringify(env.voice.preparedResolution)), {
+      width: 1920,
+      height: 1080,
+      frameRate: fps,
+    });
+    assert.equal(env.voice.choice.qualityName, qualityName);
+    assert.equal(env.voice.errors.length, 0);
+  }
+});
+
+test("Voice stops acquired tracks instead of silently downgrading a disabled picker choice", async () => {
+  const env = startHarness();
+  const start = env.voice.toggleScreenshare();
+  await env.ready.promise;
+  // Model an instance limit changing after the picker offered 1080p.
+  delete env.voice.qualities.high;
+  env.voice.picker.callback(0, "high", true);
+  await start;
+  assert.equal(env.publications.size, 0);
+  assert.equal(env.voice.shared, false);
+  assert.equal(env.voice.starting, false);
+  assert.deepEqual(
+    env.tracks.map((track) => track.stops),
+    [1, 1],
+  );
+  assert.match(env.voice.errors[0]?.message, /quality is no longer available/);
+  assert.equal(
+    env.calls.some((call) => call.probe),
+    false,
   );
 });
 

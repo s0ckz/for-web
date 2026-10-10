@@ -32,6 +32,18 @@ export function ScreenSharePickerModal(
   });
 
   async function onSubmit() {
+    // Keep the actual form choice in the desktop log, independently of the
+    // subsequent RTC lookup and native configuration acknowledgement.
+    console.error(
+      "[rtc] screen share picker confirmed",
+      JSON.stringify({
+        qualityName: group.controls.qualityName.value,
+        offeredQualities: props.qualities.map((quality) => ({
+          name: quality.name,
+          label: quality.fullName,
+        })),
+      }),
+    );
     props.callback(
       group.controls.idx.value[0],
       group.controls.qualityName.value,

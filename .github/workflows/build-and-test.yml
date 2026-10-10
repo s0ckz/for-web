@@ -64,7 +64,7 @@ jobs:
       - run: mise build:check
 
       - name: Check screen share regressions
-        run: mise exec -- node --test --test-timeout=10000 packages/client/components/rtc/screenShareCodecs.test.mjs packages/client/components/rtc/screenShareExperiments.test.mjs packages/client/components/rtc/screenSharePublication.test.mjs packages/client/components/rtc/screenShareBandwidth.test.mjs packages/client/components/rtc/screenShareDiagnostics.test.mjs packages/client/components/rtc/screenShareTelemetry.test.mjs packages/client/components/rtc/screenShareStats.behavior.test.cjs
+        run: mise exec -- node --test --test-timeout=10000 packages/client/components/rtc/screenShareCodecs.test.mjs packages/client/components/rtc/screenShareExperiments.test.mjs packages/client/components/rtc/screenSharePublication.test.mjs packages/client/components/rtc/screenShareBandwidth.test.mjs packages/client/components/rtc/screenShareDiagnostics.test.mjs packages/client/components/rtc/screenShareFlowTrace.test.mjs packages/client/components/rtc/screenShareTelemetry.test.mjs packages/client/components/rtc/screenShareStats.behavior.test.cjs
 
   lint-format:
     name: Lint & Format

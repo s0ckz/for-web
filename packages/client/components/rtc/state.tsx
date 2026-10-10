@@ -71,6 +71,7 @@ import {
 import { startSenderDiagnostics } from "./screenShareDiagnostics";
 import { getScreenShareExperiment } from "./ScreenShareExperimentControls";
 import type { ScreenShareExperiment } from "./screenShareExperiments";
+import { startScreenShareFlowTrace } from "./screenShareFlowTrace";
 import { publishPickedScreenShare } from "./screenSharePublication";
 import {
   browserCaptureOptions,
@@ -228,8 +229,7 @@ const SCREEN_SHARE_AUDIO: ScreenShareCaptureOptions["audio"] = {
  * LiveKit's h1080fps30 preset caps the stream at roughly 2.5 Mbps. 1080p
  * screen content cannot hold 30fps within that, so the encoder trades frames
  * away and settles around 10-12fps even on a connection with plenty of
- * headroom. Give it room, and tell it to protect the framerate rather than the
- * resolution.
+ * headroom. Give it room without changing the resolution the user selected.
  *
  * The ceiling used to be keyed on resolution alone, justified by both presets
  * running at 30fps -- that premise is gone now that 1080p60 ("high60", see
@@ -469,7 +469,10 @@ async function screenSharePublishOptions(
     ...(videoCodec === "h265"
       ? { backupCodecPolicy: BackupCodecPolicy.REGRESSION }
       : {}),
-    degradationPreference: "maintain-framerate",
+    // Preserve the user's selected dimensions. Motion is still the content
+    // hint, but the explicit preference overrides its resolution adaptation.
+    // Under pressure, bitrate/quantization and FPS may fall instead.
+    degradationPreference: "maintain-resolution",
     // The fields below are meant for the *audio* half of the share, but
     // LocalParticipant's setTrackEnabled loop calls
     // publishTrack(track, publishOptions) once per acquired track using this
@@ -831,6 +834,8 @@ class Voice {
    */
   #nativeEncoderLimitsRecheckTimer?: ReturnType<typeof setTimeout>;
   #stopSenderDiagnostics?: () => void;
+  #stopFlowTrace?: () => void;
+  #tracedFlowTracks = new WeakSet<MediaStreamTrack>();
   #diagnosticPublication?: LocalTrackPublication;
   #stopEncoderMonitor?: () => void;
   #screenShareStart?: symbol;
@@ -1849,6 +1854,10 @@ class Voice {
               ) => {
                 screenPickerQualityName = qualityName;
                 screenPickerAudio = audio;
+                console.error(
+                  "[rtc] screen share picker choice",
+                  JSON.stringify({ qualityName }),
+                );
                 window.native.screenPickerCallback(idx, audio);
               },
               sources: sources,
@@ -1889,9 +1898,35 @@ class Voice {
             },
             prepare: async (tracks) => {
               const enabled = this.getEnabledScreenShareQualities();
+              // The picker made an explicit choice. A changed instance limit
+              // must not silently replace it with the saved/default 720p preset.
+              if (
+                screenPickerQualityName &&
+                !enabled[screenPickerQualityName]
+              ) {
+                console.error(
+                  "[rtc] screen share quality unavailable",
+                  JSON.stringify({
+                    requestedQuality: screenPickerQualityName,
+                    enabledQualities: Object.keys(enabled),
+                  }),
+                );
+                throw new Error(
+                  "The selected screen share quality is no longer available. Please choose a quality again.",
+                );
+              }
               const finalQuality =
                 enabled[screenPickerQualityName ?? startingQuality.name] ??
                 enabled.low!;
+              console.error(
+                "[rtc] screen share quality resolved",
+                JSON.stringify({
+                  requestedQuality:
+                    screenPickerQualityName ?? startingQuality.name,
+                  resolvedQuality: finalQuality.name,
+                  resolution: finalQuality.resolution,
+                }),
+              );
               if (screenPickerQualityName)
                 screenPickerQualityName = finalQuality.name;
               const video = tracks.find(
@@ -2148,11 +2183,10 @@ class Voice {
       // self-correction for exactly that case, once a real frame has had
       // time to land.
       //
-      // The durable fix is for for-desktop's `applyConstraints` patch to
-      // report the target size from `getSettings()` synchronously instead
-      // of the last delivered frame's -- out of scope here since it needs
-      // an app release; trusting the target and self-correcting keeps
-      // for-web correct in the meantime regardless of when that ships.
+      // Current native builds expose the acknowledged target separately via
+      // getCaptureTarget(), without disguising last delivered dimensions in
+      // getSettings(). The deferred correction trusts that acknowledgement;
+      // older desktop builds retain the observed-size fallback.
       scaleResolutionDownBy = 1;
 
       console.info(
@@ -2211,6 +2245,26 @@ class Voice {
       const sender = localTrack.videoTrack?.sender;
       if (!sender?.getParameters) return;
 
+      // New native builds expose the accepted target separately from the last
+      // delivered frame. A static surface can delay its first resized frame
+      // beyond this timer; treating that delay as a refusal would downscale
+      // again once the native pixels finally reach the selected dimensions.
+      const track = localTrack.videoTrack?.mediaStreamTrack as
+        | (MediaStreamTrack & {
+            getCaptureTarget?: () => { width: number; height: number } | null;
+          })
+        | undefined;
+      try {
+        const target = track?.getCaptureTarget?.();
+        if (
+          target?.width === resolution.width &&
+          target.height === resolution.height
+        )
+          return;
+      } catch {
+        // Older/fallback tracks still use the observed-size correction below.
+      }
+
       const captured = localTrack.videoTrack?.mediaStreamTrack.getSettings();
       const scaleResolutionDownBy = screenShareScaleFactor(
         captured ?? {},
@@ -2262,7 +2316,10 @@ class Voice {
         experiment,
       );
 
-      let changed = false;
+      // Quality changes and replacement senders must retain the same policy
+      // as initial publication, including when encoding ceilings already match.
+      let changed = params.degradationPreference !== "maintain-resolution";
+      params.degradationPreference = "maintain-resolution";
 
       for (const encoding of params.encodings) {
         if (encoding.maxFramerate !== maxFramerate) {
@@ -2521,6 +2578,8 @@ class Voice {
   }
 
   #clearSenderDiagnostics() {
+    this.#stopFlowTrace?.();
+    this.#stopFlowTrace = undefined;
     this.#stopSenderDiagnostics?.();
     this.#stopSenderDiagnostics = undefined;
     this.#stopEncoderMonitor?.();
@@ -2563,6 +2622,31 @@ class Voice {
       localTrack.videoTrack.mediaStreamTrack,
       decision,
     );
+    const track = localTrack.videoTrack.mediaStreamTrack;
+    const traceRoom = this.room();
+    if (
+      decision.experiment?.traceSeconds === 90 &&
+      !this.#tracedFlowTracks.has(track)
+    ) {
+      this.#tracedFlowTracks.add(track);
+      this.#stopFlowTrace?.();
+      this.#stopFlowTrace = startScreenShareFlowTrace({
+        experiment: decision.experiment,
+        getSender: () =>
+          traceRoom &&
+          this.room() === traceRoom &&
+          this.#diagnosticPublication === localTrack &&
+          traceRoom.localParticipant.getTrackPublication(
+            Track.Source.ScreenShare,
+          ) === localTrack
+            ? localTrack.videoTrack?.sender
+            : undefined,
+        log: (record) =>
+          console.info(
+            "[rtc] screen share flow trace " + JSON.stringify(record),
+          ),
+      });
+    }
     this.#stopEncoderMonitor?.();
     const room = this.room();
     let previousDiagnostic = "";

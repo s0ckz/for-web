@@ -2,6 +2,7 @@
 export type ScreenShareExperiment = Readonly<{
   codec: "auto" | "h264" | "h265";
   maxBitrate?: number;
+  traceSeconds?: 90;
 }>;
 
 export function screenShareExperimentsEnabled(
@@ -20,6 +21,7 @@ export function screenShareExperiment(
   enabled: boolean,
   codec: unknown,
   maxBitrate: unknown,
+  trace: unknown = false,
 ): ScreenShareExperiment | undefined {
   if (!enabled) return undefined;
   const preference = codec === "h264" || codec === "h265" ? codec : "auto";
@@ -28,7 +30,12 @@ export function screenShareExperiment(
   )
     ? (maxBitrate as number)
     : undefined;
-  return preference === "auto" && ceiling === undefined
+  const traceSeconds = trace === true ? 90 : undefined;
+  return preference === "auto" && ceiling === undefined && !traceSeconds
     ? undefined
-    : Object.freeze({ codec: preference, maxBitrate: ceiling });
+    : Object.freeze({
+        codec: preference,
+        maxBitrate: ceiling,
+        ...(traceSeconds ? { traceSeconds } : {}),
+      });
 }

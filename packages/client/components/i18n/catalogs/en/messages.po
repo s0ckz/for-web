@@ -313,6 +313,10 @@ msgstr "24 hours"
 #~ msgid "7 days"
 #~ msgstr "7 days"
 
+#: components/rtc/ScreenShareExperimentControls.tsx
+msgid "90 seconds"
+msgstr "90 seconds"
+
 #: components/app/interface/settings/channel/permissions/ChannelPermissionsEditor.tsx
 msgid "Able to access channels on this server"
 msgstr "Able to access channels on this server"
@@ -1542,6 +1546,10 @@ msgstr "For 3 hours"
 #: components/app/menus/shared/NotificationContextMenu.tsx
 msgid "For 8 hours"
 msgstr "For 8 hours"
+
+#: components/rtc/ScreenShareExperimentControls.tsx
+msgid "Frame flow trace"
+msgstr "Frame flow trace"
 
 #: src/interface/Friends.tsx
 #: src/interface/navigation/channels/HomeSidebar.tsx
