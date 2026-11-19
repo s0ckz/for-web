@@ -1,4 +1,11 @@
-import { Match, Show, Switch, createSignal } from "solid-js";
+import {
+  Match,
+  Show,
+  Switch,
+  createSignal,
+  onCleanup,
+  onMount,
+} from "solid-js";
 import { Motion, Presence } from "solid-motionone";
 
 import { css } from "styled-system/css";
@@ -16,11 +23,29 @@ import MdMinimize from "@material-symbols/svg-400/outlined/minimize.svg?componen
 
 import Wordmark from "../../../../public/assets/web/wordmark.svg?component-solid";
 import { pendingUpdate } from "../../../../src/serviceWorkerInterface";
+import { DesktopUpdateButton } from "./DesktopUpdateButton";
+import {
+  type DesktopUpdateState,
+  observeDesktopUpdates,
+} from "./desktopUpdates";
 
 const isMacOS = navigator.platform.startsWith("Mac");
 const isNative = !!window.native;
 
 export function Titlebar() {
+  const [desktopUpdate, setDesktopUpdate] = createSignal<DesktopUpdateState>({
+    status: "idle",
+    version: null,
+  });
+  const customFrame = () =>
+    isNative && !!window.desktopConfig?.get?.()?.customFrame;
+  onMount(() => {
+    const stop = observeDesktopUpdates(
+      window.native?.updater,
+      setDesktopUpdate,
+    );
+    onCleanup(stop);
+  });
   const [isMaximised, setIsMaximised] = createSignal(
     // The desktop config arrives over IPC and may not have landed by first
     // render; dereferencing it unguarded throws during startup and leaves the
@@ -49,8 +74,7 @@ export function Titlebar() {
     <Presence>
       <Show
         when={
-          (isNative && window.desktopConfig?.get().customFrame) ||
-          isDisconnected()
+          customFrame() || isDisconnected() || desktopUpdate().status !== "idle"
         }
       >
         <Motion.div
@@ -58,7 +82,7 @@ export function Titlebar() {
           animate={{ height: "29px" }}
           exit={{ height: 0 }}
         >
-          <Base disconnected={isDisconnected()}>
+          <Base data-desktop-titlebar disconnected={isDisconnected()}>
             <Title
               macos={isMacOS}
               style={{
@@ -69,6 +93,8 @@ export function Titlebar() {
               <Wordmark
                 class={css({
                   height: "18px",
+                  width: "auto",
+                  maxWidth: "100%",
                   marginBlockStart: "1px",
                 })}
               />{" "}
@@ -132,7 +158,11 @@ export function Titlebar() {
                 </div>
               </Show>
             </DragHandle>
-            <Show when={isNative && !isMacOS}>
+            <DesktopUpdateButton
+              state={desktopUpdate()}
+              install={() => window.native.updater!.install()}
+            />
+            <Show when={customFrame() && !isMacOS}>
               <Action onClick={window.native.minimise}>
                 <Ripple />
                 <MdMinimize {...symbolSize(20)} />
@@ -162,6 +192,9 @@ const Base = styled("div", {
   base: {
     flexShrink: 0,
     height: "29px",
+    width: "100%",
+    maxWidth: "100vw",
+    minWidth: 0,
     userSelect: "none",
 
     display: "flex",
@@ -186,6 +219,8 @@ const Base = styled("div", {
 const Title = styled("div", {
   base: {
     display: "flex",
+    minWidth: 0,
+    overflow: "hidden",
     gap: "var(--gap-md)",
     alignItems: "center",
     paddingInlineStart: "var(--gap-md)",
@@ -206,6 +241,8 @@ const Title = styled("div", {
 const DragHandle = styled("div", {
   base: {
     flexGrow: 1,
+    minWidth: 0,
+    overflow: "hidden",
     height: "100%",
 
     display: "flex",

@@ -3838,3 +3838,27 @@ msgstr "Test bitrate ceiling"
 #: components/rtc/ScreenShareExperimentControls.tsx
 msgid "Preset default"
 msgstr "Preset default"
+
+#: components/app/interface/desktop/DesktopUpdateButton.tsx
+msgid "Downloading update…"
+msgstr "Downloading update…"
+
+#: components/app/interface/desktop/DesktopUpdateButton.tsx
+msgid "Restarting…"
+msgstr "Restarting…"
+
+#: components/app/interface/desktop/DesktopUpdateButton.tsx
+msgid "Retry update"
+msgstr "Retry update"
+
+#: components/app/interface/desktop/DesktopUpdateButton.tsx
+msgid "Restart to update"
+msgstr "Restart to update"
+
+#: components/app/interface/desktop/DesktopUpdateButton.tsx
+msgid "Could not restart Stoat. Try again or use the tray icon."
+msgstr "Could not restart Stoat. Try again or use the tray icon."
+
+#: components/app/interface/desktop/DesktopUpdateButton.tsx
+msgid "Restart Stoat to install the update. This ends any active call."
+msgstr "Restart Stoat to install the update. This ends any active call."
