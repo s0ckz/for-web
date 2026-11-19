@@ -66,6 +66,9 @@ jobs:
       - name: Check screen share regressions
         run: mise exec -- node --test --test-timeout=10000 packages/client/components/rtc/screenShareCodecs.test.mjs packages/client/components/rtc/screenShareExperiments.test.mjs packages/client/components/rtc/screenSharePublication.test.mjs packages/client/components/rtc/screenShareBandwidth.test.mjs packages/client/components/rtc/screenShareDiagnostics.test.mjs packages/client/components/rtc/screenShareFlowTrace.test.mjs packages/client/components/rtc/screenShareTelemetry.test.mjs packages/client/components/rtc/screenShareStats.behavior.test.cjs
 
+      - name: Check desktop update subscriptions
+        run: mise exec -- node --test packages/client/components/app/interface/desktop/desktopUpdates.test.mjs
+
   lint-format:
     name: Lint & Format
     runs-on: ubuntu-latest

@@ -3837,3 +3837,27 @@ msgstr "Limite de bitrate do teste"
 #: components/rtc/ScreenShareExperimentControls.tsx
 msgid "Preset default"
 msgstr "Padrão da qualidade selecionada"
+
+#: components/app/interface/desktop/DesktopUpdateButton.tsx
+msgid "Downloading update…"
+msgstr "Baixando atualização…"
+
+#: components/app/interface/desktop/DesktopUpdateButton.tsx
+msgid "Restarting…"
+msgstr "Reiniciando…"
+
+#: components/app/interface/desktop/DesktopUpdateButton.tsx
+msgid "Retry update"
+msgstr "Tentar atualizar novamente"
+
+#: components/app/interface/desktop/DesktopUpdateButton.tsx
+msgid "Restart to update"
+msgstr "Reiniciar para atualizar"
+
+#: components/app/interface/desktop/DesktopUpdateButton.tsx
+msgid "Could not restart Stoat. Try again or use the tray icon."
+msgstr "Não foi possível reiniciar o Stoat. Tente novamente ou use o ícone na bandeja."
+
+#: components/app/interface/desktop/DesktopUpdateButton.tsx
+msgid "Restart Stoat to install the update. This ends any active call."
+msgstr "Reinicie o Stoat para instalar a atualização. Isso encerra qualquer chamada em andamento."

@@ -4,6 +4,7 @@ import { Trans, useLingui } from "@lingui/solid/macro";
 
 import { CategoryButton, Checkbox, Column } from "@revolt/ui";
 import { Symbol } from "@revolt/ui/components/utils/Symbol";
+import type { DesktopUpdater } from "../../desktop/desktopUpdates";
 
 declare type DesktopConfig = {
   firstLaunch: boolean;
@@ -21,6 +22,8 @@ declare type DesktopConfig = {
 declare global {
   interface Window {
     native: {
+      /** Available in desktop builds with in-app update status. */
+      updater?: DesktopUpdater;
       versions: {
         node(): string;
         chrome(): string;
