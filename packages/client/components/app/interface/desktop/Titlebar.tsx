@@ -93,6 +93,8 @@ export function Titlebar() {
               <Wordmark
                 class={css({
                   height: "18px",
+                  width: "auto",
+                  maxWidth: "100%",
                   marginBlockStart: "1px",
                 })}
               />{" "}
@@ -217,6 +219,8 @@ const Base = styled("div", {
 const Title = styled("div", {
   base: {
     display: "flex",
+    minWidth: 0,
+    overflow: "hidden",
     gap: "var(--gap-md)",
     alignItems: "center",
     paddingInlineStart: "var(--gap-md)",
