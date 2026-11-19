@@ -90,7 +90,8 @@ jobs:
 
   e2e:
     name: e2e Integration Test
-    runs-on: ubuntu-latest
+    # The pinned Playwright browsers support 24.04; ubuntu-latest now uses 26.04.
+    runs-on: ubuntu-24.04
 
     timeout-minutes: 60
 
