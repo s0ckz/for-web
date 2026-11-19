@@ -190,6 +190,9 @@ const Base = styled("div", {
   base: {
     flexShrink: 0,
     height: "29px",
+    width: "100%",
+    maxWidth: "100vw",
+    minWidth: 0,
     userSelect: "none",
 
     display: "flex",
@@ -234,6 +237,8 @@ const Title = styled("div", {
 const DragHandle = styled("div", {
   base: {
     flexGrow: 1,
+    minWidth: 0,
+    overflow: "hidden",
     height: "100%",
 
     display: "flex",
